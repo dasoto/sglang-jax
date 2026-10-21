@@ -22,18 +22,28 @@ dequantizes weight tiles in VMEM (design doc section 4), and fuse SiTU-GLU.
 
 from __future__ import annotations
 
+import os
 from functools import partial
 
 import jax
 import jax.numpy as jnp
 from flax import nnx
 from jax import shard_map
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.moe import EPMoE
 from sgl_jax.srt.layers.quantization.mxfp4 import MXFP4_GROUP_SIZE, dequant_mxfp4
 from sgl_jax.srt.model_loader.weights import WeightSpec
+from sgl_jax.srt.utils.jax_utils import is_tpu_runtime
 from sgl_jax.srt.utils.profiling_utils import named_scope
+
+# Fused MXFP4 grouped-matmul Pallas kernel (kernels/mxfp4_gmm): opt-in until validated on TPU.
+MXFP4_GMM_KERNEL_ENV = "SGLANG_JAX_MXFP4_GMM_KERNEL"
+
+
+def mxfp4_gmm_kernel_enabled() -> bool:
+    return os.environ.get(MXFP4_GMM_KERNEL_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
 
 # k-major MXFP4 layouts on the (expert, tensor) mesh.
 _WI_SPEC = P("expert", None, "tensor")  # gate/up: [E, H//2 | H//32, I]
@@ -56,8 +66,12 @@ class MXFP4EPMoE(EPMoE):
     shards.
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, use_gmm_kernel: bool | None = None, **kwargs):
         super().__init__(*args, **kwargs)
+        # Fused dequant+GMM kernel: weights are re-encoded once by
+        # ``prepare_gmm_kernel_weights()`` (called from the model's ``load_weights``).
+        self.use_gmm_kernel = mxfp4_gmm_kernel_enabled() if use_gmm_kernel is None else use_gmm_kernel
+        self.gmm_kernel_weights_ready = False
         if self.replicate_experts:
             raise NotImplementedError("MXFP4EPMoE does not support moe_dp_size > 1")
         if self.quantized_dtype is not None or self.activation_quantized_dtype is not None:
@@ -94,6 +108,40 @@ class MXFP4EPMoE(EPMoE):
     def quantize_weights(self, is_static: bool = False, *, abstract: bool = False):
         # Packed MXFP4 experts are loaded as-is; there is nothing to quantize.
         return
+
+    def gmm_kernel_supported(self) -> bool:
+        """The kernel decodes 64-row blocks of K: H and the per-shard I must be multiples of 64."""
+        return self.hidden_size % 64 == 0 and (self.intermediate_dim // self.tp_size) % 64 == 0
+
+    def prepare_gmm_kernel_weights(self) -> bool:
+        """Re-encode the loaded packed experts in place for the fused MXFP4 GMM kernel.
+
+        ``uint8 [E, K/2, N]`` -> ``uint32 [E, K/8, N]`` (same bytes, same PartitionSpecs), done
+        shard-locally. Scales are unchanged. Returns whether the kernel path is active.
+        """
+        if self.gmm_kernel_weights_ready:
+            return True
+        if not self.use_gmm_kernel or not self.gmm_kernel_supported():
+            return False
+        from sgl_jax.srt.kernels.mxfp4_gmm import prepare_l24
+
+        with jax.set_mesh(self.moe_mesh):
+            for name, spec in (
+                ("w1_weight_packed", _WI_SPEC),
+                ("w3_weight_packed", _WI_SPEC),
+                ("w2_weight_packed", _WO_SPEC),
+            ):
+                param = getattr(self, name)
+                packed = param.get_value()
+                if packed.dtype != jnp.uint8:
+                    raise ValueError(f"{name} is {packed.dtype}, expected packed uint8")
+                convert = jax.jit(
+                    shard_map(prepare_l24, mesh=self.moe_mesh, in_specs=spec, out_specs=spec, check_vma=False),
+                    out_shardings=NamedSharding(self.moe_mesh, spec),
+                )
+                param.set_value(convert(packed))
+        self.gmm_kernel_weights_ready = True
+        return True
 
     @named_scope
     def __call__(
@@ -173,6 +221,19 @@ class MXFP4EPMoE(EPMoE):
         wo_kernel_bias=None,
         local_range=None,
     ):
+        if self.gmm_kernel_weights_ready:
+            return self._gmm_compute_kernel(
+                inputs_2d,
+                token_indices,
+                group_sizes,
+                w0_kernel,
+                w1_kernel,
+                wo_kernel,
+                group_offset,
+                w0_kernel_scale,
+                w1_kernel_scale,
+                wo_kernel_scale,
+            )
         # Local k-major shards decode straight into GMM [E_l, k, n] operands.
         # The barrier ties the packed weights to this layer's activations so XLA
         # cannot hoist (and keep live) the bf16 dequant of every layer up front.
@@ -196,6 +257,42 @@ class MXFP4EPMoE(EPMoE):
             dequant(wo_kernel, wo_kernel_scale),
             group_offset,
             local_range=local_range,
+        )
+
+    def _gmm_compute_kernel(
+        self,
+        inputs_2d,
+        token_indices,
+        group_sizes,
+        w_gate,
+        w_up,
+        w_down,
+        group_offset,
+        s_gate,
+        s_up,
+        s_down,
+    ):
+        """Fused path: l24 weights decoded in VMEM, SiTU-GLU fused into the gate/up GMM."""
+        from sgl_jax.srt.kernels.mxfp4_gmm import mxfp4_moe_mlp
+
+        if token_indices.shape[0] == 0:
+            return jnp.zeros((0, w_down.shape[-1]), dtype=inputs_2d.dtype)
+        x = inputs_2d[token_indices].astype(self.dtype)
+        return mxfp4_moe_mlp(
+            x,
+            group_sizes.astype(jnp.int32),
+            group_offset,
+            w_gate,
+            s_gate,
+            w_up,
+            s_up,
+            w_down,
+            s_down,
+            situ_beta=self.situ_beta,
+            situ_linear_beta=self.situ_linear_beta,
+            act_input_dtype=self.dtype,  # EPMoE's GMMs emit self.dtype before the activation
+            out_dtype=self.dtype,
+            interpret=not is_tpu_runtime(),
         )
 
 
