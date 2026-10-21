@@ -734,6 +734,13 @@ class KimiK3ForConditionalGeneration(nnx.Module):
         ):
             prefix = ""  # Text-only re-export without the multimodal wrapper.
         loader.load(self._create_weight_mappings(prefix))
+        n_kernel = 0
+        for layer in self.model.layers:
+            moe = getattr(layer, "block_sparse_moe", None)
+            if moe is not None and isinstance(moe.experts, MXFP4EPMoE):
+                n_kernel += moe.experts.prepare_gmm_kernel_weights()
+        if n_kernel:
+            logger.info("Kimi-K3: fused MXFP4 GMM kernel enabled for %d MoE layers", n_kernel)
         logger.info("Kimi-K3 weights loaded successfully!")
 
     def _create_weight_mappings(self, prefix: str = "language_model.") -> dict:
