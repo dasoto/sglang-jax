@@ -2012,6 +2012,18 @@ class HybridLinearKVPool(KVCache):
             self._to_physical(layer_id), loc, cache_k, cache_v, is_decode
         )
 
+    def set_kv_buffer_legacy(
+        self,
+        layer_id: int,
+        loc: jax.Array,
+        cache_k: jax.Array,
+        cache_v: jax.Array,
+    ) -> jax.Array:
+        """Native (non-TPU) attention path: scatter into the inner full-attn pool."""
+        return self.full_kv_pool.set_kv_buffer_legacy(
+            self._to_physical(layer_id), loc, cache_k, cache_v
+        )
+
     def replace_buffer(self, kv_buffer) -> None:
         """Accept COMPACTED list (length L_full, in full_attention_layer_ids order).
 
