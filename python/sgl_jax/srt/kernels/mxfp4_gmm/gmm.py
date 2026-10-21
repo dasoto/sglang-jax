@@ -70,7 +70,8 @@ def _gmm_kernel(
     out_ref = refs[1 + 2 * n_w]
     scratch = refs[2 + 2 * n_w :]
     g_scrs = scratch[:n_w]
-    wc_refs = scratch[n_w : 2 * n_w] if cache else (None,) * n_w
+    acc_refs = scratch[n_w : 2 * n_w]
+    wc_refs = scratch[2 * n_w : 3 * n_w] if cache else (None,) * n_w
 
     v = pl.program_id(0)
     n = pl.program_id(1)
@@ -83,10 +84,13 @@ def _gmm_kernel(
     nk = K // kc
     col = pl.ds(pl.multiple_of(n * bn, bn), bn)
 
-    def decode_mm(w_ref, s_ref, g_scr, wc_ref):
+    # Small accumulators ride in vregs through the K loop; big (prefill) tiles accumulate in VMEM.
+    carry_in_vregs = tm * bn * 4 <= 128 * 1024
+
+    def decode_mm(w_ref, s_ref, g_scr, wc_ref, acc_ref):
         g_scr[...] = scale_operand(s_ref[...].astype(U32), zero_mode=zero_mode)
 
-        def body(c, acc):
+        def chunk(c):
             rows = pl.ds(pl.multiple_of(c * kc, kc), kc)
             xk = lhs_ref[:, rows]
             parts = []
@@ -96,45 +100,60 @@ def _gmm_kernel(
                 if wc_ref is not None:
                     wc_ref[rows, pl.ds(pl.multiple_of(n * bn + l * nl, nl), nl)] = wd
                 parts.append(jnp.dot(xk, wd, preferred_element_type=jnp.float32))
-            return acc + (parts[0] if len(parts) == 1 else jnp.concatenate(parts, axis=1))
+            return parts[0] if len(parts) == 1 else jnp.concatenate(parts, axis=1)
 
-        return lax.fori_loop(0, nk, body, jnp.zeros((tm, bn), jnp.float32))
+        if carry_in_vregs:
+            acc_ref[...] = lax.fori_loop(0, nk, lambda c, a: a + chunk(c), jnp.zeros((tm, bn), jnp.float32))
+        else:
+            acc_ref[...] = jnp.zeros_like(acc_ref)
 
-    def cached_mm(wc_ref):
-        return jnp.dot(lhs_ref[...], wc_ref[:, col], preferred_element_type=jnp.float32)
+            def body(c, carry):
+                acc_ref[...] += chunk(c)
+                return carry
 
-    accs = []
+            lax.fori_loop(0, nk, body, 0)
+
+    def cached_mm(wc_ref, acc_ref):
+        acc_ref[...] = jnp.dot(lhs_ref[...], wc_ref[:, col], preferred_element_type=jnp.float32)
+
     for i in range(n_w):
         if cache:
             branch = jnp.where(first_g, jnp.where(keep, 0, 1), 2)
-            acc = lax.switch(
+            lax.switch(
                 branch,
                 [
-                    functools.partial(decode_mm, w_refs[i], s_refs[i], g_scrs[i], wc_refs[i]),
-                    functools.partial(decode_mm, w_refs[i], s_refs[i], g_scrs[i], None),
-                    functools.partial(cached_mm, wc_refs[i]),
+                    functools.partial(decode_mm, w_refs[i], s_refs[i], g_scrs[i], wc_refs[i], acc_refs[i]),
+                    functools.partial(decode_mm, w_refs[i], s_refs[i], g_scrs[i], None, acc_refs[i]),
+                    functools.partial(cached_mm, wc_refs[i], acc_refs[i]),
                 ],
             )
         else:
-            acc = decode_mm(w_refs[i], s_refs[i], g_scrs[i], None)
-        accs.append(acc)
+            decode_mm(w_refs[i], s_refs[i], g_scrs[i], None, acc_refs[i])
 
-    if activation == "situ_glu":
-        g, u = accs
-        if act_input_dtype is not None:  # match a reference that rounds the GMM outputs first
-            g = g.astype(act_input_dtype)
-            u = u.astype(act_input_dtype)
-        y = situ_glu_f32(g, u, situ_beta, situ_linear_beta)
-    else:
-        y = accs[0]
-
+    # Epilogue (activation + masked store), in row chunks to bound code size for big tiles.
     start = goffs_ref[gid]
     end = goffs_ref[gid + 1]
-    rows = mids_ref[v] * tm + lax.broadcasted_iota(jnp.int32, (tm, bn), 0)
-    mask = (rows >= start) & (rows < end)
-    old = out_ref[:, col]
-    old = jnp.where(first_m, jnp.zeros_like(old), old)
-    out_ref[:, col] = jnp.where(mask, y.astype(out_ref.dtype), old)
+    ec = min(tm, 64)
+
+    def epilogue(r, carry):
+        rs = pl.ds(pl.multiple_of(r * ec, ec), ec)
+        if activation == "situ_glu":
+            g = acc_refs[0][rs, :]
+            u = acc_refs[1][rs, :]
+            if act_input_dtype is not None:  # match a reference that rounds the GMM outputs first
+                g = g.astype(act_input_dtype)
+                u = u.astype(act_input_dtype)
+            y = situ_glu_f32(g, u, situ_beta, situ_linear_beta)
+        else:
+            y = acc_refs[0][rs, :]
+        rows = mids_ref[v] * tm + r * ec + lax.broadcasted_iota(jnp.int32, (ec, bn), 0)
+        mask = (rows >= start) & (rows < end)
+        old = out_ref[rs, col]
+        old = jnp.where(first_m, jnp.zeros_like(old), old)
+        out_ref[rs, col] = jnp.where(mask, y.astype(out_ref.dtype), old)
+        return carry
+
+    lax.fori_loop(0, tm // ec, epilogue, 0)
 
 
 def _visit_flags(group_ids, m_tile_ids, num_visits):
@@ -274,6 +293,7 @@ def mxfp4_gmm(
             pl.BlockSpec((None, K // 32, bn), w_map),
         ]
     scratch = [pltpu.VMEM((K // 32, bn), U32) for _ in range(n_w)]
+    scratch += [pltpu.VMEM((tm, bn), jnp.float32) for _ in range(n_w)]
     if cache:
         scratch += [pltpu.VMEM((K, N), jnp.bfloat16) for _ in range(n_w)]
 
