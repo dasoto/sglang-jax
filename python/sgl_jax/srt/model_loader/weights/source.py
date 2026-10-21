@@ -38,6 +38,9 @@ _SAFETENSORS_DTYPE_TO_JAX: dict[str, jnp.dtype] = {
     "F32": jnp.float32,
     "I64": jnp.int64,
     "I32": jnp.int32,
+    "I8": jnp.int8,
+    # Packed sub-byte weights / E8M0 scales (e.g. compressed-tensors MXFP4).
+    "U8": jnp.uint8,
     "BOOL": jnp.bool_,
     "F8_E4M3": jnp.float8_e4m3fn,
     "F8_E5M2": jnp.float8_e5m2,
