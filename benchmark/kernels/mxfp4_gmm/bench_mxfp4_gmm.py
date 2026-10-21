@@ -29,13 +29,46 @@ LAYER_WEIGHTS = E_LOCAL * (HID * 2 * INTER + INTER * HID)
 HBM_BW = 820e9
 
 
+_LOG_LINES: list = []
+_LOG_STATE = {"gcs": None, "last_upload": 0.0, "t0": time.time(), "budget": 1e9}
+
+
+def _upload_log(force=False):
+    url = _LOG_STATE["gcs"]
+    if not url or (not force and time.time() - _LOG_STATE["last_upload"] < 10):
+        return
+    _LOG_STATE["last_upload"] = time.time()
+    try:
+        from google.cloud import storage
+
+        bucket, blob = url[5:].split("/", 1)
+        storage.Client().bucket(bucket).blob(blob).upload_from_string("\n".join(_LOG_LINES) + "\n")
+    except Exception as e:  # noqa: BLE001
+        print(f"(log upload failed: {e})", flush=True)
+
+
 def log(*a):
-    print(*a, flush=True)
+    line = " ".join(str(x) for x in a)
+    print(line, flush=True)
+    _LOG_LINES.append(line)
+    _upload_log()
 
 
-def timeit(f, *args, n=20, reps=3):
+class BudgetExceeded(Exception):
+    pass
+
+
+def check_budget():
+    if time.time() - _LOG_STATE["t0"] > _LOG_STATE["budget"]:
+        raise BudgetExceeded()
+
+
+def timeit(f, *args, n=10, reps=2):
+    check_budget()
+    t0 = time.perf_counter()
     out = f(*args)
     jax.block_until_ready(out)
+    RESULTS.setdefault("first_call_s", []).append(round(time.perf_counter() - t0, 2))
     best = 1e9
     for _ in range(reps):
         t0 = time.perf_counter()
@@ -52,6 +85,8 @@ def guarded(name):
         def wrapper(*a, **k):
             try:
                 return fn(*a, **k)
+            except BudgetExceeded:
+                raise
             except Exception as e:  # noqa: BLE001
                 msg = f"{type(e).__name__}: {str(e)[:400]}"
                 log(f"  [{name}] FAILED {msg}")
@@ -173,7 +208,7 @@ def hbm_stream(bm, bn, rows=3136, cols=3072):
 
 def run_micro():
     log("== micro: MXU rates (VMEM-resident operands) ==")
-    for T in (8, 16, 32, 64, 128, 256):
+    for T in (8, 32, 128, 256):
         mxu_rate(T, 2048, 1024, jnp.bfloat16, jnp.bfloat16, jnp.float32, 400)
     for wdt in (jnp.float8_e5m2, jnp.float8_e4m3b11fnuz):
         for T in (8, 128):
@@ -181,12 +216,12 @@ def run_micro():
     for T in (8, 128):
         mxu_rate(T, 2048, 1024, jnp.int8, jnp.int8, jnp.int32, 400)
     log("== micro: VPU ==")
-    for kind in ("add", "mul", "shift"):
+    for kind in ("add", "mul"):
         vpu_rate(kind)
     log("== micro: denormals ==")
     denormal_test()
     log("== micro: HBM streaming ==")
-    for bm, bn in ((448, 256), (448, 512), (448, 1024), (448, 3072), (3136, 256)):
+    for bm, bn in ((448, 512), (448, 3072)):
         hbm_stream(bm, bn)
 
 
@@ -199,10 +234,10 @@ def make_weights(K, N, seed):
 
 
 @guarded("dense")
-def dense_case(x, w, s, *, bn, kc, exact_zero, resident, unroll=1, tag="", want=None, colscale=None, nl=None):
+def dense_case(x, w, s, *, bn, kc, zero_mode, resident, unroll=1, tag="", want=None, colscale=None, nl=None):
     from sgl_jax.srt.kernels.mxfp4_gmm.kernel import dense_mxfp4_matmul
 
-    f = functools.partial(dense_mxfp4_matmul, bn=bn, kc=kc, exact_zero=exact_zero, resident=resident,
+    f = functools.partial(dense_mxfp4_matmul, bn=bn, kc=kc, zero_mode=zero_mode, resident=resident,
                           unroll=unroll, nl=nl)
     if colscale is not None:
         f = functools.partial(f, colscale=colscale)
@@ -210,13 +245,13 @@ def dense_case(x, w, s, *, bn, kc, exact_zero, resident, unroll=1, tag="", want=
     E, T, K = x.shape
     N = w.shape[-1]
     rate = E * K * N / t
-    key = f"dense{tag}_T{T}_bn{bn}_nl{nl or bn}_kc{kc}_ez{int(exact_zero)}_res{int(resident)}_u{unroll}"
+    key = f"dense{tag}_T{T}_bn{bn}_nl{nl or bn}_kc{kc}_z{zero_mode}_res{int(resident)}_u{unroll}"
     RESULTS[key] = t * 1e6
     err = ""
     if want is not None:
         got = np.asarray(f(x, w, s).astype(jnp.float32))
         err = f" relerr={np.abs(got - want).max() / np.abs(want).max():.2e}"
-    log(f"  dense{tag} T={T:>4} bn={bn:>4} nl={nl or bn:>4} kc={kc:>3} exact_zero={int(exact_zero)} "
+    log(f"  dense{tag} T={T:>4} bn={bn:>4} nl={nl or bn:>4} kc={kc:>3} zero={zero_mode:>4} "
         f"resident={int(resident)} unroll={unroll}: {t*1e6:8.1f} us  {rate/1e12:5.2f} T w/s{err}")
     return t
 
@@ -242,25 +277,50 @@ def run_dense():
             ref = F.dequant_reference(packed, scale)
             want = np.einsum("etk,ekn->etn", np.asarray(x, np.float32), ref)
         for bn in (512, 1024):
-            for ez in (True, False):
+            for ez in ("mul", "none"):
                 for res in (False, True):
-                    dense_case(x, w, s8, bn=bn, kc=256, exact_zero=ez, resident=res,
-                               want=want if (ez and not res) else None)
+                    dense_case(x, w, s8, bn=bn, kc=256, zero_mode=ez, resident=res,
+                               want=want if (ez != "none" and not res) else None)
             if f8_ok and bn == 512:
-                for ez in (True, False):
+                for ez in ("mul", "none"):
                     for res in (False, True):
-                        dense_case(x, w8, eg8, bn=bn, kc=256, exact_zero=ez, resident=res, colscale=cs8,
-                                   tag="_f8", want=want if (ez and not res) else None)
+                        dense_case(x, w8, eg8, bn=bn, kc=256, zero_mode=ez, resident=res, colscale=cs8,
+                                   tag="_f8", want=want if (ez != "none" and not res) else None)
         for bn, nl in ((1024, 256), (512, 128), (512, 256)):
             for res in (False, True):
-                dense_case(x, w, s8, bn=bn, nl=nl, kc=256, exact_zero=True, resident=res)
-        dense_case(x, w, s8, bn=512, kc=512, exact_zero=True, resident=False)
-        dense_case(x, w, s8, bn=512, kc=128, exact_zero=True, resident=False)
-        dense_case(x, w, s8, bn=512, kc=256, exact_zero=True, resident=False, unroll=2)
-        dense_case(x, w, s8, bn=1536, kc=256, exact_zero=True, resident=False)
+                dense_case(x, w, s8, bn=bn, nl=nl, kc=256, zero_mode="mul", resident=res)
+        dense_case(x, w, s8, bn=512, kc=512, zero_mode="mul", resident=False)
+        dense_case(x, w, s8, bn=512, kc=128, zero_mode="mul", resident=False)
+        dense_case(x, w, s8, bn=512, kc=256, zero_mode="mul", resident=False, unroll=2)
+        dense_case(x, w, s8, bn=1536, kc=256, zero_mode="mul", resident=False)
     # scales as uint32 instead of uint8
     x = jnp.asarray(rng.standard_normal((E_LOCAL, 8, K)) * 0.5, jnp.bfloat16)
-    dense_case(x, w, s8.astype(jnp.uint32), bn=512, kc=256, exact_zero=True, resident=False, tag="_s32")
+    dense_case(x, w, s8.astype(jnp.uint32), bn=512, kc=256, zero_mode="mul", resident=False, tag="_s32")
+
+
+def run_dense8():
+    """Decode-regime kernel variants at 8 tokens/expert (7 experts, 3584 -> 3072)."""
+    from sgl_jax.srt.kernels.mxfp4_gmm import format as F
+
+    log("== dense fused kernel @ T=8 (7 experts x 3584 -> 3072, 77M weights) ==")
+    K, N = HID, 2 * INTER
+    packed, scale, words = make_weights(K, N, 0)
+    w, s8 = jnp.asarray(words), jnp.asarray(scale)
+    x = jnp.asarray(np.random.default_rng(1).standard_normal((E_LOCAL, 8, K)) * 0.5, jnp.bfloat16)
+    want = np.einsum("etk,ekn->etn", np.asarray(x, np.float32), F.dequant_reference(packed, scale))
+    dense_case(x, w, s8, bn=512, kc=256, zero_mode="mul", resident=False, want=want)
+    dense_case(x, w, s8, bn=512, kc=256, zero_mode="mask", resident=False, want=want)
+    dense_case(x, w, s8, bn=512, kc=256, zero_mode="mul", resident=True)
+    dense_case(x, w, s8, bn=512, kc=256, zero_mode="mask", resident=True)
+    dense_case(x, w, s8, bn=512, kc=256, zero_mode="none", resident=True)
+    dense_case(x, w, s8, bn=1024, nl=256, kc=256, zero_mode="mul", resident=False)
+    dense_case(x, w, s8, bn=1024, nl=256, kc=256, zero_mode="mul", resident=True)
+    dense_case(x, w, s8, bn=512, nl=128, kc=256, zero_mode="mul", resident=True)
+    if RESULTS.get("mxu_bfloat16xfloat8_e5m2_T8") is not None:
+        w8, eg8, cs8 = map(jnp.asarray, F.encode_f8l(packed, scale))
+        dense_case(x, w8, eg8, bn=512, kc=256, zero_mode="mul", resident=False, colscale=cs8, tag="_f8", want=want)
+        dense_case(x, w8, eg8, bn=512, kc=256, zero_mode="mul", resident=True, colscale=cs8, tag="_f8")
+        dense_case(x, w8, eg8, bn=1024, nl=256, kc=256, zero_mode="mul", resident=True, colscale=cs8, tag="_f8")
 
 
 # ------------------------------------------------------------------------------ ragged gmm
@@ -373,15 +433,16 @@ def run_layer():
         h = situ(jnp.concatenate([g, u], axis=-1))
         return megablox_gmm(h, d2, gs, preferred_element_type=jnp.bfloat16)
 
-    def f_mx(x, gs, tm, bn13, bn2):
-        h = mxfp4_gmm(x, wg, sg_d, gs, w_up=wu, scale_up=su_d, activation="situ_glu", tm=tm, bn=bn13)
-        return mxfp4_gmm(h, w2, s2_d, gs, tm=tm, bn=bn2)
+    def f_mx(x, gs, tm, bn13, bn2, nl, zm):
+        h = mxfp4_gmm(x, wg, sg_d, gs, w_up=wu, scale_up=su_d, activation="situ_glu", tm=tm, bn=bn13,
+                      nl=nl if nl and bn13 % nl == 0 else None, zero_mode=zm)
+        return mxfp4_gmm(h, w2, s2_d, gs, tm=tm, bn=bn2, nl=nl if nl and bn2 % nl == 0 else None, zero_mode=zm)
 
     f_dense = jax.jit(f_bf16_dense)
     f_mb = jax.jit(f_megablox_bf16)
     f_cur = jax.jit(f_current)
     rng = np.random.default_rng(2)
-    for T in (1, 4, 16, 64, 256, 1024):
+    for T in LAYER_TS:
         M = E_LOCAL * T
         gs = jnp.full((E_LOCAL,), T, jnp.int32)
         x3 = jnp.asarray(rng.standard_normal((E_LOCAL, T, HID)) * 0.5, jnp.bfloat16)
@@ -394,56 +455,74 @@ def run_layer():
                 t = timeit(fn, *args)
                 RESULTS[f"layer_{name}_T{T}"] = t * 1e3
                 line += f" {name} {t*1e3:7.3f} ms |"
+            except BudgetExceeded:
+                raise
             except Exception as e:  # noqa: BLE001
                 line += f" {name} FAILED {type(e).__name__} |"
-        tms = (16, 32) if T <= 4 else ((16, 64) if T <= 16 else ((64, 128) if T <= 64 else (256, 512)))
+        tm = 16 if T <= 8 else (64 if T <= 64 else (256 if T <= 256 else 512))
         best = None
-        for tm in tms:
-            for bn13, bn2 in ((768, 896), (512, 512), (1536, 1792)):
+        for bn13, bn2, nl, zm in LAYER_CFGS:
+            if True:
                 try:
-                    f = jax.jit(functools.partial(f_mx, tm=tm, bn13=bn13, bn2=bn2))
+                    check_budget()
+                    f = jax.jit(functools.partial(f_mx, tm=tm, bn13=bn13, bn2=bn2, nl=nl, zm=zm))
                     t = timeit(f, x, gs)
-                    RESULTS[f"layer_mx_T{T}_tm{tm}_bn{bn13}-{bn2}"] = t * 1e3
+                    RESULTS[f"layer_mx_T{T}_tm{tm}_bn{bn13}-{bn2}_nl{nl}_{zm}"] = t * 1e3
+                    log(f"    mx tm={tm} bn={bn13}/{bn2} nl={nl} zero={zm}: {t*1e3:.3f} ms")
                     if best is None or t < best[0]:
                         got = np.asarray(f(x, gs).astype(jnp.float32))
                         err = np.abs(got - ref).max() / max(np.abs(ref).max(), 1e-30)
-                        best = (t, tm, bn13, bn2, err)
+                        best = (t, tm, f"{bn13}/{bn2} nl={nl} {zm}", "", err)
+                except BudgetExceeded:
+                    raise
                 except Exception as e:  # noqa: BLE001
-                    log(f"    mx tm={tm} bn={bn13}/{bn2} FAILED {type(e).__name__}: {str(e)[:300]}")
+                    log(f"    mx tm={tm} bn={bn13}/{bn2} zero={zm} FAILED {type(e).__name__}: {str(e)[:300]}")
         if best:
             t, tm, bn13, bn2, err = best
             RESULTS[f"layer_mx_best_T{T}"] = t * 1e3
-            line += (f" MXFP4-fused {t*1e3:7.3f} ms ({LAYER_WEIGHTS/t/1e12:5.2f} T w/s, tm={tm} bn={bn13}/{bn2},"
+            line += (f" MXFP4-fused {t*1e3:7.3f} ms ({LAYER_WEIGHTS/t/1e12:5.2f} T w/s, tm={tm} bn={bn13},"
                      f" rel.err vs bf16 {err:.1e})")
         log(line)
     log(f"  (HBM ideal: MXFP4 {LAYER_WEIGHTS*0.53125/HBM_BW*1e3:.3f} ms, bf16 {LAYER_WEIGHTS*2/HBM_BW*1e3:.3f} ms)")
 
 
 SECTIONS: list = []
+LAYER_TS = (1, 8, 64, 256, 1024)
+LAYER_CFGS = ((768, 1792, 256, "mul"), (768, 1792, 256, "mask"), (512, 896, None, "mul"))
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--sections", default="micro,dense,gmm,layer")
+    ap.add_argument("--sections", default="micro,dense8,layer,dense,gmm")
+    ap.add_argument("--gcs-log", default=os.environ.get("BENCH_GCS_LOG", ""))
+    ap.add_argument("--budget-s", type=float, default=float(os.environ.get("BENCH_BUDGET_S", "1e9")))
     a = ap.parse_args()
     SECTIONS[:] = a.sections.split(",")
+    _LOG_STATE["budget"] = a.budget_s
     rank = int(os.environ.get("NODE_RANK", "0"))
     nh = int(os.environ.get("NUM_HOSTS", "1"))
     if nh > 1:
         jax.distributed.initialize(coordinator_address=os.environ["COORD"] + ":8476", num_processes=nh,
                                    process_id=rank)
     if rank == 0:
+        _LOG_STATE["gcs"] = a.gcs_log or None
+        _LOG_STATE["t0"] = time.time()
         d = jax.local_devices()[0]
         log(f"device: {d.device_kind}, jax {jax.__version__}, local devices {len(jax.local_devices())}")
         with jax.default_device(d):
             for sec in a.sections.split(","):
                 t0 = time.time()
                 try:
-                    {"micro": run_micro, "dense": run_dense, "gmm": run_gmm, "layer": run_layer}[sec]()
+                    {"micro": run_micro, "dense8": run_dense8, "dense": run_dense, "gmm": run_gmm,
+                     "layer": run_layer}[sec]()
+                except BudgetExceeded:
+                    log(f"-- time budget exhausted during section {sec}")
+                    break
                 except Exception:  # noqa: BLE001
                     log(traceback.format_exc()[-2000:])
                 log(f"-- section {sec} took {time.time()-t0:.0f}s")
         log("RESULTS_JSON " + json.dumps(RESULTS))
+        _upload_log(force=True)
     if nh > 1:
         from jax.experimental import multihost_utils
 

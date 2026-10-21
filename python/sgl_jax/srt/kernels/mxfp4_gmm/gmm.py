@@ -57,7 +57,7 @@ def _gmm_kernel(
     bn: int,
     kc: int,
     nl: int,
-    exact_zero: bool,
+    zero_mode: str,
     activation: str | None,
     cache: bool,
     situ_beta: float,
@@ -84,7 +84,7 @@ def _gmm_kernel(
     col = pl.ds(pl.multiple_of(n * bn, bn), bn)
 
     def decode_mm(w_ref, s_ref, g_scr, wc_ref):
-        g_scr[...] = scale_operand(s_ref[...].astype(U32), exact_zero=exact_zero)
+        g_scr[...] = scale_operand(s_ref[...].astype(U32), zero_mode=zero_mode)
 
         def body(c, acc):
             rows = pl.ds(pl.multiple_of(c * kc, kc), kc)
@@ -92,7 +92,7 @@ def _gmm_kernel(
             parts = []
             for l in range(bn // nl):
                 lanes = None if nl == bn else pl.ds(l * nl, nl)
-                wd = decode_l24_chunk(w_ref, g_scr, c, nblk=kc // 64, exact_zero=exact_zero, lanes=lanes)
+                wd = decode_l24_chunk(w_ref, g_scr, c, nblk=kc // 64, zero_mode=zero_mode, lanes=lanes)
                 if wc_ref is not None:
                     wc_ref[rows, pl.ds(pl.multiple_of(n * bn + l * nl, nl), nl)] = wd
                 parts.append(jnp.dot(xk, wd, preferred_element_type=jnp.float32))
@@ -159,7 +159,7 @@ def _visit_flags(group_ids, m_tile_ids, num_visits):
         "nl",
         "activation",
         "out_dtype",
-        "exact_zero",
+        "zero_mode",
         "cache",
         "zero_unvisited",
         "situ_beta",
@@ -184,7 +184,7 @@ def mxfp4_gmm(
     kc: int = 256,
     nl: int | None = None,
     out_dtype=jnp.bfloat16,
-    exact_zero: bool = True,
+    zero_mode: str = "mul",
     cache: bool = True,
     zero_unvisited: bool = True,
     situ_beta: float = 4.0,
@@ -205,6 +205,8 @@ def mxfp4_gmm(
       activation: None or "situ_glu".
       tm, bn, kc: row tile, output column tile, K chunk (multiple of 64).
       nl: decode/matmul lane sub-tile inside a column tile (bn % nl == 0); None -> bn.
+      zero_mode: "mul" | "mask" (exact zeros; integer-multiply or shift/and gating) or "none"
+        (benchmark only: zero codes decode as 0.75 * scale).
       zero_unvisited: zero rows outside the local groups (megablox gmm semantics).
       situ_beta, situ_linear_beta: SiTU-GLU constants (Kimi-K3: 4 and 25).
       act_input_dtype: round the gate/up accumulators to this dtype before SiTU
@@ -219,6 +221,8 @@ def mxfp4_gmm(
     if scale.shape != (E_l, K // 32, N):
         raise ValueError(f"scale {scale.shape} != {(E_l, K // 32, N)}")
     nl = nl or bn
+    if K % kc:  # largest multiple-of-64 chunk <= kc that divides K
+        kc = next((c for c in range(kc - kc % 64, 63, -64) if K % c == 0), kc)
     if N % bn or K % kc or kc % 64 or bn % nl:
         raise ValueError(f"bad tiling N={N} bn={bn} K={K} kc={kc} nl={nl}")
     n_w = 1
@@ -280,7 +284,7 @@ def mxfp4_gmm(
         bn=bn,
         kc=kc,
         nl=nl,
-        exact_zero=exact_zero,
+        zero_mode=zero_mode,
         activation=activation,
         cache=cache,
         situ_beta=situ_beta,

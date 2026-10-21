@@ -1,8 +1,10 @@
 """Fused MXFP4 dequant + matmul Pallas kernels for TPU v5e (see format.py).
 
 Decode cost per 8 weights (one uint32 word -> 4 bf16-pair words), in 32-bit VPU ops:
-  l24, no zero handling ......... 17   (numerically wrong for zero codes; cost floor)
-  l24, exact zeros ("mul") ...... 33   (gates the exponent offset G with an integer multiply)
+  l24, zero_mode="none" ......... 17   (numerically wrong for zero codes; cost floor)
+  l24, zero_mode="mul" .......... 33   (gates the exponent offset G with an integer multiply)
+  l24, zero_mode="mask" ......... 37   (gates G with a spread mask: shifts/sub/and only)
+The f8l (float8_e5m2) variant decodes 4 weights per 32-bit op (18 / 8 / 20 ops per 8 weights).
 """
 
 from __future__ import annotations
@@ -28,25 +30,34 @@ def _c(v):
     return jnp.asarray(v, dtype=U32)
 
 
-def decode_l24_block(w, ga, gb, *, exact_zero: bool = True):
+ZERO_MODES = ("mul", "mask", "none")
+
+
+def _gate(nzf, g, zero_mode, spread_shift):
+    """G for nonzero weights, 0 for zero codes. nzf: flags (1 bit per lane field)."""
+    if zero_mode == "mul":
+        return nzf * g  # g = s - 1 (bf16) / Eg (f8): the flag sits at the field's LSB position
+    return g & ((nzf << spread_shift) - nzf)  # g = G replicated; mask covers the exponent bits
+
+
+def decode_l24_block(w, ga, gb, *, zero_mode: str = "mul"):
     """Decode one l24 word block.
 
     Args:
       w: uint32 [8, bn] -- 64 weight rows x bn columns.
-      ga, gb: uint32 [8, bn] (rows broadcast) for the two 32-row groups of the block.
-        exact_zero=True: ``s - 1`` (E8M0 scale minus one).
-        exact_zero=False: ``(s - 1) * 0x00800080`` (G replicated in both halves).
+      ga, gb: uint32 [8, bn] (rows broadcast) for the two 32-row groups of the block, from
+        :func:`scale_operand` (``s - 1`` for zero_mode="mul", else ``(s - 1) << 7`` in both halves).
     Returns:
       bf16 [64, bn] in natural row order.
     """
-    if exact_zero:
+    if zero_mode != "none":
         t = w ^ _c(_FLIP_MU0)
         nz = t | (t >> 1) | (t << 1)  # bit 3f+1 of each half = (mu_f != 1)
         m = _c(_M_NZ)
-        a0 = (nz & m) * ga
-        a1 = ((nz << 3) & m) * ga
-        a2 = ((nz << 6) & m) * gb
-        a3 = ((nz >> 3) & m) * gb
+        a0 = _gate(nz & m, ga, zero_mode, 8)
+        a1 = _gate((nz << 3) & m, ga, zero_mode, 8)
+        a2 = _gate((nz << 6) & m, gb, zero_mode, 8)
+        a3 = _gate((nz >> 3) & m, gb, zero_mode, 8)
     else:
         a0 = a1 = ga
         a2 = a3 = gb
@@ -57,17 +68,18 @@ def decode_l24_block(w, ga, gb, *, exact_zero: bool = True):
     return jnp.concatenate([pltpu.bitcast(o, jnp.bfloat16) for o in (o0, o1, o2, o3)], axis=0)
 
 
-def decode_f8l_block(w, ea, eb, *, exact_zero: bool = True):
+def decode_f8l_block(w, ea, eb, *, zero_mode: str = "mul"):
     """f8l word block uint32 [8, bn] -> float8_e5m2 [64, bn] (natural row order).
 
-    ea, eb: uint32 [8, bn] per-group e5m2 exponent Eg (exact_zero) or Eg*0x04040404.
+    ea, eb: uint32 [8, bn] from :func:`f8_scale_operand` (``Eg`` for "mul", else ``Eg << 2`` in
+    all four bytes).
     """
-    if exact_zero:
+    if zero_mode != "none":
         t = w ^ _c(0x12121212)
         nz = t | (t >> 1) | (t << 1)  # bits 2 / 5 of each byte = (mu != 1)
         m = _c(0x04040404)
-        a0 = (nz & m) * ea
-        a1 = ((nz >> 3) & m) * eb
+        a0 = _gate(nz & m, ea, zero_mode, 5)
+        a1 = _gate((nz >> 3) & m, eb, zero_mode, 5)
     else:
         a0, a1 = ea, eb
     o0 = (w & _c(0x8E8E8E8E)) + a0
@@ -75,27 +87,34 @@ def decode_f8l_block(w, ea, eb, *, exact_zero: bool = True):
     return jnp.concatenate([pltpu.bitcast(o, jnp.float8_e5m2) for o in (o0, o1)], axis=0)
 
 
-def decode_f8l_chunk(w_ref, g_ref, c, *, nblk: int, exact_zero: bool, lanes=None):
+def decode_f8l_chunk(w_ref, g_ref, c, *, nblk: int, zero_mode: str, lanes=None):
     ln = _lane_slice(lanes)
     wq = w_ref[pl.ds(pl.multiple_of(c * 8 * nblk, 8 * nblk), 8 * nblk), ln]
     ngrp = 2 * nblk
     gq = g_ref[pl.ds(pl.multiple_of(c * ngrp, ngrp), ngrp), ln] if ngrp % 8 == 0 else g_ref[pl.ds(c * ngrp, ngrp), ln]
     parts = [
         decode_f8l_block(wq[8 * b : 8 * b + 8, :], _bcast_row(gq, 2 * b), _bcast_row(gq, 2 * b + 1),
-                         exact_zero=exact_zero)
+                         zero_mode=zero_mode)
         for b in range(nblk)
     ]
     return parts[0] if nblk == 1 else jnp.concatenate(parts, axis=0)
 
 
-def f8_scale_operand(eg_u32, *, exact_zero: bool):
-    return eg_u32 if exact_zero else (eg_u32 << 2) * _c(0x01010101)
+def f8_scale_operand(eg_u32, *, zero_mode: str):
+    if zero_mode == "mul":
+        return eg_u32
+    e = eg_u32 << 2
+    e = e | (e << 8)
+    return e | (e << 16)
 
 
-def scale_operand(s_u32, *, exact_zero: bool):
-    """Per-group operand from E8M0 scales (uint32)."""
+def scale_operand(s_u32, *, zero_mode: str):
+    """Per-group operand from E8M0 scales (uint32): ``s-1`` ("mul") or ``(s-1)<<7`` in both halves."""
     sm1 = s_u32 - _c(1)
-    return sm1 if exact_zero else sm1 * _c(0x00800080)
+    if zero_mode == "mul":
+        return sm1
+    g = sm1 << 7
+    return g | (g << 16)
 
 
 def _bcast_row(x, r, rows=8):
@@ -106,7 +125,7 @@ def _lane_slice(lanes):
     return slice(None) if lanes is None else lanes
 
 
-def decode_l24_chunk(w_ref, g_ref, c, *, nblk: int, exact_zero: bool, lanes=None):
+def decode_l24_chunk(w_ref, g_ref, c, *, nblk: int, zero_mode: str, lanes=None):
     """Decode ``nblk`` consecutive 64-row blocks starting at block ``c * nblk``.
 
     w_ref: uint32 [K/8, bn] ref; g_ref: uint32 [K/32, bn] ref holding scale_operand();
@@ -124,7 +143,7 @@ def decode_l24_chunk(w_ref, g_ref, c, *, nblk: int, exact_zero: bool, lanes=None
     for b in range(nblk):
         ga = _bcast_row(gq, 2 * b)
         gb = _bcast_row(gq, 2 * b + 1)
-        parts.append(decode_l24_block(wq[8 * b : 8 * b + 8, :], ga, gb, exact_zero=exact_zero))
+        parts.append(decode_l24_block(wq[8 * b : 8 * b + 8, :], ga, gb, zero_mode=zero_mode))
     return parts[0] if nblk == 1 else jnp.concatenate(parts, axis=0)
 
 
@@ -134,15 +153,15 @@ def decode_l24_chunk(w_ref, g_ref, c, *, nblk: int, exact_zero: bool, lanes=None
 # ----------------------------------------------------------------------------------------
 
 
-def _dense_kernel(x_ref, w_ref, s_ref, *rest, kc: int, exact_zero: bool, unroll, fmt: str, nl: int):
+def _dense_kernel(x_ref, w_ref, s_ref, *rest, kc: int, zero_mode: str, unroll, fmt: str, nl: int):
     # x_ref [T, K] bf16; w_ref [K/8, bn] u32; s_ref [K/32, bn] u8|u32; o_ref [T, bn]
     if fmt == "f8l":
         cs_ref, o_ref, g_scr = rest
-        g_scr[...] = f8_scale_operand(s_ref[...].astype(U32), exact_zero=exact_zero)
+        g_scr[...] = f8_scale_operand(s_ref[...].astype(U32), zero_mode=zero_mode)
         dec = decode_f8l_chunk
     else:
         o_ref, g_scr = rest
-        g_scr[...] = scale_operand(s_ref[...].astype(U32), exact_zero=exact_zero)
+        g_scr[...] = scale_operand(s_ref[...].astype(U32), zero_mode=zero_mode)
         dec = decode_l24_chunk
     nblk = kc // 64
     nk = x_ref.shape[1] // kc
@@ -152,11 +171,11 @@ def _dense_kernel(x_ref, w_ref, s_ref, *rest, kc: int, exact_zero: bool, unroll,
     def body(c, acc):
         xk = x_ref[:, pl.ds(pl.multiple_of(c * kc, kc), kc)]
         if nls == 1:
-            wd = dec(w_ref, g_scr, c, nblk=nblk, exact_zero=exact_zero)
+            wd = dec(w_ref, g_scr, c, nblk=nblk, zero_mode=zero_mode)
             return acc + jnp.dot(xk, wd, preferred_element_type=jnp.float32)
         parts = []
         for l in range(nls):
-            wd = dec(w_ref, g_scr, c, nblk=nblk, exact_zero=exact_zero, lanes=pl.ds(l * nl, nl))
+            wd = dec(w_ref, g_scr, c, nblk=nblk, zero_mode=zero_mode, lanes=pl.ds(l * nl, nl))
             parts.append(jnp.dot(xk, wd, preferred_element_type=jnp.float32))
         return acc + jnp.concatenate(parts, axis=1)
 
@@ -168,7 +187,7 @@ def _dense_kernel(x_ref, w_ref, s_ref, *rest, kc: int, exact_zero: bool, unroll,
 
 @functools.partial(
     jax.jit,
-    static_argnames=("bn", "kc", "nl", "exact_zero", "out_dtype", "resident", "unroll", "interpret"),
+    static_argnames=("bn", "kc", "nl", "zero_mode", "out_dtype", "resident", "unroll", "interpret"),
 )
 def dense_mxfp4_matmul(
     x,
@@ -179,7 +198,7 @@ def dense_mxfp4_matmul(
     bn: int = 512,
     kc: int = 256,
     nl: int | None = None,
-    exact_zero: bool = True,
+    zero_mode: str = "mul",
     out_dtype=jnp.bfloat16,
     resident: bool = False,
     unroll=1,
@@ -210,7 +229,7 @@ def dense_mxfp4_matmul(
         in_specs.append(pl.BlockSpec((None, 1, bn), widx))
         args.append(colscale)
     return pl.pallas_call(
-        functools.partial(_dense_kernel, kc=kc, exact_zero=exact_zero, unroll=unroll, fmt=fmt, nl=nl or bn),
+        functools.partial(_dense_kernel, kc=kc, zero_mode=zero_mode, unroll=unroll, fmt=fmt, nl=nl or bn),
         out_shape=jax.ShapeDtypeStruct((E, T, N), out_dtype),
         grid=(E, N // bn),
         in_specs=in_specs,

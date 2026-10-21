@@ -50,8 +50,8 @@ def test_l24_swar_bits_match_dequant():
     assert np.all(np.abs(got[~nz]) <= 2.0**-126)
 
 
-@pytest.mark.parametrize("exact_zero", [True, False])
-def test_kernel_block_decode_bits(exact_zero):
+@pytest.mark.parametrize("zero_mode", ["mul", "mask", "none"])
+def test_kernel_block_decode_bits(zero_mode):
     packed, scale = _all_bytes_weights(n_experts=1)
     words = F.encode_l24(packed)[0]
     ref_bits = F.bf16_bits_l24_reference(words, scale[0])
@@ -62,29 +62,31 @@ def test_kernel_block_decode_bits(exact_zero):
     def dec(w, g0, g1):
         ga = jnp.broadcast_to(g0, (8, w.shape[1]))
         gb = jnp.broadcast_to(g1, (8, w.shape[1]))
-        return jax.lax.bitcast_convert_type(Kn.decode_l24_block(w, ga, gb, exact_zero=exact_zero), jnp.uint16)
+        return jax.lax.bitcast_convert_type(Kn.decode_l24_block(w, ga, gb, zero_mode=zero_mode), jnp.uint16)
 
-    g = Kn.scale_operand(s32, exact_zero=exact_zero)
+    g = Kn.scale_operand(s32, zero_mode=zero_mode)
     for blk in range(words.shape[0] // 8):
         got = np.asarray(dec(jnp.asarray(words[8 * blk : 8 * blk + 8]), g[2 * blk][None], g[2 * blk + 1][None]))
         rows = slice(64 * blk, 64 * blk + 64)
-        if exact_zero:
+        if zero_mode != "none":
             np.testing.assert_array_equal(got, ref_bits[rows])
         else:  # no zero handling: nonzero weights are still exact
             nz = want[rows] != 0
             np.testing.assert_array_equal(got[nz], ref_bits[rows][nz])
 
 
-def test_f8l_decode_values():
+@pytest.mark.parametrize("zero_mode", ["mul", "mask"])
+def test_f8l_decode_values(zero_mode):
     packed, scale = F.random_mxfp4((512, 256), 1, seed=3, zero_frac=0.15)
     words, eg, cs = F.encode_f8l(packed, scale)
     want = F.dequant_reference(packed, scale)[0]
 
     @jax.jit
     def dec(w, e0, e1):
-        return Kn.decode_f8l_block(w, jnp.broadcast_to(e0, (8, 256)), jnp.broadcast_to(e1, (8, 256)))
+        return Kn.decode_f8l_block(w, jnp.broadcast_to(e0, (8, 256)), jnp.broadcast_to(e1, (8, 256)),
+                                   zero_mode=zero_mode)
 
-    g = jnp.asarray(eg[0].astype(np.uint32))
+    g = Kn.f8_scale_operand(jnp.asarray(eg[0].astype(np.uint32)), zero_mode=zero_mode)
     for blk in range(words.shape[1] // 8):
         got = np.asarray(dec(jnp.asarray(words[0, 8 * blk : 8 * blk + 8]), g[2 * blk][None], g[2 * blk + 1][None]))
         got = got.astype(np.float32) * cs[0]
@@ -94,8 +96,8 @@ def test_f8l_decode_values():
         assert np.all(np.abs(got[~nz]) <= np.abs(ref).max() * 2.0**-20)
 
 
-@pytest.mark.parametrize("fmt", ["l24", "f8l"])
-def test_dense_kernel(fmt):
+@pytest.mark.parametrize("fmt,zero_mode", [("l24", "mul"), ("l24", "mask"), ("f8l", "mul"), ("f8l", "mask")])
+def test_dense_kernel(fmt, zero_mode):
     E, T, K, N = 2, 8, 512, 256
     packed, scale = F.random_mxfp4((K, N), E, seed=1, zero_frac=0.12)
     ref = F.dequant_reference(packed, scale)
@@ -104,7 +106,8 @@ def test_dense_kernel(fmt):
         args = (jnp.asarray(F.encode_l24(packed)), jnp.asarray(scale))
     else:
         args = tuple(map(jnp.asarray, F.encode_f8l(packed, scale)))
-    out = Kn.dense_mxfp4_matmul(x, *args, bn=256, nl=128, kc=256, out_dtype=jnp.float32, interpret=True)
+    out = Kn.dense_mxfp4_matmul(x, *args, bn=256, nl=128, kc=256, zero_mode=zero_mode, out_dtype=jnp.float32,
+                                interpret=True)
     want = np.einsum("etk,ekn->etn", np.asarray(x, np.float32), ref)
     np.testing.assert_allclose(np.asarray(out), want, rtol=0, atol=1e-5 * np.abs(want).max())
 
@@ -119,6 +122,7 @@ CASES = [
     (3, 3, 0, [40, 1, 23], 16, 128, "situ_glu", True),
     (3, 3, 0, [70, 2, 50], 16, 128, "situ_glu", True),
     (3, 3, 0, [70, 2, 50], 16, (256, 128), "situ_glu", True),  # (bn, nl): lane sub-tiles
+    (3, 3, 0, [70, 2, 50], 16, (256, 128), "situ_glu", "mask"),  # cache=True + zero_mode="mask"
 ]
 
 
@@ -138,9 +142,10 @@ def test_ragged_gmm(G, E_l, goff, sizes, tm, bn, act, cache):
     gs = jnp.asarray(sizes, jnp.int32)
     x = jnp.asarray(rng.standard_normal((int(sum(sizes)), K)) * 0.5, jnp.bfloat16)
     bn, nl = bn if isinstance(bn, tuple) else (bn, None)
+    zero_mode = cache if isinstance(cache, str) else "mul"
     out = mxfp4_gmm(
-        x, w, s, gs, jnp.int32(goff), tm=tm, bn=bn, nl=nl, kc=128, out_dtype=jnp.float32, cache=cache,
-        interpret=True, **kw
+        x, w, s, gs, jnp.int32(goff), tm=tm, bn=bn, nl=nl, kc=128, out_dtype=jnp.float32, cache=bool(cache),
+        zero_mode=zero_mode, interpret=True, **kw
     )
     ref = mxfp4_gmm_reference(x, deq, gs, goff, w_up_deq=deq_u, activation=act)
     np.testing.assert_allclose(np.asarray(out), np.asarray(ref), rtol=0, atol=2e-6 * float(jnp.abs(ref).max()))
@@ -166,3 +171,30 @@ def test_ragged_gmm_situ_bf16_inputs_and_empty():
     np.testing.assert_allclose(out, ref, rtol=1e-2, atol=1e-3 * np.abs(ref).max())
     empty = mxfp4_gmm(x[:0], w, s, jnp.zeros((2,), jnp.int32), tm=16, bn=128, interpret=True)
     assert empty.shape == (0, N)
+
+
+def test_moe_mlp_matches_bf16_epmoe_reference():
+    """mxfp4_moe_mlp == dequant_mxfp4 + per-expert matmuls + situ_and_mul (EPMoE math)."""
+    from sgl_jax.srt.kernels.mxfp4_gmm import mxfp4_moe_mlp, prepare_l24
+
+    H, I, G, E_l, goff = 256, 128, 6, 3, 2
+    sizes = [5, 3, 17, 0, 9, 4]
+    rng = np.random.default_rng(11)
+    pg, sg = F.random_mxfp4((H, I), E_l, seed=21, zero_frac=0.1)
+    pu, su = F.random_mxfp4((H, I), E_l, seed=22, zero_frac=0.1)
+    pd, sd = F.random_mxfp4((I, H), E_l, seed=23, zero_frac=0.1)
+    x = jnp.asarray(rng.standard_normal((sum(sizes), H)), jnp.bfloat16)
+    gs = jnp.asarray(sizes, jnp.int32)
+    enc = jax.jit(prepare_l24)
+    out = mxfp4_moe_mlp(
+        x, gs, jnp.int32(goff), enc(jnp.asarray(pg)), jnp.asarray(sg), enc(jnp.asarray(pu)), jnp.asarray(su),
+        enc(jnp.asarray(pd)), jnp.asarray(sd), tm=16, bn_up=128, bn_down=256, nl=128, out_dtype=jnp.float32,
+        interpret=True,
+    )
+    deq = lambda p, s: jnp.asarray(F.dequant_reference(p, s))
+    h = mxfp4_gmm_reference(x, deq(pg, sg), gs, goff, w_up_deq=deq(pu, su), activation="situ_glu",
+                            act_input_dtype=jnp.bfloat16).astype(jnp.bfloat16)
+    ref = mxfp4_gmm_reference(h, deq(pd, sd), gs, goff)
+    out, ref = np.asarray(out), np.asarray(ref)
+    np.testing.assert_allclose(out, ref, rtol=2e-2, atol=2e-3 * np.abs(ref).max())
+    assert np.isclose(out, ref, rtol=1e-5, atol=1e-5 * np.abs(ref).max()).mean() > 0.98
