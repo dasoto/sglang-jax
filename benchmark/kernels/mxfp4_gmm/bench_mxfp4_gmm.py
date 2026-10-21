@@ -435,7 +435,8 @@ def run_layer():
 
     def f_mx(x, gs, tm, bn13, bn2, nl, zm):
         h = mxfp4_gmm(x, wg, sg_d, gs, w_up=wu, scale_up=su_d, activation="situ_glu", tm=tm, bn=bn13,
-                      nl=nl if nl and bn13 % nl == 0 else None, zero_mode=zm)
+                      nl=nl if nl and bn13 % nl == 0 else None, zero_mode=zm, act_input_dtype=jnp.bfloat16,
+                      zero_unvisited=False)
         return mxfp4_gmm(h, w2, s2_d, gs, tm=tm, bn=bn2, nl=nl if nl and bn2 % nl == 0 else None, zero_mode=zm)
 
     f_dense = jax.jit(f_bf16_dense)
