@@ -418,6 +418,14 @@ class _TensorSlice:
         shape, ranges = _slice_ranges(tuple(meta["shape"]), index, dtype.itemsize)
         if not ranges:
             return np.empty(shape, dtype=dtype)
+        if len(ranges) > 1 and hasattr(self.source, "_read_full_tensor"):
+            # Strided slice (e.g. a row-parallel weight sharded on its input dim) maps to
+            # one tiny range per row. Object stores serve that as thousands of serialized
+            # round trips, so read the whole tensor once (cached across the host's local
+            # shards) and slice it in memory.
+            full = self.source._read_full_tensor(self.path, meta)
+            full = full.view(dtype).reshape(tuple(meta["shape"]))
+            return np.ascontiguousarray(full[index]).reshape(shape)
         data = np.empty(math.prod(shape) * dtype.itemsize, dtype=np.uint8)
         self.source.read_ranges(
             [(self.path, meta["offset"] + offset, size) for offset, size in ranges],
@@ -446,6 +454,22 @@ class RunaiWeightSource(WeightSource):
         self._metadata: dict[str, list[dict[str, Any]]] = {}
         self._lock = threading.Lock()
         self._streamer = None
+        self._tensor_cache: dict[tuple[str, int], np.ndarray] = {}
+        self._cache_lock = threading.Lock()
+
+    def _read_full_tensor(self, path, meta):
+        key = (path, meta["offset"])
+        with self._cache_lock:
+            hit = self._tensor_cache.get(key)
+        if hit is not None:
+            return hit
+        begin, end = meta["data_offsets"]
+        data = self.read_ranges([(path, meta["offset"], end - begin)])[0]
+        with self._cache_lock:
+            self._tensor_cache[key] = data
+            while len(self._tensor_cache) > 2:
+                self._tensor_cache.pop(next(iter(self._tensor_cache)))
+        return data
 
     @property
     def metadata(self):
@@ -543,6 +567,38 @@ class RunaiWeightSource(WeightSource):
         return self.handles[filename].get_slice(name)[index]
 
     def read_ranges(self, ranges, *, buffer=None):
+        """Coalesce nearby same-file ranges into large object-store reads, then scatter."""
+        if not ranges:
+            return []
+        gap_limit = int(os.environ.get("SGLANG_RUNAI_COALESCE_GAP_BYTES", str(4 << 20)))
+        if gap_limit <= 0 or len(ranges) == 1:
+            return self._stream_ranges(ranges, buffer=buffer)
+        order = sorted(range(len(ranges)), key=lambda i: (ranges[i][0], ranges[i][1]))
+        merged, members = [], []  # merged: [path, start, end]; members: [(i, offset)]
+        for i in order:
+            path, offset, size = ranges[i]
+            if merged and merged[-1][0] == path and offset - merged[-1][2] <= gap_limit:
+                merged[-1][2] = max(merged[-1][2], offset + size)
+                members[-1].append(i)
+            else:
+                merged.append([path, offset, offset + size])
+                members.append([i])
+        if len(merged) == len(ranges):
+            return self._stream_ranges(ranges, buffer=buffer)
+        spans = self._stream_ranges([(p, s, e - s) for p, s, e in merged])
+        if buffer is None:
+            buffer = np.empty(sum(size for _, _, size in ranges), dtype=np.uint8)
+        outputs, cursor = [], 0
+        for _, _, size in ranges:
+            outputs.append(buffer[cursor : cursor + size])
+            cursor += size
+        for (path, start, _), idxs, span in zip(merged, members, spans):
+            for i in idxs:
+                _, offset, size = ranges[i]
+                outputs[i][:] = span[offset - start : offset - start + size]
+        return outputs
+
+    def _stream_ranges(self, ranges, *, buffer=None):
         # A FileStreamer has one active request. MoE loading invokes readers
         # from multiple host threads, so serialize submissions, not SDK I/O.
         with self._lock:
