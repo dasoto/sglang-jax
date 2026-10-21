@@ -110,6 +110,9 @@ def test_dense_kernel(fmt, zero_mode):
                                 interpret=True)
     want = np.einsum("etk,ekn->etn", np.asarray(x, np.float32), ref)
     np.testing.assert_allclose(np.asarray(out), want, rtol=0, atol=1e-5 * np.abs(want).max())
+    out2 = Kn.dense_mxfp4_matmul(x, *args, bn=128, kc=128, zero_mode=zero_mode, out_dtype=jnp.float32, bigdot=True,
+                                 interpret=True)
+    np.testing.assert_allclose(np.asarray(out2), want, rtol=0, atol=1e-5 * np.abs(want).max())
 
 
 CASES = [

@@ -234,11 +234,13 @@ def make_weights(K, N, seed):
 
 
 @guarded("dense")
-def dense_case(x, w, s, *, bn, kc, zero_mode, resident, unroll=1, tag="", want=None, colscale=None, nl=None):
+def dense_case(x, w, s, *, bn, kc, zero_mode, resident, unroll=1, tag="", want=None, colscale=None, nl=None,
+               bigdot=False):
     from sgl_jax.srt.kernels.mxfp4_gmm.kernel import dense_mxfp4_matmul
 
     f = functools.partial(dense_mxfp4_matmul, bn=bn, kc=kc, zero_mode=zero_mode, resident=resident,
-                          unroll=unroll, nl=nl)
+                          unroll=unroll, nl=nl, bigdot=bigdot)
+    tag = tag + ("_bigdot" if bigdot else "")
     if colscale is not None:
         f = functools.partial(f, colscale=colscale)
     t = timeit(f, x, w, s)
@@ -316,6 +318,8 @@ def run_dense8():
     dense_case(x, w, s8, bn=1024, nl=256, kc=256, zero_mode="mul", resident=False)
     dense_case(x, w, s8, bn=1024, nl=256, kc=256, zero_mode="mul", resident=True)
     dense_case(x, w, s8, bn=512, nl=128, kc=256, zero_mode="mul", resident=True)
+    dense_case(x, w, s8, bn=512, kc=256, zero_mode="mul", resident=True, bigdot=True)
+    dense_case(x, w, s8, bn=512, kc=256, zero_mode="mul", resident=False, bigdot=True, want=want)
     if RESULTS.get("mxu_bfloat16xfloat8_e5m2_T8") is not None:
         w8, eg8, cs8 = map(jnp.asarray, F.encode_f8l(packed, scale))
         dense_case(x, w8, eg8, bn=512, kc=256, zero_mode="mul", resident=False, colscale=cs8, tag="_f8", want=want)

@@ -153,8 +153,10 @@ def decode_l24_chunk(w_ref, g_ref, c, *, nblk: int, zero_mode: str, lanes=None):
 # ----------------------------------------------------------------------------------------
 
 
-def _dense_kernel(x_ref, w_ref, s_ref, *rest, kc: int, zero_mode: str, unroll, fmt: str, nl: int):
+def _dense_kernel(x_ref, w_ref, s_ref, *rest, kc: int, zero_mode: str, unroll, fmt: str, nl: int, bigdot: bool):
     # x_ref [T, K] bf16; w_ref [K/8, bn] u32; s_ref [K/32, bn] u8|u32; o_ref [T, bn]
+    wbuf = rest[-1] if bigdot else None
+    rest = rest[:-1] if bigdot else rest
     if fmt == "f8l":
         cs_ref, o_ref, g_scr = rest
         g_scr[...] = f8_scale_operand(s_ref[...].astype(U32), zero_mode=zero_mode)
@@ -163,6 +165,17 @@ def _dense_kernel(x_ref, w_ref, s_ref, *rest, kc: int, zero_mode: str, unroll, f
         o_ref, g_scr = rest
         g_scr[...] = scale_operand(s_ref[...].astype(U32), zero_mode=zero_mode)
         dec = decode_l24_chunk
+    if bigdot:  # decode the whole tile into VMEM, then one MXU dot over the full K
+        def dbody(c, carry):
+            wbuf[pl.ds(pl.multiple_of(c * kc, kc), kc), :] = dec(w_ref, g_scr, c, nblk=kc // 64, zero_mode=zero_mode)
+            return carry
+
+        lax.fori_loop(0, x_ref.shape[1] // kc, dbody, 0, unroll=unroll)
+        acc = jnp.dot(x_ref[...], wbuf[...], preferred_element_type=jnp.float32)
+        if fmt == "f8l":
+            acc = acc * cs_ref[...]
+        o_ref[...] = acc.astype(o_ref.dtype)
+        return
     nblk = kc // 64
     nk = x_ref.shape[1] // kc
     bn = w_ref.shape[1]
@@ -187,7 +200,7 @@ def _dense_kernel(x_ref, w_ref, s_ref, *rest, kc: int, zero_mode: str, unroll, f
 
 @functools.partial(
     jax.jit,
-    static_argnames=("bn", "kc", "nl", "zero_mode", "out_dtype", "resident", "unroll", "interpret"),
+    static_argnames=("bn", "kc", "nl", "zero_mode", "out_dtype", "resident", "unroll", "bigdot", "interpret"),
 )
 def dense_mxfp4_matmul(
     x,
@@ -202,6 +215,7 @@ def dense_mxfp4_matmul(
     out_dtype=jnp.bfloat16,
     resident: bool = False,
     unroll=1,
+    bigdot: bool = False,
     interpret: bool = False,
 ):
     """x [E, T, K] bf16; w l24 uint32 [E, K/8, N]; s uint8|uint32 [E, K/32, N] -> [E, T, N].
@@ -229,12 +243,14 @@ def dense_mxfp4_matmul(
         in_specs.append(pl.BlockSpec((None, 1, bn), widx))
         args.append(colscale)
     return pl.pallas_call(
-        functools.partial(_dense_kernel, kc=kc, zero_mode=zero_mode, unroll=unroll, fmt=fmt, nl=nl or bn),
+        functools.partial(_dense_kernel, kc=kc, zero_mode=zero_mode, unroll=unroll, fmt=fmt, nl=nl or bn,
+                          bigdot=bigdot),
         out_shape=jax.ShapeDtypeStruct((E, T, N), out_dtype),
         grid=(E, N // bn),
         in_specs=in_specs,
         out_specs=pl.BlockSpec((None, T, bn), lambda e, n: (e, 0, n)),
-        scratch_shapes=[pltpu.VMEM((K // 32, bn), U32)],
+        scratch_shapes=[pltpu.VMEM((K // 32, bn), U32)]
+        + ([pltpu.VMEM((K, bn), jnp.bfloat16 if colscale is None else jnp.float8_e5m2)] if bigdot else []),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary", "arbitrary"),
             vmem_limit_bytes=100 * 2**20,
