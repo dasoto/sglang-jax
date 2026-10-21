@@ -179,6 +179,36 @@ def denormal_test():
     log(f"  bf16 subnormal RHS in MXU: {exact}/128 exact, {flushed} flushed to zero")
 
 
+@guarded("convert_rate")
+def convert_rate(src_dtype, dst_dtype=jnp.bfloat16, K=2048, N=1024, rep=50):
+    """In-kernel dtype conversion throughput (e.g. int8 -> bf16 for an int8-intermediate decode)."""
+
+    def kern(w_ref, o_ref):
+        def body(r, c):
+            off = pl.multiple_of((r % 2) * K, K)
+            o_ref[...] = w_ref[pl.ds(off, K), :].astype(dst_dtype)
+            return c
+
+        lax.fori_loop(0, rep, body, 0)
+
+    rng = np.random.default_rng(0)
+    if jnp.issubdtype(src_dtype, jnp.integer):
+        w = jnp.asarray(rng.integers(-96, 97, (2 * K, N)), src_dtype)
+    else:
+        w = jnp.asarray(rng.standard_normal((2 * K, N)), jnp.float32).astype(src_dtype)
+    f = jax.jit(
+        pl.pallas_call(
+            kern,
+            out_shape=jax.ShapeDtypeStruct((K, N), dst_dtype),
+            compiler_params=pltpu.CompilerParams(vmem_limit_bytes=100 * 2**20),
+        )
+    )
+    t = timeit(f, w, n=5)
+    rate = rep * K * N / t
+    RESULTS[f"convert_{jnp.dtype(src_dtype).name}_to_{jnp.dtype(dst_dtype).name}"] = rate
+    log(f"  convert {jnp.dtype(src_dtype).name} -> {jnp.dtype(dst_dtype).name}: {rate/1e12:6.2f} T elem/s")
+
+
 @guarded("hbm_stream")
 def hbm_stream(bm, bn, rows=3136, cols=3072):
     def kern(w_ref, o_ref):
@@ -218,6 +248,8 @@ def run_micro():
     log("== micro: VPU ==")
     for kind in ("add", "mul"):
         vpu_rate(kind)
+    convert_rate(jnp.int8)
+    convert_rate(jnp.float8_e5m2)
     log("== micro: denormals ==")
     denormal_test()
     log("== micro: HBM streaming ==")
