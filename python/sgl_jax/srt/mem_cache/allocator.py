@@ -172,6 +172,8 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.num_pages = size // page_size
         self.pages_per_rank = self.num_pages // dp_size
         self.debug_mode = debug_mode
+        inner_kv = getattr(kvcache, "full_kv_pool", kvcache)
+        self.dcp_size = getattr(inner_kv, "dcp_size", 1) if inner_kv is not None else 1
 
         # Each rank has independent [1, pages_per_rank] page indices
         self.free_pages = [
@@ -181,18 +183,68 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = [[] for _ in range(dp_size)]
         self.is_not_in_free_group = True
 
+    def _pop_dcp_pages(self, dp_rank: int, target_ranks: np.ndarray) -> np.ndarray | None:
+        total_need = len(target_ranks)
+        if total_need == 0:
+            return np.empty(0, dtype=np.int32)
+        if total_need > len(self.free_pages[dp_rank]):
+            self.merge_and_sort_free(dp_rank)
+        if total_need > len(self.free_pages[dp_rank]):
+            return None
+
+        free = self.free_pages[dp_rank]
+        page_ranks = (free - 1) % self.dcp_size
+        if len(self.release_pages[dp_rank]) > 0:
+            for r in range(self.dcp_size):
+                need_r = int(np.sum(target_ranks == r))
+                if need_r > 0 and int(np.sum(page_ranks == r)) < need_r:
+                    self.merge_and_sort_free(dp_rank)
+                    free = self.free_pages[dp_rank]
+                    page_ranks = (free - 1) % self.dcp_size
+                    break
+
+        out_pages = np.empty(total_need, dtype=np.int32)
+        used_mask = np.zeros(len(free), dtype=bool)
+        unmatched_slots = []
+        for r in range(self.dcp_size):
+            req_pos = np.flatnonzero(target_ranks == r)
+            if len(req_pos) == 0:
+                continue
+            cand_idx = np.flatnonzero((page_ranks == r) & (~used_mask))
+            take = min(len(req_pos), len(cand_idx))
+            if take > 0:
+                chosen = cand_idx[:take]
+                out_pages[req_pos[:take]] = free[chosen]
+                used_mask[chosen] = True
+            if take < len(req_pos):
+                unmatched_slots.extend(req_pos[take:].tolist())
+
+        if unmatched_slots:
+            rem_idx = np.flatnonzero(~used_mask)[: len(unmatched_slots)]
+            out_pages[unmatched_slots] = free[rem_idx]
+            used_mask[rem_idx] = True
+
+        self.free_pages[dp_rank] = free[~used_mask]
+        return out_pages
+
     def alloc(self, need_size: int, dp_rank: int = 0) -> np.ndarray | None:
         """Page-aligned allocation."""
         assert need_size % self.page_size == 0, "The allocation size should be page-aligned"
         num_pages = need_size // self.page_size
 
-        if num_pages > len(self.free_pages[dp_rank]):
-            self.merge_and_sort_free(dp_rank)
-        if num_pages > len(self.free_pages[dp_rank]):
-            return None
+        if self.dcp_size > 1:
+            target_ranks = np.arange(num_pages, dtype=np.int32) % self.dcp_size
+            out_pages = self._pop_dcp_pages(dp_rank, target_ranks)
+            if out_pages is None:
+                return None
+        else:
+            if num_pages > len(self.free_pages[dp_rank]):
+                self.merge_and_sort_free(dp_rank)
+            if num_pages > len(self.free_pages[dp_rank]):
+                return None
 
-        out_pages = self.free_pages[dp_rank][:num_pages].copy()
-        self.free_pages[dp_rank] = self.free_pages[dp_rank][num_pages:]
+            out_pages = self.free_pages[dp_rank][:num_pages].copy()
+            self.free_pages[dp_rank] = self.free_pages[dp_rank][num_pages:]
 
         # Generate contiguous indices using numpy internally
         page_indices = out_pages[:, None] * self.page_size + np.arange(self.page_size)
@@ -287,6 +339,22 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         num_pages_before = (prefix_lens_np + self.page_size - 1) // self.page_size
         total_new_pages = np.sum(num_pages_after - num_pages_before)
 
+        if self.dcp_size > 1 and total_new_pages > 0:
+            target_ranks = np.concatenate(
+                [
+                    np.arange(pb, pa, dtype=np.int32) % self.dcp_size
+                    for pb, pa in zip(num_pages_before, num_pages_after)
+                    if pa > pb
+                ]
+            )
+            allocated_pages = self._pop_dcp_pages(dp_rank, target_ranks)
+            if allocated_pages is None:
+                return None
+            out_indices, _ = self._alloc_extend_impl(
+                allocated_pages, prefix_lens_np, extend_lens, last_loc_np, extend_num_tokens
+            )
+            return out_indices
+
         if total_new_pages > len(self.free_pages[dp_rank]):
             self.merge_and_sort_free(dp_rank)
         if total_new_pages > len(self.free_pages[dp_rank]):
@@ -342,6 +410,16 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         num_pages_before = (pre_lens + self.page_size - 1) // self.page_size
         needs_new_page = num_pages_after > num_pages_before
         total_new_pages = np.sum(needs_new_page)
+
+        if self.dcp_size > 1 and total_new_pages > 0:
+            target_ranks = (num_pages_before[needs_new_page] % self.dcp_size).astype(np.int32)
+            allocated_pages = self._pop_dcp_pages(dp_rank, target_ranks)
+            if allocated_pages is None:
+                return None
+            out_indices, _ = self._alloc_decode_impl(
+                allocated_pages, needs_new_page, last_loc_np, batch_size
+            )
+            return out_indices
 
         if total_new_pages > len(self.free_pages[dp_rank]):
             self.merge_and_sort_free(dp_rank)

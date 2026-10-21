@@ -95,14 +95,21 @@ class RecurrentComponent(TreeComponent):
         new_parent.component_data[ct].lock_ref = 0
 
     def on_parent_gains_child(self, node: UnifiedTreeNode) -> None:
-        # Leaf-only invariant: a node turning internal must drop its slot or it
-        # strands unevictable; if locked (a CoW src), defer the free to final unlock.
+        # Unary-chain invariant: a single-child internal node drops its slot so
+        # a single long request does not accumulate one slot per chunk boundary.
+        # However, if the node is a shared branch point (>=2 children or
+        # explicitly checkpointed on an existing internal node), retain its
+        # snapshot so subsequent branches can reuse it.
         cd = node.component_data[self.component_type]
+        if len(node.children) >= 2 or getattr(node, "_recurrent_branch_retained", False):
+            node._recurrent_branch_retained = True
+            return
         if cd.value is None or cd.lock_ref > 0:
             return
         self.req_to_token_pool.free_recurrent_slot(int(cd.value[0]), _node_dp_rank(node))
         self.cache.component_evictable_size_[self.component_type][_node_dp_rank(node)] -= 1
         cd.value = None
+        self.cache._update_aux_evictable_node_sets(node)
 
     def commit_insert_component_data(
         self,
@@ -120,11 +127,11 @@ class RecurrentComponent(TreeComponent):
             result.recurrent_committed = False
             return
         if node.children:
-            result.recurrent_committed = False
-            return
+            node._recurrent_branch_retained = True
         cd.value = params.recurrent_value
         self.cache.component_evictable_size_[ct][_node_dp_rank(node)] += 1
         self.cache._update_evictable_leaf_sets(node)
+        self.cache._update_aux_evictable_node_sets(node)
         result.recurrent_committed = True
 
     def prepare_for_caching_req(
@@ -243,6 +250,7 @@ class RecurrentComponent(TreeComponent):
             self.req_to_token_pool.free_recurrent_slot(int(cd.value[0]), _node_dp_rank(node))
             self.cache.component_evictable_size_[ct][_node_dp_rank(node)] -= 1
             cd.value = None
+            node._recurrent_branch_retained = False
             freed = 1
         return freed, 0
 
@@ -255,23 +263,37 @@ class RecurrentComponent(TreeComponent):
             return
         ct = self.component_type
         dp_rank = params.dp_rank
-        # Evicting a leaf frees its FULL KV too (atomic at page=1); parents are
-        # internal (no recurrent value), so nothing is re-pushed after a pop.
+        candidates = self.cache.aux_evictable_device_nodes.get(
+            ct, self.cache.evictable_device_leaves
+        )
         heap = [
             x
-            for x in self.cache.evictable_device_leaves
+            for x in candidates
             if self.node_has_component_data(x, EvictLayer.DEVICE)
         ]
         heapq.heapify(heap)
         while tracker[ct] < request and heap:
             x = heapq.heappop(heap)
-            if x not in self.cache.evictable_device_leaves:
-                continue
             if not self.node_has_component_data(x, EvictLayer.DEVICE):
+                continue
+            if x.component_data[ct].lock_ref > 0:
                 continue
             if dp_rank is not None and _node_dp_rank(x) != dp_rank:
                 continue
-            self.cache._evict_device_leaf(x, tracker)
+            if x in self.cache.evictable_device_leaves:
+                parent = x.parent
+                self.cache._evict_device_leaf(x, tracker)
+                if (
+                    parent is not None
+                    and parent is not self.cache.root_node
+                    and parent in self.cache.evictable_device_leaves
+                    and self.node_has_component_data(parent, EvictLayer.DEVICE)
+                ):
+                    heapq.heappush(heap, parent)
+            else:
+                freed, _ = self.evict_component(x, EvictLayer.DEVICE)
+                tracker[ct] += freed
+                self.cache._update_aux_evictable_node_sets(x)
 
     # ---- locking ------------------------------------------------------------
 
@@ -311,14 +333,19 @@ class RecurrentComponent(TreeComponent):
         if cd.lock_ref > 0:
             if cd.lock_ref == 1:
                 node_dp_rank = _node_dp_rank(node)
-                if cd.value is not None and node.children:
-                    # Node went internal while locked: deferred free from
-                    # on_parent_gains_child.
+                is_branch = len(node.children) >= 2 or getattr(
+                    node, "_recurrent_branch_retained", False
+                )
+                if cd.value is not None and node.children and not is_branch:
+                    # Unary-chain node went internal while locked: deferred free
+                    # from on_parent_gains_child.
                     self.req_to_token_pool.free_recurrent_slot(int(cd.value[0]), node_dp_rank)
                     self.cache.component_protected_size_[ct][node_dp_rank] -= 1
                     cd.value = None
                     cd.lock_ref = 0
                     return
+                if is_branch:
+                    node._recurrent_branch_retained = True
                 self.cache.component_evictable_size_[ct][node_dp_rank] += 1
                 self.cache.component_protected_size_[ct][node_dp_rank] -= 1
             cd.lock_ref -= 1

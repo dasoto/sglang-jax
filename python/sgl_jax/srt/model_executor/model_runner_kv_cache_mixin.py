@@ -359,6 +359,7 @@ class ModelRunnerKVCacheMixin:
                 num_latent_layers=num_layers,
                 indexer_key_dim=indexer_key_dim,
                 num_indexer_layers=num_indexer_layers,
+                dcp_size=getattr(self.server_args, "dcp_size", 1),
             )
 
         swa_num_kv_heads = getattr(self.model_config.hf_config, "swa_num_key_value_heads", None)
@@ -545,21 +546,24 @@ class ModelRunnerKVCacheMixin:
                 )
             token_capacity = min(token_capacity, max_total_tokens)
 
-        # Page alignment
-        token_capacity = (token_capacity // self.server_args.page_size) * self.server_args.page_size
+        # Page alignment (including dcp_size so each DCP rank has an equal number of pages)
+        dcp_size = getattr(self.server_args, "dcp_size", 1) if getattr(self, "use_mla_backend", False) else 1
+        page_unit = self.server_args.page_size * dcp_size
+        token_capacity = (token_capacity // page_unit) * page_unit
 
         # DP scale
         token_capacity = token_capacity * dp_size
 
-        # Data mesh sharding alignment on total allocated pages (including dp_size reserved pages)
+        # Data mesh sharding alignment on total allocated pages (including dp_size * dcp_size reserved pages)
         if hasattr(self, "mesh") and self.mesh is not None and "data" in self.mesh.shape:
             data_mesh_dim = self.mesh.shape["data"]
             if data_mesh_dim > 1:
                 usable_pages = token_capacity // self.server_args.page_size
-                allocated_pages = usable_pages + dp_size
-                step = math.lcm(dp_size, data_mesh_dim)
+                reserved_pages = dp_size * dcp_size
+                allocated_pages = usable_pages + reserved_pages
+                step = math.lcm(dp_size * dcp_size, data_mesh_dim * dcp_size)
                 allocated_pages = (allocated_pages // step) * step
-                usable_pages = allocated_pages - dp_size
+                usable_pages = allocated_pages - reserved_pages
                 if usable_pages <= 0:
                     raise RuntimeError(
                         "Not enough KV cache capacity to align allocated pages "
@@ -791,6 +795,7 @@ class ModelRunnerKVCacheMixin:
                 kv_lora_rank=kv_lora_rank,
                 qk_rope_head_dim=qk_rope_head_dim,
                 dp_size=dp_size,
+                dcp_size=getattr(self.server_args, "dcp_size", 1),
                 abstract=abstract,
                 **dsa_kwargs,
             )

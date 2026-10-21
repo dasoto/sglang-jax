@@ -56,6 +56,8 @@ class MLAAttentionMetadata:
     page_indices: jax.Array = None
     seq_lens: jax.Array = None
     distribution: jax.Array = None
+    page_seq_positions: jax.Array = None
+    global_seq_lens: jax.Array = None
 
     def tree_flatten(self):
         children = (
@@ -64,6 +66,8 @@ class MLAAttentionMetadata:
             self.page_indices,
             self.seq_lens,
             self.distribution,
+            self.page_seq_positions,
+            self.global_seq_lens,
         )
         aux_data = {}
         return (children, aux_data)
@@ -76,6 +80,8 @@ class MLAAttentionMetadata:
         obj.page_indices = children[2]
         obj.seq_lens = children[3]
         obj.distribution = children[4]
+        obj.page_seq_positions = children[5] if len(children) > 5 else None
+        obj.global_seq_lens = children[6] if len(children) > 6 else None
         return obj
 
 
@@ -109,6 +115,7 @@ class MLAAttentionBackend(AttentionBackend):
         # When num_kv_pages_per_block is None, the kernel's lookup path also
         # overrides this with the tuned value if the "decode" entry hits.
         decode_batch_size: int = 4,
+        dcp_size: int = 1,
     ):
         assert page_size > 1, (
             "MLA attention backend does not support page_size=1. "
@@ -124,6 +131,7 @@ class MLAAttentionBackend(AttentionBackend):
         self.page_size = page_size
         self.mesh = mesh
         self.attention_data_partition_axis = attention_data_partition_axis
+        self.dcp_size = dcp_size
         if vmem_limit_bytes is None:
             if jax.default_backend() == "tpu":
                 from jax.experimental.pallas import tpu as pltpu
@@ -168,7 +176,7 @@ class MLAAttentionBackend(AttentionBackend):
 
         cache_loc_2d = batch.cache_loc.reshape(batch.dp_size, per_dp_loc_len)
         strided_2d = cache_loc_2d[:, :: self.page_size]
-        page_indices = (strided_2d // self.page_size).ravel()
+        logical_pages_2d = strided_2d // self.page_size
 
         if batch.forward_mode == ForwardMode.EXTEND:
             ext_2d = batch.extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
@@ -189,7 +197,6 @@ class MLAAttentionBackend(AttentionBackend):
         aligned_2d = aligned_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
         cu_kv_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
         cu_kv_2d[:, 1:] = np.cumsum(aligned_2d, axis=1)
-        cu_kv_lens = cu_kv_2d.ravel()
 
         seq_lens_2d = batch.seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
         local_num_seqs = np.sum(seq_lens_2d > 0, axis=1, dtype=np.int32)
@@ -202,15 +209,99 @@ class MLAAttentionBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
+        if self.dcp_size <= 1:
+            page_indices = logical_pages_2d.ravel()
+            cu_kv_lens = cu_kv_2d.ravel()
+            (
+                metadata.cu_q_lens,
+                metadata.cu_kv_lens,
+                metadata.page_indices,
+                metadata.seq_lens,
+                metadata.distribution,
+            ) = device_array(
+                (cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
+                sharding=(NamedSharding(self.mesh, P(self.attention_data_partition_axis))),
+            )
+            return metadata
+
+        # DCP > 1: build per-(dp_rank, dcp_rank) local page tables and sequence positions.
+        per_dp_pages = per_dp_loc_len // self.page_size
+        max_pages_per_rank = (per_dp_pages // self.dcp_size) + 2 * batch.per_dp_bs_size
+
+        dcp_page_indices = np.zeros(
+            (batch.dp_size, self.dcp_size, max_pages_per_rank), dtype=np.int32
+        )
+        dcp_page_seq_pos = np.full(
+            (batch.dp_size, self.dcp_size, max_pages_per_rank), 0x3FFFFFFF, dtype=np.int32
+        )
+        dcp_cu_kv_lens = np.zeros(
+            (batch.dp_size, self.dcp_size, batch.per_dp_bs_size + 1), dtype=np.int32
+        )
+        dcp_seq_lens = np.zeros(
+            (batch.dp_size, self.dcp_size, batch.per_dp_bs_size), dtype=np.int32
+        )
+
+        for dp_r in range(batch.dp_size):
+            write_cursors = [0] * self.dcp_size
+            for s in range(batch.per_dp_bs_size):
+                s_len = int(seq_lens_2d[dp_r, s])
+                if s_len <= 0:
+                    for r in range(self.dcp_size):
+                        dcp_cu_kv_lens[dp_r, r, s + 1] = write_cursors[r] * self.page_size
+                    continue
+                p_start = int(cu_kv_2d[dp_r, s]) // self.page_size
+                p_end = int(cu_kv_2d[dp_r, s + 1]) // self.page_size
+                seq_pages = logical_pages_2d[dp_r, p_start:p_end]
+                seq_pos = np.arange(len(seq_pages), dtype=np.int32) * self.page_size
+                valid_mask = seq_pages > 0
+                valid_pages = seq_pages[valid_mask]
+                valid_pos = seq_pos[valid_mask]
+                owners = (valid_pages - 1) % self.dcp_size
+                local_pages = ((valid_pages - 1) // self.dcp_size) + 1
+
+                for r in range(self.dcp_size):
+                    r_mask = owners == r
+                    r_pages = local_pages[r_mask]
+                    r_pos = valid_pos[r_mask]
+                    c = write_cursors[r]
+                    if len(r_pages) == 0:
+                        # Ensure >= 1 page so kernel bkv loop executes at least once and drains DMA semaphores.
+                        dcp_page_indices[dp_r, r, c] = 0
+                        dcp_page_seq_pos[dp_r, r, c] = 0x3FFFFFFF
+                        write_cursors[r] = c + 1
+                        dcp_seq_lens[dp_r, r, s] = 1
+                    else:
+                        n_p = len(r_pages)
+                        dcp_page_indices[dp_r, r, c : c + n_p] = r_pages
+                        dcp_page_seq_pos[dp_r, r, c : c + n_p] = r_pos
+                        write_cursors[r] = c + n_p
+                        last_pos = int(r_pos[-1])
+                        last_tokens = min(self.page_size, max(1, s_len - last_pos))
+                        dcp_seq_lens[dp_r, r, s] = (n_p - 1) * self.page_size + last_tokens
+                    dcp_cu_kv_lens[dp_r, r, s + 1] = write_cursors[r] * self.page_size
+
+        dpa = self.attention_data_partition_axis
         (
             metadata.cu_q_lens,
+            metadata.distribution,
+            metadata.global_seq_lens,
+        ) = device_array(
+            (cu_q_lens, distribution, seq_lens),
+            sharding=(NamedSharding(self.mesh, P(dpa))),
+        )
+        (
             metadata.cu_kv_lens,
             metadata.page_indices,
             metadata.seq_lens,
-            metadata.distribution,
+            metadata.page_seq_positions,
         ) = device_array(
-            (cu_q_lens, cu_kv_lens, page_indices, seq_lens, distribution),
-            sharding=(NamedSharding(self.mesh, P(self.attention_data_partition_axis))),
+            (
+                dcp_cu_kv_lens.ravel(),
+                dcp_page_indices.ravel(),
+                dcp_seq_lens.ravel(),
+                dcp_page_seq_pos.ravel(),
+            ),
+            sharding=(NamedSharding(self.mesh, P((dpa, "tensor")))),
         )
         return metadata
 
@@ -229,6 +320,7 @@ class MLAAttentionBackend(AttentionBackend):
             "num_kv_pages_per_block": self.num_kv_pages_per_block,
             "num_queries_per_block": self.num_queries_per_block,
             "decode_batch_size": self.decode_batch_size,
+            "dcp_size": self.dcp_size,
         }
         return (children, aux_data)
 
@@ -247,6 +339,7 @@ class MLAAttentionBackend(AttentionBackend):
             num_kv_pages_per_block=aux_data["num_kv_pages_per_block"],
             num_queries_per_block=aux_data["num_queries_per_block"],
             decode_batch_size=aux_data["decode_batch_size"],
+            dcp_size=aux_data.get("dcp_size", 1),
         )
         obj.forward_metadata = children[0]
         return obj
@@ -311,36 +404,25 @@ class MLAAttentionBackend(AttentionBackend):
         sliding_window = layer.sliding_window_size if layer is not None else None
         soft_cap = layer.logit_cap if layer is not None else None
 
-        in_specs = (
-            P(dpa, "tensor", None),  # ql_nope    [T, n_h/tp, lkv]
-            P(dpa, "tensor", None),  # q_pe       [T, n_h/tp, r]
-            P(dpa, None),  # new_kv_c   [T, lkv]  (single latent, no head axis)
-            P(dpa, None),  # new_k_pe   [T, r]    (single latent)
-            P(dpa, None, None, None),  # cache (page axis sharded by data)
-            P(dpa),  # seq_lens
-            P(dpa),  # page_indices
-            P(dpa),  # cu_q_lens
-            P(dpa),  # cu_kv_lens
-            P(dpa),  # distribution
-        )
-        out_specs = (
-            P(dpa, "tensor", None),  # o_latent       [T, n_h/tp, lkv]
-            P(dpa, None, None, None),  # updated cache  4D
-        )
+        if self.dcp_size <= 1:
+            in_specs = (
+                P(dpa, "tensor", None),  # ql_nope    [T, n_h/tp, lkv]
+                P(dpa, "tensor", None),  # q_pe       [T, n_h/tp, r]
+                P(dpa, None),  # new_kv_c   [T, lkv]  (single latent, no head axis)
+                P(dpa, None),  # new_k_pe   [T, r]    (single latent)
+                P(dpa, None, None, None),  # cache (page axis sharded by data)
+                P(dpa),  # seq_lens
+                P(dpa),  # page_indices
+                P(dpa),  # cu_q_lens
+                P(dpa),  # cu_kv_lens
+                P(dpa),  # distribution
+            )
+            out_specs = (
+                P(dpa, "tensor", None),  # o_latent       [T, n_h/tp, lkv]
+                P(dpa, None, None, None),  # updated cache  4D
+            )
 
-        def _run(
-            ql_nope_,
-            q_pe_,
-            new_kv_c_,
-            new_k_pe_,
-            cache_,
-            seq_lens_,
-            page_indices_,
-            cu_q_lens_,
-            cu_kv_lens_,
-            distribution_,
-        ):
-            return mla_ragged_paged_attention(
+            def _run(
                 ql_nope_,
                 q_pe_,
                 new_kv_c_,
@@ -351,6 +433,139 @@ class MLAAttentionBackend(AttentionBackend):
                 cu_q_lens_,
                 cu_kv_lens_,
                 distribution_,
+            ):
+                return mla_ragged_paged_attention(
+                    ql_nope_,
+                    q_pe_,
+                    new_kv_c_,
+                    new_k_pe_,
+                    cache_,
+                    seq_lens_,
+                    page_indices_,
+                    cu_q_lens_,
+                    cu_kv_lens_,
+                    distribution_,
+                    sm_scale=sm_scale,
+                    sliding_window=sliding_window,
+                    soft_cap=soft_cap,
+                    num_kv_pages_per_block=self.num_kv_pages_per_block,
+                    num_queries_per_block=self.num_queries_per_block,
+                    decode_batch_size=self.decode_batch_size,
+                    vmem_limit_bytes=self.vmem_limit_bytes,
+                )
+
+            o_latent, updated_cache = jax.shard_map(
+                _run,
+                in_specs=in_specs,
+                out_specs=out_specs,
+                check_vma=False,
+            )(
+                ql_nope,
+                q_pe,
+                new_kv_c,
+                new_k_pe,
+                cache,
+                self.forward_metadata.seq_lens,
+                self.forward_metadata.page_indices,
+                self.forward_metadata.cu_q_lens,
+                self.forward_metadata.cu_kv_lens,
+                self.forward_metadata.distribution,
+            )
+
+            return o_latent, updated_cache
+
+        # DCP > 1 path:
+        # 1. Pre-scatter owned new KV tokens into local cache_
+        # 2. AllGather queries across "tensor" so each DCP rank scores all query heads against its local KV pages
+        # 3. Run mla_ragged_paged_attention with return_lse=True, page_seq_positions, global_kv_lens
+        # 4. Combine partial (o_partial, lse_partial) across "tensor" using LSE reduction and slice local TP heads
+        from sgl_jax.srt.kernels.mla.v2.kernel import align_to
+
+        in_specs_dcp = (
+            P(dpa, "tensor", None),  # ql_nope
+            P(dpa, "tensor", None),  # q_pe
+            P(dpa, None),  # new_kv_c
+            P(dpa, None),  # new_k_pe
+            P((dpa, "tensor"), None, None, None),  # cache sharded by (data, tensor)
+            P((dpa, "tensor")),  # local seq_lens
+            P((dpa, "tensor")),  # local page_indices
+            P(dpa),  # cu_q_lens
+            P((dpa, "tensor")),  # local cu_kv_lens
+            P(dpa),  # distribution
+            P((dpa, "tensor")),  # page_seq_positions
+            P(dpa),  # global_seq_lens
+            P(dpa),  # out_cache_loc
+        )
+        out_specs_dcp = (
+            P(dpa, "tensor", None),  # o_latent [T, n_h/tp, lkv]
+            P((dpa, "tensor"), None, None, None),  # updated cache
+        )
+
+        def _run_dcp(
+            ql_nope_,
+            q_pe_,
+            new_kv_c_,
+            new_k_pe_,
+            cache_,
+            seq_lens_,
+            page_indices_,
+            cu_q_lens_,
+            cu_kv_lens_,
+            distribution_,
+            page_seq_positions_,
+            global_seq_lens_,
+            out_cache_loc_,
+        ):
+            dcp_rank = jax.lax.axis_index("tensor")
+            lkv_dim = align_to(new_kv_c_.shape[-1], 128)
+            r_dim = align_to(new_k_pe_.shape[-1], 128)
+
+            kv_c_pad = (
+                jnp.pad(new_kv_c_, ((0, 0), (0, lkv_dim - new_kv_c_.shape[-1])))
+                if lkv_dim != new_kv_c_.shape[-1]
+                else new_kv_c_
+            )
+            k_pe_pad = (
+                jnp.pad(new_k_pe_, ((0, 0), (0, r_dim - new_k_pe_.shape[-1])))
+                if r_dim != new_k_pe_.shape[-1]
+                else new_k_pe_
+            )
+            new_kv_fused = jnp.concatenate([kv_c_pad, k_pe_pad], axis=-1).astype(cache_.dtype)
+
+            logical_page = out_cache_loc_ // self.page_size
+            in_page = out_cache_loc_ % self.page_size
+            is_owned = (out_cache_loc_ >= self.page_size) & (
+                ((logical_page - 1) % self.dcp_size) == dcp_rank
+            )
+            local_page = ((logical_page - 1) // self.dcp_size) + 1
+
+            cache_flat = cache_.reshape(-1, cache_.shape[-1])
+            local_slot = jnp.where(
+                is_owned,
+                local_page * self.page_size + in_page,
+                cache_flat.shape[0],
+            )
+            cache_flat = cache_flat.at[local_slot].set(new_kv_fused, mode="drop")
+            cache_updated = cache_flat.reshape(cache_.shape)
+
+            # Gather all query heads so every DCP rank computes attention for all heads on its local KV pages.
+            ql_nope_all = jax.lax.all_gather(ql_nope_, axis_name="tensor", axis=1, tiled=True)
+            q_pe_all = jax.lax.all_gather(q_pe_, axis_name="tensor", axis=1, tiled=True)
+
+            o_partial, cache_updated, lse_partial = mla_ragged_paged_attention(
+                ql_nope_all,
+                q_pe_all,
+                new_kv_c_,
+                new_k_pe_,
+                cache_updated,
+                seq_lens_,
+                page_indices_,
+                cu_q_lens_,
+                cu_kv_lens_,
+                distribution_,
+                page_seq_positions=page_seq_positions_,
+                global_kv_lens=global_seq_lens_,
+                return_lse=True,
                 sm_scale=sm_scale,
                 sliding_window=sliding_window,
                 soft_cap=soft_cap,
@@ -360,10 +575,39 @@ class MLAAttentionBackend(AttentionBackend):
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
 
+            # Combine (o_partial, lse_partial) across the "tensor" (DCP) axis.
+            # o_partial: [T_dp, N_h, lkv_dim], lse_partial: [T_dp, N_h]
+            o_gathered = jax.lax.all_gather(o_partial, axis_name="tensor", axis=0, tiled=False)
+            lse_gathered = jax.lax.all_gather(lse_partial, axis_name="tensor", axis=0, tiled=False)
+
+            # Slice this TP rank's query heads: [dcp_size, T_dp, n_h_local, ...]
+            n_h_local = ql_nope_.shape[1]
+            head_start = dcp_rank * n_h_local
+            o_local_heads = jax.lax.dynamic_slice_in_dim(
+                o_gathered, head_start, n_h_local, axis=2
+            ).astype(jnp.float32)
+            lse_local_heads = jax.lax.dynamic_slice_in_dim(
+                lse_gathered, head_start, n_h_local, axis=2
+            )
+
+            lse_max = jnp.max(lse_local_heads, axis=0, keepdims=True)
+            lse_max_safe = jnp.where(jnp.isneginf(lse_max), 0.0, lse_max)
+            weights = jnp.where(
+                jnp.isneginf(lse_local_heads),
+                0.0,
+                jnp.exp(lse_local_heads - lse_max_safe),
+            )
+            weights_sum = jnp.sum(weights, axis=0)
+            weights_norm = weights / jnp.where(weights_sum > 0.0, weights_sum, 1.0)[None, ...]
+            o_combined = jnp.sum(o_local_heads * weights_norm[..., None], axis=0).astype(
+                ql_nope_.dtype
+            )
+            return o_combined, cache_updated
+
         o_latent, updated_cache = jax.shard_map(
-            _run,
-            in_specs=in_specs,
-            out_specs=out_specs,
+            _run_dcp,
+            in_specs=in_specs_dcp,
+            out_specs=out_specs_dcp,
             check_vma=False,
         )(
             ql_nope,
@@ -376,17 +620,20 @@ class MLAAttentionBackend(AttentionBackend):
             self.forward_metadata.cu_q_lens,
             self.forward_metadata.cu_kv_lens,
             self.forward_metadata.distribution,
+            self.forward_metadata.page_seq_positions,
+            self.forward_metadata.global_seq_lens,
+            forward_batch.out_cache_loc,
         )
 
         return o_latent, updated_cache
 
-    @staticmethod
-    def get_max_running_reqests(max_context_len: int, page_size: int) -> int:
+    def get_max_running_reqests(self, max_context_len: int, page_size: int) -> int:
         # Same scalar-prefetch budget heuristic as FlashAttention.get_max_running_reqests:
         # caps the number of concurrent requests by the per-request page slot count
         # so metadata arrays fit in TPU scalar-prefetch memory.
-        num_page_per_req = cdiv(max_context_len, page_size)
-        res = 1024 * 1024 // 2 // num_page_per_req // 4
+        eff_page_size = page_size * max(1, getattr(self, "dcp_size", 1))
+        num_page_per_req = cdiv(max_context_len, eff_page_size)
+        res = 1024 * 1024 // 2 // max(1, num_page_per_req) // 4
         assert (
             res > 0
         ), f"max running requests: {res} must larger than 0, please increase page size or decrease max context length"

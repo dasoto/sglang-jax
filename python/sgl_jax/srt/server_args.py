@@ -270,6 +270,7 @@ class ServerArgs:
     mm_processor_worker_num: int = 0
 
     enable_return_routed_experts: bool = False
+    dcp_size: int = 1
     enable_expert_balance_debug: bool = False
     expert_balance_segment_counter: int = 100
     expert_balance_output_file: str | None = None
@@ -1024,6 +1025,12 @@ class ServerArgs:
             type=int,
             default=ServerArgs.page_size,
             help="The number of tokens in a page.",
+        )
+        parser.add_argument(
+            "--dcp-size",
+            type=int,
+            default=ServerArgs.dcp_size,
+            help="Decode context parallelism (DCP) degree for sharding MLA KV cache pages across the attention TP group.",
         )
         parser.add_argument(
             "--swa-full-tokens-ratio",
@@ -2079,6 +2086,16 @@ class ServerArgs:
         if self.precompile_num_threads < 1:
             raise ValueError("--precompile-num-threads must be at least 1")
         assert (self.tp_size) % self.nnodes == 0, "tp_size must be divisible by number of nodes"
+
+        if self.dcp_size < 1:
+            raise ValueError("--dcp-size must be at least 1")
+        if self.dcp_size > 1:
+            attn_tp = self.tp_size // self.dp_size
+            if self.dcp_size != attn_tp:
+                raise ValueError(
+                    f"--dcp-size ({self.dcp_size}) must equal the attention TP group size "
+                    f"(tp_size // dp_size = {self.tp_size} // {self.dp_size} = {attn_tp})."
+                )
 
         if self.moe_dp_size < 1:
             raise ValueError("--moe-dp-size must be at least 1")
