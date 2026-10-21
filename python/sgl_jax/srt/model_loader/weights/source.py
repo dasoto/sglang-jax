@@ -238,6 +238,25 @@ class LocalSource(WeightSource):
         if not self._warmup or self._prefetched:
             return
         self._prefetched = True
+        # Full-checkpoint warm-up reads every safetensors file on every host. On a
+        # multi-host slice that multiplies GCS traffic by the host count (64 x 1.45 TB
+        # for Kimi-K3) although each host only needs its own shards, so it is opt-in there.
+        warm = os.environ.get("SGLANG_JAX_GCSFUSE_WARMUP", "auto").lower()
+        if warm in ("0", "false", "no"):
+            return
+        if warm == "auto":
+            try:
+                import jax
+
+                if jax.process_count() > 1:
+                    logger.info(
+                        "Multi-host load (%d processes): skipping full-checkpoint GCSFuse "
+                        "warm-up; set SGLANG_JAX_GCSFUSE_WARMUP=1 to force it",
+                        jax.process_count(),
+                    )
+                    return
+            except Exception:
+                pass
         model_path = self.model_config.model_path
         try:
             with open("/proc/mounts") as fp:
