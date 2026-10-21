@@ -7,6 +7,7 @@ import math
 import os
 import pickle
 import struct
+import queue
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -483,8 +484,18 @@ class RunaiWeightSource(WeightSource):
             try:
                 sdk = runai_utils._sdk()
                 self._chunks = sdk.FileChunks
-                self._streamer = sdk.FileStreamer()
-                self._streamer.__enter__()
+                # A FileStreamer serves one request at a time; a small pool lets the
+                # loader's reader threads (experts, per-shard dense reads) overlap
+                # object-store round trips instead of queueing behind one lock.
+                n = max(1, int(os.environ.get("SGLANG_RUNAI_NUM_STREAMERS", "8")))
+                self._pool = queue.Queue()
+                self._all_streamers = []
+                for _ in range(n):
+                    streamer = sdk.FileStreamer()
+                    streamer.__enter__()
+                    self._all_streamers.append(streamer)
+                    self._pool.put(streamer)
+                self._streamer = self._all_streamers[0]
             except Exception as exc:
                 error = exc
             coordinate_error(error, "source initialization")
@@ -539,9 +550,12 @@ class RunaiWeightSource(WeightSource):
         return result
 
     def __exit__(self, exc_type, exc_value, traceback):
-        if self._streamer is not None:
-            self._streamer.__exit__(exc_type, exc_value, traceback)
-            self._streamer = None
+        for streamer in getattr(self, "_all_streamers", None) or (
+            [self._streamer] if self._streamer is not None else []
+        ):
+            streamer.__exit__(exc_type, exc_value, traceback)
+        self._all_streamers = []
+        self._streamer = None
 
     @property
     def identity(self):
@@ -596,13 +610,22 @@ class RunaiWeightSource(WeightSource):
         return outputs
 
     def _stream_ranges(self, ranges, *, buffer=None):
-        # A FileStreamer has one active request. MoE loading invokes readers
-        # from multiple host threads, so serialize submissions, not SDK I/O.
-        with self._lock:
-            if self._streamer is None:
-                raise RuntimeError("RunAI weight source is closed")
-            if not ranges:
-                return []
+        # Each FileStreamer has one active request; borrow one from the pool so
+        # concurrent reader threads stream in parallel.
+        if self._streamer is None:
+            raise RuntimeError("RunAI weight source is closed")
+        if not ranges:
+            return []
+        pool = getattr(self, "_pool", None)
+        streamer = pool.get() if pool is not None else self._streamer
+        try:
+            return self._stream_with(streamer, ranges, buffer)
+        finally:
+            if pool is not None:
+                pool.put(streamer)
+
+    def _stream_with(self, streamer, ranges, buffer):  # noqa: C901
+        if True:  # keeps the original block indentation
             # One owned allocation also lets strided tensor slices avoid a
             # second full-size copy when assembling their contiguous rows.
             if buffer is None:
@@ -623,9 +646,9 @@ class RunaiWeightSource(WeightSource):
                 chunks = [min(chunk_bytes, size - p) for p in range(0, size, chunk_bytes)]
                 requests.append(self._chunks(i, path, offset, chunks))
                 offsets.append([0, *itertools.accumulate(chunks)])
-            self._streamer.stream_files(requests, device="cpu")
+            streamer.stream_files(requests, device="cpu")
             seen = set()
-            for file_id, chunk_id, tensor in self._streamer.get_chunks():
+            for file_id, chunk_id, tensor in streamer.get_chunks():
                 if (file_id, chunk_id) in seen:
                     raise ValueError("RunAI returned a duplicate chunk")
                 begin, end = offsets[file_id][chunk_id : chunk_id + 2]

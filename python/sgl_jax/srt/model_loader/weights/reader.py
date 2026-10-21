@@ -167,13 +167,24 @@ class JaxShardReader(WeightReader):
             groups.setdefault(key, (index, []))[1].append(device)
         try:
             uploaded = {}
-            for index, devices in groups.values():
-                value = callback(index)
+            items = list(groups.values())
+            workers = min(len(items), int(os.environ.get("SGLANG_WEIGHT_SHARD_READ_WORKERS", "8")))
+            if workers > 1:
+                # Distinct local shards are independent reads; overlap their I/O
+                # (object-store latency dominates) and upload in a fixed order.
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    values = list(executor.map(lambda item: callback(item[0]), items))
+            else:
+                values = None
+            for n, (index, devices) in enumerate(items):
+                value = values[n] if values is not None else callback(index)
                 copies = [jax.device_put(value, device) for device in devices]
                 # Retain host owners until transfers finish; duplicate replicas
                 # reuse one read. This wait involves only single-device arrays.
                 jax.block_until_ready(copies)
                 uploaded.update(zip(devices, copies))
+                if values is not None:
+                    values[n] = None
                 del value, copies
             arrays = [uploaded[d] for d in sharding.mesh.devices.flat if d in assignments]
         except Exception as exc:
