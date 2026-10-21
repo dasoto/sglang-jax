@@ -272,6 +272,9 @@ class Scheduler(
         # Init inter-process communication
         context = zmq.Context(2)
         self._comm_backend = None
+        # Multi-host idle throttle for rank 0 (see _wait_for_requests_if_idle).
+        self._idle_poller = None
+        self._idle_poll_ms = int(os.environ.get("SGLANG_JAX_IDLE_POLL_MS", "5"))
 
         if self.node_rank == 0:
             # todo: support multi host
@@ -1153,9 +1156,32 @@ class Scheduler(
                 raise ReceiveDataError(f"[Subscriber {self.node_rank}] Fails to receive data")
         return recv_reqs
 
+    def _wait_for_requests_if_idle(self) -> None:
+        """Rank 0, multi-host: block briefly on the input sockets while fully idle.
+
+        Every loop iteration publishes the received requests (usually an empty
+        list) to the other nodes over ZMQ PUB/SUB with an unbounded high-water
+        mark. A fully idle loop that never blocks publishes empty messages as
+        fast as it spins; the context's I/O threads saturate and the subscriber
+        backlogs grow, so the first request after an idle period waited 20-150 s
+        on a 64-host v5e-256 slice. Polling the input sockets caps the idle
+        publish rate at ~1000 / SGLANG_JAX_IDLE_POLL_MS messages per second and
+        still returns as soon as a request or RPC arrives.
+        """
+        if self._idle_poll_ms <= 0 or not self.is_fully_idle():
+            return
+        if self._idle_poller is None:
+            self._idle_poller = zmq.Poller()
+            for sock in (self.recv_from_tokenizer, self.recv_from_rpc):
+                if sock is not None:
+                    self._idle_poller.register(sock, zmq.POLLIN)
+        self._idle_poller.poll(self._idle_poll_ms)
+
     def recv_requests(self) -> list[Req]:
         """Receive results at node_rank = 0 and broadcast it to all other Node ranks."""
         if self.node_rank == 0:
+            if self.nnodes > 1:
+                self._wait_for_requests_if_idle()
             recv_reqs = []
 
             while True:
