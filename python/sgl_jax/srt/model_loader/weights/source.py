@@ -453,21 +453,29 @@ class RunaiWeightSource(WeightSource):
         self._lock = threading.Lock()
         self._streamer = None
         self._tensor_cache: dict[tuple[str, int], np.ndarray] = {}
+        self._inflight_locks: dict[tuple[str, int], threading.Lock] = {}
         self._cache_lock = threading.Lock()
 
     def _read_full_tensor(self, path, meta):
         key = (path, meta["offset"])
         with self._cache_lock:
             hit = self._tensor_cache.get(key)
-        if hit is not None:
-            return hit
-        begin, end = meta["data_offsets"]
-        data = self.read_ranges([(path, meta["offset"], end - begin)])[0]
-        with self._cache_lock:
-            self._tensor_cache[key] = data
-            while len(self._tensor_cache) > 2:
-                self._tensor_cache.pop(next(iter(self._tensor_cache)))
-        return data
+            if hit is not None:
+                return hit
+            inflight = self._inflight_locks.setdefault(key, threading.Lock())
+        with inflight:
+            with self._cache_lock:
+                hit = self._tensor_cache.get(key)
+                if hit is not None:
+                    return hit
+            begin, end = meta["data_offsets"]
+            data = self.read_ranges([(path, meta["offset"], end - begin)])[0]
+            with self._cache_lock:
+                self._tensor_cache[key] = data
+                self._inflight_locks.pop(key, None)
+                while len(self._tensor_cache) > 8:
+                    self._tensor_cache.pop(next(iter(self._tensor_cache)))
+            return data
 
     @property
     def metadata(self):
