@@ -51,6 +51,8 @@ class EPMoE(nnx.Module):
         pre_gather_quant_dtype=None,
         moe_dp_size: int = 1,
         use_sc_permute: bool | None = None,
+        situ_beta: float = 1.0,
+        situ_linear_beta: float | None = None,
     ):
         self.num_experts_per_tok = num_experts_per_tok
         # Opt-in SparseCore permute/unpermute kernels; ``None`` defers to the env flag.
@@ -78,6 +80,9 @@ class EPMoE(nnx.Module):
         self.activation = activation
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_limit = swiglu_limit
+        # SiTU-GLU (Kimi-K3): beta*tanh(g/beta)*sigmoid(g) * linear_beta*tanh(u/linear_beta).
+        self.situ_beta = situ_beta
+        self.situ_linear_beta = situ_linear_beta
         self.hidden_size = hidden_size
 
         # Get quantization settings from config
@@ -142,39 +147,48 @@ class EPMoE(nnx.Module):
             wo_sharding = P("expert", "tensor", None)
 
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
-            # MOE weights' shape is (num_experts, k, n)
-            self.wi_0 = nnx.Param(
-                jax.random.normal(
-                    jax.random.PRNGKey(0),
-                    (self.num_experts, hidden_size, intermediate_dim),
-                    dtype=weight_dtype,
-                    out_sharding=wi_sharding,
-                )
-            )
+            self._init_expert_weights(wi_sharding, wo_sharding)
 
-            self.wi_1 = nnx.Param(
-                jax.random.normal(
-                    jax.random.PRNGKey(0),
-                    (self.num_experts, hidden_size, intermediate_dim),
-                    dtype=weight_dtype,
-                    out_sharding=wi_sharding,
-                )
-            )
+    def _init_expert_weights(self, wi_sharding: P, wo_sharding: P) -> None:
+        """Create the expert parameters (called under ``self.updated_mesh``).
 
-            self.wo = nnx.Param(
-                jax.random.normal(
-                    jax.random.PRNGKey(0),
-                    (self.num_experts, intermediate_dim, hidden_size),
-                    dtype=weight_dtype,
-                    out_sharding=wo_sharding,
-                )
+        Subclasses that keep experts in a packed format (e.g. MXFP4) override
+        this hook to declare their own parameters.
+        """
+        hidden_size, intermediate_dim = self.hidden_size, self.intermediate_dim
+        # MOE weights' shape is (num_experts, k, n)
+        self.wi_0 = nnx.Param(
+            jax.random.normal(
+                jax.random.PRNGKey(0),
+                (self.num_experts, hidden_size, intermediate_dim),
+                dtype=self.weight_dtype,
+                out_sharding=wi_sharding,
             )
+        )
 
-            # Scales are None by default - only set by quantize_weights() if quantization is enabled
-            # gmm kernel handles None scales properly (no scaling applied)
-            self.wi_0_scale = None
-            self.wi_1_scale = None
-            self.wo_scale = None
+        self.wi_1 = nnx.Param(
+            jax.random.normal(
+                jax.random.PRNGKey(0),
+                (self.num_experts, hidden_size, intermediate_dim),
+                dtype=self.weight_dtype,
+                out_sharding=wi_sharding,
+            )
+        )
+
+        self.wo = nnx.Param(
+            jax.random.normal(
+                jax.random.PRNGKey(0),
+                (self.num_experts, intermediate_dim, hidden_size),
+                dtype=self.weight_dtype,
+                out_sharding=wo_sharding,
+            )
+        )
+
+        # Scales are None by default - only set by quantize_weights() if quantization is enabled
+        # gmm kernel handles None scales properly (no scaling applied)
+        self.wi_0_scale = None
+        self.wi_1_scale = None
+        self.wo_scale = None
 
     def _detect_device_capabilities(self):
         try:
@@ -811,6 +825,12 @@ class EPMoE(nnx.Module):
             gate = jnp.clip(layer_w0, max=self.swiglu_limit)
             up = jnp.clip(layer_w1, -self.swiglu_limit, self.swiglu_limit)
             intermediate_layer = (up + 1.0) * gate * jax.nn.sigmoid(gate * self.swiglu_alpha)
+        elif self.activation == "situ":
+            from sgl_jax.srt.layers.activation import situ_and_mul
+
+            intermediate_layer = situ_and_mul(
+                layer_w0, layer_w1, beta=self.situ_beta, linear_beta=self.situ_linear_beta
+            )
         else:
             raise ValueError(f"Unsupported activation function {self.activation}")
 

@@ -162,7 +162,15 @@ def get_kimi_linear_config(hf_config: Any) -> KimiLinearConfig | None:
     Mirrors ``configs.bailing_hybrid.get_bailing_hybrid_config`` so the dispatch
     layer can detect Kimi-Linear and Bailing-hybrid through symmetric helpers
     instead of comparing model_type strings inline.
+
+    Kimi-K3 (KDA + MLA hybrid with a ``kimi_linear`` text sub-config) returns
+    its text config, so the KDA backend and recurrent-state pools are wired the
+    same way as for Kimi-Linear.
     """
+    from sgl_jax.srt.configs.kimi_k3 import get_kimi_k3_text_config, is_kimi_k3_config
+
+    if is_kimi_k3_config(hf_config):
+        return get_kimi_k3_text_config(hf_config)
     if not _is_kimi_linear_config(hf_config):
         return None
     if getattr(hf_config, "linear_attn_config", None) is None:

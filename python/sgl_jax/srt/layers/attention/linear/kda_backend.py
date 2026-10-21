@@ -506,11 +506,16 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         layer: RadixLinearAttention,
         g: jax.Array,
     ) -> jax.Array:
-        """JAX-side gate activation used by the DECODE path."""
+        """JAX-side gate activation used by the DECODE path.
+
+        Returns the log-decay in float32: FLA's ``fused_recurrent_kda``
+        activates the gate in-kernel in fp32, and the recurrence below runs in
+        fp32 too, so rounding the log-decay to the (bf16) input dtype would only
+        add error (up to ~0.4% per-step decay error at the K3 lower bound -5).
+        """
         if layer.A_log is None or layer.dt_bias is None:
             raise ValueError("KDA gate activation requires layer.A_log and layer.dt_bias")
         H = g.shape[-2]
-        orig_dtype = g.dtype
         g32 = g.astype(jnp.float32) + layer.dt_bias.value.reshape(H, -1).astype(jnp.float32)
         a_scale = jnp.exp(layer.A_log.value.reshape(H, 1).astype(jnp.float32))
         lower_bound = getattr(layer, "kda_gate_lower_bound", None)
@@ -520,7 +525,7 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
             out = -a_scale * jax.nn.softplus(g32)
         else:
             out = lower_bound * jax.nn.sigmoid(a_scale * g32)
-        return out.astype(orig_dtype)
+        return out
 
     def _unpack_conv_states(
         self,

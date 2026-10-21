@@ -113,6 +113,16 @@ class NativeAttention(AttentionBackend):
             softmax_dtype=layer.softmax_dtype,
         )
 
+        # The KV pool pads head_dim to a multiple of 128 (e.g. MLA 192 -> 256);
+        # the padded V columns are zero, so drop them to return the layer's
+        # [tokens, heads * v_head_dim] contract.
+        pooled_v_dim = attn_output.shape[-1] // layer.q_head_num
+        v_head_dim = getattr(layer, "v_head_dim", pooled_v_dim)
+        if v_head_dim < pooled_v_dim:
+            attn_output = attn_output.reshape(-1, layer.q_head_num, pooled_v_dim)[
+                :, :, :v_head_dim
+            ].reshape(-1, layer.q_head_num * v_head_dim)
+
         # Return full fused KV buffer for this layer so that caller can persist it outside JIT
         return attn_output, kv_fused
 
