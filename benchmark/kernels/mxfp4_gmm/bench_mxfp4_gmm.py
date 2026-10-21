@@ -35,7 +35,7 @@ _LOG_STATE = {"gcs": None, "last_upload": 0.0, "t0": time.time(), "budget": 1e9}
 
 def _upload_log(force=False):
     url = _LOG_STATE["gcs"]
-    if not url or (not force and time.time() - _LOG_STATE["last_upload"] < 10):
+    if not url or (not force and time.time() - _LOG_STATE["last_upload"] < 3):
         return
     _LOG_STATE["last_upload"] = time.time()
     try:
@@ -377,14 +377,18 @@ def gmm_case(x, ws, gs, goff, *, tm, bn, situ, cache=True, tag="", nl=None):
 
     if situ:
         w, s, wu, su = ws
-        f = jax.jit(lambda x, gs, goff: mxfp4_gmm(x, w, s, gs, goff, w_up=wu, scale_up=su, activation="situ_glu",
-                                                   tm=tm, bn=bn, nl=nl, cache=cache))
+        f = jax.jit(lambda x, w, s, wu, su, gs, goff: mxfp4_gmm(
+            x, w, s, gs, goff, w_up=wu, scale_up=su, activation="situ_glu",
+            tm=tm, bn=bn, nl=nl, cache=cache))
+        args = (x, w, s, wu, su, gs, goff)
         nweights = 2 * w.shape[0] * x.shape[1] * w.shape[2]
     else:
         w, s = ws
-        f = jax.jit(lambda x, gs, goff: mxfp4_gmm(x, w, s, gs, goff, tm=tm, bn=bn, nl=nl, cache=cache))
+        f = jax.jit(lambda x, w, s, gs, goff: mxfp4_gmm(
+            x, w, s, gs, goff, tm=tm, bn=bn, nl=nl, cache=cache))
+        args = (x, w, s, gs, goff)
         nweights = w.shape[0] * x.shape[1] * w.shape[2]
-    t = timeit(f, x, gs, goff)
+    t = timeit(f, *args)
     key = f"gmm{tag}_situ{int(situ)}_M{x.shape[0]}_tm{tm}_bn{bn}_nl{nl or bn}_c{int(cache)}"
     RESULTS[key] = t * 1e6
     log(f"  gmm{tag} situ={int(situ)} M={x.shape[0]:>5} tm={tm:>4} bn={bn:>4} nl={nl or bn:>4} cache={int(cache)}: "
@@ -452,28 +456,30 @@ def run_layer():
     pg, sg, pu, su, p2, s2 = map(jnp.asarray, (pg, sg, pu, su, p2, s2))
     b13 = jnp.concatenate([bg, bu], axis=-1)
 
-    def f_bf16_dense(x):  # x [E, T, K]: XLA einsum with resident bf16 weights (the 0.54 ms baseline)
+    def f_bf16_dense(x, b13, b2):  # x [E, T, K]: XLA einsum with resident bf16 weights (the 0.54 ms baseline)
         h = jnp.einsum("etk,ekn->etn", x, b13)
         return jnp.einsum("etn,enk->etk", situ(h), b2)
 
-    def f_megablox_bf16(x, gs):  # current MXFP4EPMoE path minus the dequant: bf16 megablox gmm
+    def f_megablox_bf16(x, gs, bg, bu, b2):  # current MXFP4EPMoE path minus the dequant: bf16 megablox gmm
         g = megablox_gmm(x, bg, gs, preferred_element_type=jnp.bfloat16)
         u = megablox_gmm(x, bu, gs, preferred_element_type=jnp.bfloat16)
         h = situ(jnp.concatenate([g, u], axis=-1))
         return megablox_gmm(h, b2, gs, preferred_element_type=jnp.bfloat16)
 
-    def f_current(x, gs):  # XLA dequant + bf16 megablox (what moe_mxfp4.py does today)
+    def f_current(x, gs, pg, sg, pu, su, p2, s2):  # XLA dequant + bf16 megablox (what moe_mxfp4.py does today)
         dg, du, d2 = deq(pg, sg), deq(pu, su), deq(p2, s2)
         g = megablox_gmm(x, dg, gs, preferred_element_type=jnp.bfloat16)
         u = megablox_gmm(x, du, gs, preferred_element_type=jnp.bfloat16)
         h = situ(jnp.concatenate([g, u], axis=-1))
         return megablox_gmm(h, d2, gs, preferred_element_type=jnp.bfloat16)
 
-    def f_mx(x, gs, tm, bn13, bn2, nl, zm):
+    def f_mx(x, gs, wg, sg_d, wu, su_d, w2, s2_d, *, tm, bn13, bn2, nl, zm):
+        use_cache = x.shape[0] > tm * wg.shape[0]
         h = mxfp4_gmm(x, wg, sg_d, gs, w_up=wu, scale_up=su_d, activation="situ_glu", tm=tm, bn=bn13,
                       nl=nl if nl and bn13 % nl == 0 else None, zero_mode=zm, act_input_dtype=jnp.bfloat16,
-                      zero_unvisited=False)
-        return mxfp4_gmm(h, w2, s2_d, gs, tm=tm, bn=bn2, nl=nl if nl and bn2 % nl == 0 else None, zero_mode=zm)
+                      cache=use_cache, zero_unvisited=False)
+        return mxfp4_gmm(h, w2, s2_d, gs, tm=tm, bn=bn2, nl=nl if nl and bn2 % nl == 0 else None,
+                         zero_mode=zm, cache=use_cache)
 
     f_dense = jax.jit(f_bf16_dense)
     f_mb = jax.jit(f_megablox_bf16)
@@ -485,9 +491,10 @@ def run_layer():
         x3 = jnp.asarray(rng.standard_normal((E_LOCAL, T, HID)) * 0.5, jnp.bfloat16)
         x = x3.reshape(M, HID)
         line = f"  T/expert={T:>5}:"
-        ref = np.asarray(f_dense(x3).astype(jnp.float32)).reshape(M, HID)
-        for name, fn, args in (("bf16-einsum", f_dense, (x3,)), ("bf16-megablox", f_mb, (x, gs)),
-                               ("dequant+megablox", f_cur, (x, gs))):
+        ref = np.asarray(f_dense(x3, b13, b2).astype(jnp.float32)).reshape(M, HID)
+        for name, fn, args in (("bf16-einsum", f_dense, (x3, b13, b2)),
+                               ("bf16-megablox", f_mb, (x, gs, bg, bu, b2)),
+                               ("dequant+megablox", f_cur, (x, gs, pg, sg, pu, su, p2, s2))):
             try:
                 t = timeit(fn, *args)
                 RESULTS[f"layer_{name}_T{T}"] = t * 1e3
@@ -503,11 +510,11 @@ def run_layer():
                 try:
                     check_budget()
                     f = jax.jit(functools.partial(f_mx, tm=tm, bn13=bn13, bn2=bn2, nl=nl, zm=zm))
-                    t = timeit(f, x, gs)
+                    t = timeit(f, x, gs, wg, sg_d, wu, su_d, w2, s2_d)
                     RESULTS[f"layer_mx_T{T}_tm{tm}_bn{bn13}-{bn2}_nl{nl}_{zm}"] = t * 1e3
                     log(f"    mx tm={tm} bn={bn13}/{bn2} nl={nl} zero={zm}: {t*1e3:.3f} ms")
                     if best is None or t < best[0]:
-                        got = np.asarray(f(x, gs).astype(jnp.float32))
+                        got = np.asarray(f(x, gs, wg, sg_d, wu, su_d, w2, s2_d).astype(jnp.float32))
                         err = np.abs(got - ref).max() / max(np.abs(ref).max(), 1e-30)
                         best = (t, tm, f"{bn13}/{bn2} nl={nl} {zm}", "", err)
                 except BudgetExceeded:
@@ -525,7 +532,7 @@ def run_layer():
 
 SECTIONS: list = []
 LAYER_TS = (1, 8, 64, 256, 1024)
-LAYER_CFGS = ((768, 1792, 256, "mul"), (768, 1792, 256, "mask"), (512, 896, None, "mul"))
+LAYER_CFGS = ((512, 512, None, "mul"), (512, 896, None, "mul"), (512, 512, None, "mask"))
 
 
 def main():

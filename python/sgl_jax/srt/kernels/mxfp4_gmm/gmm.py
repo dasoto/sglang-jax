@@ -114,7 +114,22 @@ def _gmm_kernel(
             lax.fori_loop(0, nk, body, 0)
 
     def cached_mm(wc_ref, acc_ref):
-        acc_ref[...] = jnp.dot(lhs_ref[...], wc_ref[:, col], preferred_element_type=jnp.float32)
+        def cchunk(c):
+            rows = pl.ds(pl.multiple_of(c * kc, kc), kc)
+            xk = lhs_ref[:, rows]
+            wd = wc_ref[rows, col]
+            return jnp.dot(xk, wd, preferred_element_type=jnp.float32)
+
+        if carry_in_vregs:
+            acc_ref[...] = lax.fori_loop(0, nk, lambda c, a: a + cchunk(c), jnp.zeros((tm, bn), jnp.float32))
+        else:
+            acc_ref[...] = jnp.zeros_like(acc_ref)
+
+            def cbody(c, carry):
+                acc_ref[...] += cchunk(c)
+                return carry
+
+            lax.fori_loop(0, nk, cbody, 0)
 
     for i in range(n_w):
         if cache:

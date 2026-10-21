@@ -65,9 +65,9 @@ def mxfp4_moe_mlp(
     act_input_dtype=jnp.bfloat16,
     out_dtype=jnp.bfloat16,
     tm: int | None = None,
-    bn_up: int = 768,
-    bn_down: int = 1792,
-    nl: int | None = 256,
+    bn_up: int = 512,
+    bn_down: int = 512,
+    nl: int | None = None,
     zero_mode: str = "mul",
     zero_unvisited: bool = True,
     interpret: bool = False,
@@ -83,6 +83,8 @@ def mxfp4_moe_mlp(
     n_up, n_down = w_gate.shape[-1], w_down.shape[-1]
     bn_up = bn_up if n_up % bn_up == 0 else n_up
     bn_down = bn_down if n_down % bn_down == 0 else n_down
+    # VMEM decoded-weight cache is only useful when the input has more m-tiles than local experts.
+    use_cache = x.shape[0] > tm * w_gate.shape[0]
     h = mxfp4_gmm(
         x,
         w_gate,
@@ -100,6 +102,7 @@ def mxfp4_moe_mlp(
         act_input_dtype=act_input_dtype,
         out_dtype=x.dtype,
         zero_mode=zero_mode,
+        cache=use_cache,
         zero_unvisited=False,  # the down GMM only reads local rows
         interpret=interpret,
     )
@@ -114,6 +117,7 @@ def mxfp4_moe_mlp(
         nl=nl if nl and bn_down % nl == 0 else None,
         out_dtype=out_dtype,
         zero_mode=zero_mode,
+        cache=use_cache,
         zero_unvisited=zero_unvisited,
         interpret=interpret,
     )
