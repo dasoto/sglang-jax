@@ -99,6 +99,13 @@ class QuantizationConfig:
         is_static_checkpoint: Whether the checkpoint is static (true for checkpoints quantized offline, false for on-the-fly quantization)
         ignored_layers: Optional list of layer name patterns to exclude from quantization
         weight_block_size: Optional block sizes for block quantization (e.g., [128, 128])
+        moe_weight_format: Optional packed storage format for static MoE expert
+            weights that is not expressible as a single dtype. ``"mxfp4"``:
+            compressed-tensors ``mxfp4-pack-quantized`` (E2M1 nibbles packed two
+            per uint8, low nibble = even column, plus one uint8 E8M0 scale per
+            32 weights). Such experts are kept packed on device and dequantized
+            inside the MoE layer (see ``layers/moe_mxfp4.py``); they do not go
+            through ``EPMoE.quantize_weights``.
     """
 
     linear_rules: list[dict] | None = None
@@ -108,6 +115,7 @@ class QuantizationConfig:
     ignored_layers: list[str] | None = None
     weight_block_size: tuple[int, int] | None = None
     allow_narrow_n_blockwise: bool = False
+    moe_weight_format: str | None = None
 
     def to_dict(self) -> dict:
         # Required by transformers.PretrainedConfig.to_json_string when this
@@ -127,6 +135,7 @@ class QuantizationConfig:
                 list(self.weight_block_size) if self.weight_block_size is not None else None
             ),
             "allow_narrow_n_blockwise": self.allow_narrow_n_blockwise,
+            "moe_weight_format": self.moe_weight_format,
         }
 
     @classmethod
@@ -211,6 +220,10 @@ class QuantizationConfig:
     def get_moe_weight_dtype(self) -> jnp.dtype | None:
         """Get the dtype for MoE weight quantization."""
         return self.moe_weight_dtype
+
+    def is_mxfp4_moe(self) -> bool:
+        """Whether routed experts are stored as packed MXFP4 (E2M1 + E8M0)."""
+        return self.moe_weight_format == "mxfp4"
 
     def get_moe_activation_dtype(self) -> jnp.dtype | None:
         """Get the dtype for MoE activation quantization."""

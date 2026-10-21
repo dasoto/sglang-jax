@@ -59,6 +59,10 @@ _FUSED_MOE_V2_SUPPORTED_ARCHITECTURES = frozenset(
 
 _FORCED_FUSED_EP_MOE_ARCHS = frozenset({"Qwen3_5MoeForConditionalGeneration"})
 
+# Models whose MoE block always uses EPMoE (e.g. Kimi-K3: 896 experts do not
+# divide a whole v5e mesh and FusedEPMoE replicates the shared experts).
+_FORCED_EP_MOE_ARCHS = frozenset({"KimiK3ForConditionalGeneration"})
+
 _MOE_DP_SUPPORTED_ARCHITECTURES = frozenset({"BailingMoeV3ForCausalLM"})
 
 
@@ -177,6 +181,16 @@ class ModelConfig:
                 self.moe_backend.value,
             )
             self.moe_backend = MoEBackend.FUSED
+        if (
+            self.hf_config.architectures[0] in _FORCED_EP_MOE_ARCHS
+            and self.moe_backend != MoEBackend.EPMOE
+        ):
+            logger.info(
+                "%s hard-codes EPMoE; resolving effective moe_backend %s -> epmoe",
+                self.hf_config.architectures[0],
+                self.moe_backend.value,
+            )
+            self.moe_backend = MoEBackend.EPMOE
 
         # Unify quantization config handling:
         # 1. User provided config path -> use it
@@ -572,6 +586,8 @@ class ModelConfig:
                         weight_block_size=weight_block_size,
                     )
                     return quant_config
+                elif format_type == "mxfp4-pack-quantized":
+                    return _mxfp4_pack_quantization_config(hf_quant_config)
                 elif format_type == "pack-quantized":
                     groups = hf_quant_config.get("config_groups")
                     if not isinstance(groups, dict) or not groups:
@@ -1034,6 +1050,49 @@ class ModelConfig:
                 f"Remote URLs are not supported in JAX implementation. "
                 f"Please use a local path or HuggingFace model name instead: {self.model_path}"
             )
+
+
+def _mxfp4_pack_quantization_config(hf_quant_config: dict) -> QuantizationConfig:
+    """Build the static config for compressed-tensors ``mxfp4-pack-quantized``.
+
+    Kimi-K3 ships its routed experts in this format (everything else is BF16,
+    see the ``ignore`` list). Experts stay packed on device; the MoE layer
+    dequantizes them per forward. No linear layer is quantized.
+    """
+    groups = hf_quant_config.get("config_groups")
+    if not isinstance(groups, dict) or not groups:
+        raise ValueError("mxfp4-pack-quantized requires non-empty config_groups.")
+    for name, group in groups.items():
+        weights = group.get("weights") if isinstance(group, dict) else None
+        if not isinstance(weights, dict) or not (
+            weights.get("num_bits") == 4
+            and weights.get("type") == "float"
+            and weights.get("strategy") == "group"
+            and weights.get("group_size") == 32
+            and weights.get("symmetric", True) is True
+            and not weights.get("dynamic", False)
+            and weights.get("actorder") is None
+        ):
+            raise ValueError(
+                "mxfp4-pack-quantized supports only static FP4 (E2M1) weights with "
+                f"group_size=32 E8M0 scales; unsupported config group {name!r}: {weights}"
+            )
+        if any(group.get(key) is not None for key in ("input_activations", "output_activations")):
+            raise ValueError("mxfp4-pack-quantized activation quantization is not supported.")
+    ignored_layers = hf_quant_config.get("ignore") or []
+    logger.info(
+        "Auto-detected compressed-tensors MXFP4 (mxfp4-pack-quantized) checkpoint; "
+        "routed experts stay packed and are dequantized in the MoE layer."
+    )
+    return QuantizationConfig(
+        is_static_checkpoint=True,
+        linear_rules=[],
+        moe_weight_dtype=None,
+        moe_activation_dtype=None,
+        ignored_layers=list(ignored_layers),
+        weight_block_size=None,
+        moe_weight_format="mxfp4",
+    )
 
 
 def _get_and_verify_dtype(
