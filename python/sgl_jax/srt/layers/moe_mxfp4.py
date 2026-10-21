@@ -174,6 +174,18 @@ class MXFP4EPMoE(EPMoE):
         local_range=None,
     ):
         # Local k-major shards decode straight into GMM [E_l, k, n] operands.
+        # The barrier ties the packed weights to this layer's activations so XLA
+        # cannot hoist (and keep live) the bf16 dequant of every layer up front.
+        packed = (
+            w0_kernel,
+            w1_kernel,
+            wo_kernel,
+            w0_kernel_scale,
+            w1_kernel_scale,
+            wo_kernel_scale,
+        )
+        *packed, inputs_2d = jax.lax.optimization_barrier((*packed, inputs_2d))
+        w0_kernel, w1_kernel, wo_kernel, w0_kernel_scale, w1_kernel_scale, wo_kernel_scale = packed
         dequant = partial(dequant_mxfp4, axis=-2, out_dtype=self.dtype)
         return super()._gmm_compute(
             inputs_2d,
