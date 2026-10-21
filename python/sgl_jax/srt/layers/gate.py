@@ -92,6 +92,7 @@ class GateLogit(nnx.Module):
         compute_dtype: jnp.dtype = jnp.float32,
         bias_dtype: jnp.dtype | None = None,
         score_func: str | None = "softmax",
+        kernel_axes: tuple[str | None, str | None] = (None, None),
     ):
         self.weight_dtype = weight_dtype
         self.enable_expert_bias = enable_expert_bias
@@ -99,13 +100,14 @@ class GateLogit(nnx.Module):
         self.kernel_dtype = kernel_dtype
         self.compute_dtype = compute_dtype
         self.bias_dtype = weight_dtype if bias_dtype is None else bias_dtype
+        self.kernel_axes = tuple(kernel_axes)
 
         self.kernel = nnx.Param(
             jax.random.normal(
                 jax.random.PRNGKey(0),
                 (input_size, num_experts),
                 dtype=self.kernel_dtype,
-                out_sharding=P(None, None),
+                out_sharding=P(*self.kernel_axes),
             ),
         )
         if enable_expert_bias:
@@ -133,13 +135,19 @@ class GateLogit(nnx.Module):
 
         if self.score_func:
             if self.score_func == "softmax":
+                if self.kernel_axes[1] is not None:
+                    logits = jax.sharding.reshard(logits, jax.typeof(hidden_states).sharding)
                 logits = jax.nn.softmax(logits, axis=-1)
+                return logits
             elif self.score_func == "sigmoid":
                 logits = jax.nn.sigmoid(logits)
             elif self.score_func == "tanh":
                 logits = jax.nn.tanh(logits)
             else:
                 raise ValueError("unknown score func")
+
+        if self.kernel_axes[1] is not None:
+            logits = jax.sharding.reshard(logits, jax.typeof(hidden_states).sharding)
 
         return logits
 

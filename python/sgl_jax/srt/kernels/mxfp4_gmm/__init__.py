@@ -66,7 +66,7 @@ def mxfp4_moe_mlp(
     out_dtype=jnp.bfloat16,
     tm: int | None = None,
     bn_up: int = 512,
-    bn_down: int = 512,
+    bn_down: int = 896,
     nl: int | None = None,
     zero_mode: str = "mul",
     zero_unvisited: bool = True,
@@ -81,8 +81,8 @@ def mxfp4_moe_mlp(
     if tm is None:
         tm = pick_row_tile(x.shape[0], group_sizes.shape[0])
     n_up, n_down = w_gate.shape[-1], w_down.shape[-1]
-    bn_up = bn_up if n_up % bn_up == 0 else n_up
-    bn_down = bn_down if n_down % bn_down == 0 else n_down
+    bn_up = bn_up if n_up % bn_up == 0 else (512 if n_up % 512 == 0 else n_up)
+    bn_down = bn_down if n_down % bn_down == 0 else (512 if n_down % 512 == 0 else n_down)
     # VMEM decoded-weight cache is only useful when the input has more m-tiles than local experts.
     use_cache = x.shape[0] > tm * w_gate.shape[0]
     h = mxfp4_gmm(

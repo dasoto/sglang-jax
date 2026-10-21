@@ -312,6 +312,263 @@ class Ling3Detector(Glm45Detector):
         return result
 
 
+_K3_THINK_OPEN = "<|open|>think<|sep|>"
+_K3_THINK_CLOSE = "<|close|>think<|sep|>"
+_K3_RESPONSE_OPEN = "<|open|>response<|sep|>"
+_K3_RESPONSE_CLOSE = "<|close|>response<|sep|>"
+_K3_TOOLS_OPEN = "<|open|>tools<|sep|>"
+_K3_TOOLS_CLOSE = "<|close|>tools<|sep|>"
+_K3_MESSAGE_CLOSE = "<|close|>message<|sep|>"
+_K3_PARTIAL_SUFFIXES = (
+    "<|open|>",
+    "<|close|>",
+    _K3_THINK_CLOSE.removesuffix("<|sep|>"),
+    _K3_RESPONSE_OPEN.removesuffix("<|sep|>"),
+    _K3_RESPONSE_CLOSE.removesuffix("<|sep|>"),
+    _K3_TOOLS_OPEN.removesuffix("<|sep|>"),
+    _K3_TOOLS_CLOSE.removesuffix("<|sep|>"),
+    _K3_MESSAGE_CLOSE.removesuffix("<|sep|>"),
+)
+
+
+def _k3_partial_suffix_len(text: str, markers: list[str]) -> int:
+    best = 0
+    for marker in markers:
+        if not marker:
+            continue
+        for length in range(min(len(marker) - 1, len(text)), best, -1):
+            if text.endswith(marker[:length]):
+                best = length
+                break
+    return best
+
+
+def _k3_strip_partial_suffix(text: str) -> str:
+    for suffix in _K3_PARTIAL_SUFFIXES:
+        if text.endswith(suffix):
+            return text[: -len(suffix)]
+    return text
+
+
+def _k3_strip_response_wrappers(text: str) -> str:
+    open_idx = text.find(_K3_RESPONSE_OPEN)
+    if open_idx != -1:
+        close_idx = text.find(_K3_RESPONSE_CLOSE, open_idx + len(_K3_RESPONSE_OPEN))
+        if close_idx != -1:
+            text = text[open_idx + len(_K3_RESPONSE_OPEN) : close_idx]
+        else:
+            text = text[open_idx + len(_K3_RESPONSE_OPEN) :]
+    else:
+        text = text.replace(_K3_RESPONSE_CLOSE, "")
+    text = text.replace(_K3_MESSAGE_CLOSE, "")
+    return _k3_strip_partial_suffix(text)
+
+
+class KimiK3Detector(BaseReasoningFormatDetector):
+    """Detector for the Kimi-K3 XTML think channel (`<|open|>think<|sep|>...<|close|>think<|sep|>`)."""
+
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
+        super().__init__(
+            _K3_THINK_OPEN,
+            _K3_THINK_CLOSE,
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token=_K3_TOOLS_OPEN,
+        )
+        self._reasoning_done = False
+        self._tools_passthrough = False
+        self._streamed_reasoning: list[str] = []
+        self._discard_delayed_think_close = False
+
+    def _clean_content(self, text: str) -> str:
+        tools_idx = text.find(_K3_TOOLS_OPEN)
+        if tools_idx != -1:
+            return _k3_strip_response_wrappers(text[:tools_idx]) + text[tools_idx:]
+        return _k3_strip_response_wrappers(text)
+
+    def _next_channel_idx(self, text: str, start: int = 0) -> int:
+        found = [
+            idx
+            for token in (_K3_RESPONSE_OPEN, self.tool_start_token)
+            if token and (idx := text.find(token, start)) != -1
+        ]
+        return min(found) if found else -1
+
+    @staticmethod
+    def _skipped_think_channel(
+        text: str,
+        start: int = 0,
+        think_close_idx: int = -1,
+        next_channel_idx: int = -1,
+    ) -> bool:
+        response_close_idx = text.find(_K3_RESPONSE_CLOSE, start)
+        return response_close_idx != -1 and all(
+            boundary_idx == -1 or response_close_idx < boundary_idx
+            for boundary_idx in (think_close_idx, next_channel_idx)
+        )
+
+    def detect_and_parse(self, text: str) -> StreamingParseResult:
+        in_reasoning = self._in_reasoning or self.think_start_token in text
+        if not in_reasoning and self.think_end_token not in text:
+            return StreamingParseResult(normal_text=self._clean_content(text))
+
+        open_idx = text.find(self.think_start_token)
+        start = open_idx + len(self.think_start_token) if open_idx != -1 else 0
+        close_idx = text.find(self.think_end_token, start)
+        tools_idx = text.find(self.tool_start_token, start) if self.tool_start_token else -1
+        channel_idx = self._next_channel_idx(text, start)
+        if self._skipped_think_channel(text, start, close_idx, channel_idx):
+            return StreamingParseResult(
+                normal_text=self._clean_content(text[start:].replace(self.think_end_token, ""))
+            )
+        if close_idx != -1 and tools_idx != -1 and tools_idx < close_idx:
+            return StreamingParseResult(
+                reasoning_text=_k3_strip_partial_suffix(text[start:tools_idx]),
+                normal_text=self._clean_content(text[tools_idx:]),
+            )
+        if close_idx == -1:
+            if channel_idx != -1:
+                return StreamingParseResult(
+                    reasoning_text=_k3_strip_partial_suffix(text[start:channel_idx]),
+                    normal_text=self._clean_content(text[channel_idx:]),
+                )
+            return StreamingParseResult(reasoning_text=_k3_strip_partial_suffix(text[start:]))
+
+        reasoning_text = text[start:close_idx]
+        rest = text[close_idx + len(self.think_end_token) :]
+        return StreamingParseResult(
+            reasoning_text=reasoning_text,
+            normal_text=self._clean_content(rest),
+        )
+
+    def parse_streaming_increment(self, new_text: str) -> StreamingParseResult:
+        self._buffer += new_text
+        if not self._in_reasoning and not self._reasoning_done:
+            open_idx = self._buffer.find(self.think_start_token)
+            if open_idx != -1:
+                self._buffer = self._buffer[open_idx + len(self.think_start_token) :]
+                self._in_reasoning = True
+                self.stripped_think_start = True
+            elif self.think_start_token.startswith(self._buffer):
+                return StreamingParseResult()
+            else:
+                self._reasoning_done = True
+
+        if self._in_reasoning:
+            buf = self._buffer
+            if not self.stripped_think_start:
+                open_idx = buf.find(self.think_start_token)
+                if open_idx != -1:
+                    buf = buf[open_idx + len(self.think_start_token) :]
+                    self._buffer = buf
+                    self.stripped_think_start = True
+
+            close_idx = buf.find(self.think_end_token)
+            tools_idx = buf.find(self.tool_start_token) if self.tool_start_token else -1
+            channel_idx = self._next_channel_idx(buf)
+            if self._skipped_think_channel(
+                buf, think_close_idx=close_idx, next_channel_idx=channel_idx
+            ):
+                replay = "".join(self._streamed_reasoning)
+                self._streamed_reasoning.clear()
+                self._in_reasoning = False
+                self._reasoning_done = True
+                self._discard_delayed_think_close = True
+                return StreamingParseResult(normal_text=replay + self._drain_content())
+
+            if close_idx != -1 and not (tools_idx != -1 and tools_idx < close_idx):
+                reasoning_text = buf[:close_idx]
+                self._buffer = buf[close_idx + len(self.think_end_token) :]
+                self._in_reasoning = False
+                self._reasoning_done = True
+                self._streamed_reasoning.clear()
+                return StreamingParseResult(
+                    reasoning_text=reasoning_text,
+                    normal_text=self._drain_content(),
+                )
+
+            if channel_idx != -1:
+                reasoning_text = _k3_strip_partial_suffix(buf[:channel_idx])
+                self._buffer = buf[channel_idx:]
+                self._in_reasoning = False
+                self._reasoning_done = True
+                self._streamed_reasoning.clear()
+                self._tools_passthrough = bool(
+                    self.tool_start_token and buf.startswith(self.tool_start_token, channel_idx)
+                )
+                return StreamingParseResult(
+                    reasoning_text=reasoning_text,
+                    normal_text=self._drain_content(),
+                )
+
+            if not self.stream_reasoning:
+                return StreamingParseResult()
+            markers = [
+                self.think_end_token,
+                self.tool_start_token or "",
+                _K3_RESPONSE_OPEN,
+                _K3_RESPONSE_CLOSE,
+                _K3_MESSAGE_CLOSE,
+            ]
+            if not self.stripped_think_start:
+                markers.append(self.think_start_token)
+            holdback = _k3_partial_suffix_len(buf, markers)
+            emit = buf[: len(buf) - holdback] if holdback else buf
+            emit = _k3_strip_partial_suffix(emit)
+            self._buffer = buf[len(emit) :]
+            self._streamed_reasoning.append(emit)
+            return StreamingParseResult(reasoning_text=emit)
+
+        return StreamingParseResult(normal_text=self._drain_content())
+
+    def _drain_content(self) -> str:
+        buf = self._buffer
+        if not buf:
+            return ""
+        if self._tools_passthrough:
+            holdback = (
+                _k3_partial_suffix_len(buf, [self.think_end_token])
+                if self._discard_delayed_think_close
+                else 0
+            )
+            emit = buf[: len(buf) - holdback] if holdback else buf
+            self._buffer = buf[len(emit) :]
+            if self._discard_delayed_think_close:
+                emit = emit.replace(self.think_end_token, "")
+            return emit
+
+        tools_idx = buf.find(_K3_TOOLS_OPEN)
+        if tools_idx != -1:
+            holdback = (
+                _k3_partial_suffix_len(buf, [self.think_end_token])
+                if self._discard_delayed_think_close
+                else 0
+            )
+            emit = buf[: len(buf) - holdback] if holdback else buf
+            self._buffer = buf[len(emit) :]
+            head = emit[:tools_idx]
+            tail = emit[tools_idx:]
+            for marker in (_K3_RESPONSE_OPEN, _K3_RESPONSE_CLOSE, _K3_MESSAGE_CLOSE):
+                head = head.replace(marker, "")
+            if self._discard_delayed_think_close:
+                head = head.replace(self.think_end_token, "")
+                tail = tail.replace(self.think_end_token, "")
+            self._tools_passthrough = True
+            return head + tail
+
+        markers = [_K3_RESPONSE_OPEN, _K3_RESPONSE_CLOSE, _K3_MESSAGE_CLOSE, _K3_TOOLS_OPEN]
+        if self._discard_delayed_think_close:
+            markers.append(self.think_end_token)
+        holdback = _k3_partial_suffix_len(buf, markers)
+        emit = buf[: len(buf) - holdback] if holdback else buf
+        self._buffer = buf[len(emit) :]
+        for marker in (_K3_RESPONSE_OPEN, _K3_RESPONSE_CLOSE, _K3_MESSAGE_CLOSE):
+            emit = emit.replace(marker, "")
+        if self._discard_delayed_think_close:
+            emit = emit.replace(self.think_end_token, "")
+        return emit
+
+
 class ReasoningParser:
     """
     Parser that handles both streaming and non-streaming scenarios for extracting
@@ -328,6 +585,7 @@ class ReasoningParser:
         "qwen3": Qwen3Detector,
         "mimo": Qwen3Detector,
         "kimi": KimiDetector,
+        "kimi_k3": KimiK3Detector,
         "glm45": Glm45Detector,
         "gemma4": Gemma4Detector,
         "ling3": Ling3Detector,

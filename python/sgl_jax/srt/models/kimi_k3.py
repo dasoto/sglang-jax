@@ -363,6 +363,10 @@ class KimiK3LatentMoE(nnx.Module):
         if config.moe_router_activation_func != "sigmoid":
             raise ValueError("Kimi-K3 LatentMoE expects a sigmoid router")
 
+        tp_size = int(mesh.shape.get("tensor", 1)) if mesh is not None else 1
+        gate_kernel_axes = (
+            (None, "tensor") if config.num_experts % tp_size == 0 else (None, None)
+        )
         self.gate = GateLogit(
             input_size=self.hidden_size,
             num_experts=config.num_experts,
@@ -372,6 +376,7 @@ class KimiK3LatentMoE(nnx.Module):
             compute_dtype=jnp.float32,
             bias_dtype=jnp.float32,
             score_func="sigmoid",
+            kernel_axes=gate_kernel_axes,
         )
         # One expert group (K3: num_expert_group=1) is plain biased top-k.
         num_expert_group = getattr(config, "num_expert_group", 1) or 1
@@ -855,7 +860,9 @@ class KimiK3ForConditionalGeneration(nnx.Module):
         moe_src = f"{prefix}.block_sparse_moe"
         moe_dst = f"{target}.block_sparse_moe"
         mappings[f"{moe_src}.gate.weight"] = WeightSpec(
-            target_path=f"{moe_dst}.gate.kernel", sharding=(None, None), transpose=True
+            target_path=f"{moe_dst}.gate.kernel",
+            sharding=moe.gate.kernel_axes,
+            transpose=True,
         )
         mappings[f"{moe_src}.gate.e_score_correction_bias"] = WeightSpec(
             target_path=f"{moe_dst}.gate.bias", sharding=(None,)
