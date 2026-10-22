@@ -123,3 +123,41 @@ def test_local_window_path_matches_generic_kernel_path(T, cap):
     scale = np.abs(out_gen).max()
     np.testing.assert_allclose(out_win, out_gen, rtol=0, atol=1e-2 * scale)
     assert np.abs(out_win - out_gen).mean() < 1e-3 * np.abs(out_gen).mean()
+
+
+@pytest.mark.skipif(len(jax.devices()) < 4, reason="needs 4 (CPU) devices")
+def test_local_window_path_skips_masked_padding_tokens():
+    """DP-padding tokens (token_mask=False) are skipped: zero output, real rows unchanged."""
+    T, H, I, E, topk, ep = 48, 256, 256, 8, 3, 2
+    mesh = jax.make_mesh((1, 4), ("data", "tensor"), axis_types=(jax.sharding.AxisType.Explicit,) * 2)
+    with jax.set_mesh(mesh):
+        common = dict(hidden_size=H, num_experts=E, num_experts_per_tok=topk, ep_size=ep, mesh=mesh,
+                      intermediate_dim=I, activation="situ", situ_beta=4.0, situ_linear_beta=25.0)
+        generic = MXFP4EPMoE(use_gmm_kernel=True, **common)
+        windowed = MXFP4EPMoE(use_gmm_kernel=True, **common)
+        generic.local_window_min_rows = 1 << 30
+        windowed.local_window_min_rows = 1
+        windowed.local_window_capacity = 16
+        for name, (k, n), seed in (("w1", (H, I), 7), ("w3", (H, I), 8), ("w2", (I, H), 9)):
+            packed, scale = F.random_mxfp4((k, n), E, seed=seed, zero_frac=0.1)
+            for layer in (generic, windowed):
+                for suffix, arr in (("weight_packed", packed), ("weight_scale", scale)):
+                    param = getattr(layer, f"{name}_{suffix}")
+                    param.value = jax.device_put(jnp.asarray(arr), param.value.sharding)
+        assert generic.prepare_gmm_kernel_weights() and windowed.prepare_gmm_kernel_weights()
+
+        ids, w = _routing(T, E, topk, seed=7)
+        mask = np.zeros(T, bool)
+        mask[:12] = True  # first DP rank's 12 real tokens; the rest is padding
+        mask[30:33] = True
+        rep = NamedSharding(mesh, P(None, None))
+        hs = jax.device_put(jnp.asarray(np.random.default_rng(7).standard_normal((T, H)), jnp.bfloat16), rep)
+        tw = jax.device_put(jnp.asarray(w), rep)
+        ti = jax.device_put(jnp.asarray(ids), rep)
+        tm = jax.device_put(jnp.asarray(mask), NamedSharding(mesh, P(None)))
+        out_gen = np.asarray(generic(hs, tw, ti).astype(jnp.float32))
+        out_win = np.asarray(windowed(hs, tw, ti, token_mask=tm).astype(jnp.float32))
+
+    assert np.all(out_win[~mask] == 0)
+    scale = np.abs(out_gen[mask]).max()
+    np.testing.assert_allclose(out_win[mask], out_gen[mask], rtol=0, atol=1e-2 * scale)

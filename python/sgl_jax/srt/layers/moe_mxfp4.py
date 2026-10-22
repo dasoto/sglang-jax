@@ -79,6 +79,7 @@ class MXFP4EPMoE(EPMoE):
             os.environ.get("SGLANG_JAX_MOE_LOCAL_WINDOW_CF", "4.0")
         )
         self.local_window_capacity = None  # fixed window rows (tests); None = derive from load
+        self.supports_token_mask = True
         if self.replicate_experts:
             raise NotImplementedError("MXFP4EPMoE does not support moe_dp_size > 1")
         if self.quantized_dtype is not None or self.activation_quantized_dtype is not None:
@@ -158,7 +159,15 @@ class MXFP4EPMoE(EPMoE):
         topk_ids,
         *,
         out_sharding: jax.sharding.NamedSharding | None = None,
+        token_mask: jax.Array | None = None,
     ) -> jax.Array:
+        """``token_mask`` [tokens] marks real tokens (DP-padding slots are False).
+
+        Only the local-window (prefill) path uses it: masked tokens are routed to a
+        sentinel expert id, so they are neither computed nor counted. With one busy
+        DP rank, 7/8 of a step's tokens are padding whose identical rows all route to
+        the same experts and would serialize a few expert shards.
+        """
         if out_sharding is None:
             out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * hidden_states.ndim)))
         out_specs = P(
@@ -168,11 +177,23 @@ class MXFP4EPMoE(EPMoE):
             ]
         )
         scatter_on_tensor = "tensor" in out_specs
+        rows = topk_ids.shape[0] * topk_ids.shape[1]
+        use_mask = (
+            token_mask is not None
+            and token_mask.shape[0] == topk_ids.shape[0]
+            and self.gmm_kernel_weights_ready
+            and rows >= self.local_window_min_rows
+        )
 
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
+            if use_mask:
+                mask = jax.sharding.reshard(token_mask, P(None))
+                topk_ids_reshard = jnp.where(
+                    mask[:, None], topk_ids_reshard, jnp.asarray(self.num_experts, topk_ids_reshard.dtype)
+                )
             result = shard_map(
                 partial(self._forward, scatter_on_tensor=scatter_on_tensor),
                 mesh=self.moe_mesh,

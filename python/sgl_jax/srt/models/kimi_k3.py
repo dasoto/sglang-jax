@@ -460,6 +460,7 @@ class KimiK3LatentMoE(nnx.Module):
         self,
         hidden_states: jax.Array,
         dispatch_info: ExpertLocationMetadata | None = None,
+        token_mask: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         router_scores = self.gate(hidden_states)
         topk_weights, topk_ids = self.topk(
@@ -469,7 +470,10 @@ class KimiK3LatentMoE(nnx.Module):
             latent, _ = self.routed_expert_down_proj(hidden_states)
         else:
             latent = hidden_states
-        routed = self.experts(latent, topk_weights, topk_ids)
+        if token_mask is not None and getattr(self.experts, "supports_token_mask", False):
+            routed = self.experts(latent, topk_weights, topk_ids, token_mask=token_mask)
+        else:
+            routed = self.experts(latent, topk_weights, topk_ids)
         if self.routed_expert_norm is not None:
             routed = self.routed_expert_norm(routed)
         if self.routed_expert_up_proj is not None:
@@ -568,7 +572,13 @@ class KimiK3DecoderLayer(nnx.Module):
         hidden_states = self.mlp_res(blocks, partial_sum)
         hidden_states = self.post_attention_layernorm(hidden_states)
         if self.is_moe_layer:
-            ffn_output, topk_ids = self.block_sparse_moe(hidden_states, dispatch_info)
+            # DP-padding slots have out_cache_loc == -1; the MoE skips them in prefill.
+            token_mask = (
+                forward_batch.out_cache_loc >= 0 if forward_batch.out_cache_loc is not None else None
+            )
+            ffn_output, topk_ids = self.block_sparse_moe(
+                hidden_states, dispatch_info, token_mask=token_mask
+            )
         else:
             ffn_output, topk_ids = self.mlp(hidden_states), None
         partial_sum = partial_sum + ffn_output
