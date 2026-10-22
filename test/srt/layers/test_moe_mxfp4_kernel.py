@@ -76,3 +76,50 @@ def test_kernel_path_matches_dequant_path(T):
     # differs, which can flip a few bf16 roundings.
     np.testing.assert_allclose(out_ker, out_ref, rtol=0, atol=2e-2 * scale)
     assert np.abs(out_ker - out_ref).mean() < 2e-3 * np.abs(out_ref).mean()
+
+
+@pytest.mark.skipif(len(jax.devices()) < 4, reason="needs 4 (CPU) devices")
+@pytest.mark.parametrize("T,cap", [(40, None), (40, 16), (64, 24), (7, 8)])
+def test_local_window_path_matches_generic_kernel_path(T, cap):
+    """Prefill local-window path (incl. multi-window overflow loop) == EPMoE's generic path."""
+    H, I, E, topk, ep = 256, 256, 8, 3, 2
+    mesh = jax.make_mesh((1, 4), ("data", "tensor"), axis_types=(jax.sharding.AxisType.Explicit,) * 2)
+    with jax.set_mesh(mesh):
+        common = dict(
+            hidden_size=H,
+            num_experts=E,
+            num_experts_per_tok=topk,
+            ep_size=ep,
+            mesh=mesh,
+            intermediate_dim=I,
+            activation="situ",
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+        )
+        generic = MXFP4EPMoE(use_gmm_kernel=True, **common)
+        windowed = MXFP4EPMoE(use_gmm_kernel=True, **common)
+        generic.local_window_min_rows = 1 << 30  # never
+        windowed.local_window_min_rows = 1  # always
+        windowed.local_window_capacity = cap
+        for name, (k, n), seed in (("w1", (H, I), 4), ("w3", (H, I), 5), ("w2", (I, H), 6)):
+            packed, scale = F.random_mxfp4((k, n), E, seed=seed, zero_frac=0.1)
+            for layer in (generic, windowed):
+                for suffix, arr in (("weight_packed", packed), ("weight_scale", scale)):
+                    param = getattr(layer, f"{name}_{suffix}")
+                    param.value = jax.device_put(jnp.asarray(arr), param.value.sharding)
+        assert generic.prepare_gmm_kernel_weights() and windowed.prepare_gmm_kernel_weights()
+
+        ids, w = _routing(T, E, topk, seed=100 + T)
+        rep = NamedSharding(mesh, P(None, None))
+        hs = jax.device_put(
+            jnp.asarray(np.random.default_rng(T).standard_normal((T, H)), jnp.bfloat16), rep
+        )
+        tw = jax.device_put(jnp.asarray(w), rep)
+        ti = jax.device_put(jnp.asarray(ids), rep)
+        out_gen = np.asarray(generic(hs, tw, ti).astype(jnp.float32))
+        out_win = np.asarray(windowed(hs, tw, ti).astype(jnp.float32))
+
+    assert out_gen.shape == out_win.shape == (T, H)
+    scale = np.abs(out_gen).max()
+    np.testing.assert_allclose(out_win, out_gen, rtol=0, atol=1e-2 * scale)
+    assert np.abs(out_win - out_gen).mean() < 1e-3 * np.abs(out_gen).mean()

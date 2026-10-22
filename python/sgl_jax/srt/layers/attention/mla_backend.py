@@ -577,17 +577,26 @@ class MLAAttentionBackend(AttentionBackend):
 
             # Combine (o_partial, lse_partial) across the "tensor" (DCP) axis.
             # o_partial: [T_dp, N_h, lkv_dim], lse_partial: [T_dp, N_h]
-            o_gathered = jax.lax.all_gather(o_partial, axis_name="tensor", axis=0, tiled=False)
-            lse_gathered = jax.lax.all_gather(lse_partial, axis_name="tensor", axis=0, tiled=False)
-
-            # Slice this TP rank's query heads: [dcp_size, T_dp, n_h_local, ...]
+            # Each DCP rank only keeps its own n_h_local query heads, so an all_to_all
+            # that sends head group g to rank g moves 1/dcp_size of the data an
+            # all_gather of every head would (the all_gather was ~23% of a 4096-token
+            # prefill step on v5e-256). Result: [dcp_size (source rank), T_dp, n_h_local, ...],
+            # the same layout as slicing this rank's heads out of the all_gather.
             n_h_local = ql_nope_.shape[1]
-            head_start = dcp_rank * n_h_local
-            o_local_heads = jax.lax.dynamic_slice_in_dim(
-                o_gathered, head_start, n_h_local, axis=2
+            dcp = o_partial.shape[1] // n_h_local
+            o_local_heads = jax.lax.all_to_all(
+                o_partial.reshape(o_partial.shape[0], dcp, n_h_local, o_partial.shape[-1]),
+                axis_name="tensor",
+                split_axis=1,
+                concat_axis=0,
+                tiled=False,
             ).astype(jnp.float32)
-            lse_local_heads = jax.lax.dynamic_slice_in_dim(
-                lse_gathered, head_start, n_h_local, axis=2
+            lse_local_heads = jax.lax.all_to_all(
+                lse_partial.reshape(lse_partial.shape[0], dcp, n_h_local),
+                axis_name="tensor",
+                split_axis=1,
+                concat_axis=0,
+                tiled=False,
             )
 
             lse_max = jnp.max(lse_local_heads, axis=0, keepdims=True)

@@ -22,6 +22,7 @@ dequantizes weight tiles in VMEM (design doc section 4), and fuse SiTU-GLU.
 
 from __future__ import annotations
 
+import math
 import os
 from functools import partial
 
@@ -72,6 +73,12 @@ class MXFP4EPMoE(EPMoE):
         # ``prepare_gmm_kernel_weights()`` (called from the model's ``load_weights``).
         self.use_gmm_kernel = mxfp4_gmm_kernel_enabled() if use_gmm_kernel is None else use_gmm_kernel
         self.gmm_kernel_weights_ready = False
+        # Large (prefill) batches take the local-window path (see _forward_local_window).
+        self.local_window_min_rows = int(os.environ.get("SGLANG_JAX_MOE_LOCAL_WINDOW_MIN_ROWS", "4096"))
+        self.local_window_capacity_factor = float(
+            os.environ.get("SGLANG_JAX_MOE_LOCAL_WINDOW_CF", "4.0")
+        )
+        self.local_window_capacity = None  # fixed window rows (tests); None = derive from load
         if self.replicate_experts:
             raise NotImplementedError("MXFP4EPMoE does not support moe_dp_size > 1")
         if self.quantized_dtype is not None or self.activation_quantized_dtype is not None:
@@ -203,6 +210,140 @@ class MXFP4EPMoE(EPMoE):
                 None,
             )
         return jax.sharding.reshard(result, out_sharding)
+
+    def _forward(
+        self,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        w0_weights,
+        w1_weights,
+        wo_weights,
+        w0_kernel_scale=None,
+        w1_kernel_scale=None,
+        wo_kernel_scale=None,
+        w0_kernel_bias=None,
+        w1_kernel_bias=None,
+        wo_kernel_bias=None,
+        *,
+        scatter_on_tensor: bool = False,
+    ):
+        rows = topk_ids.shape[0] * topk_ids.shape[1]
+        if not (self.gmm_kernel_weights_ready and rows >= self.local_window_min_rows):
+            return super()._forward(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                w0_weights,
+                w1_weights,
+                wo_weights,
+                w0_kernel_scale,
+                w1_kernel_scale,
+                wo_kernel_scale,
+                w0_kernel_bias,
+                w1_kernel_bias,
+                wo_kernel_bias,
+                scatter_on_tensor=scatter_on_tensor,
+            )
+        output = self._forward_local_window(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            w0_weights,
+            w1_weights,
+            wo_weights,
+            w0_kernel_scale,
+            w1_kernel_scale,
+            wo_kernel_scale,
+        )
+        # Same reductions as EPMoE._forward.
+        if self.tp_size > 1:
+            if scatter_on_tensor:
+                output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=0, tiled=True)
+            else:
+                output = jax.lax.psum(output, "tensor")
+        if self.ep_size > 1:
+            output = self._combine(output)
+        return output
+
+    def _window_capacity(self, rows: int) -> int:
+        """Static rows per window: capacity_factor x the expected local share, 256-aligned."""
+        if self.local_window_capacity:
+            return int(self.local_window_capacity)
+        expected = rows * self.experts_per_device / self.num_experts
+        cap = int(math.ceil(expected * self.local_window_capacity_factor / 256.0)) * 256
+        return max(512, min(cap, -(-rows // 256) * 256))
+
+    def _forward_local_window(
+        self, hidden_states, topk_weights, topk_ids, w_gate, w_up, w_down, s_gate, s_up, s_down
+    ):
+        """Prefill path: compute and combine only the rows routed to this shard's experts.
+
+        Tokens are replicated on every expert shard, and EPMoE's generic path does
+        O(tokens * top_k) work per shard: it gathers every routed row, zeroes the
+        non-local rows of the GMM output, and runs a top_k-pass fp32 unpermute over
+        all of them, although only ~E_l/E of the rows are local. The local rows are
+        a contiguous range of the expert-sorted order, so this path processes them
+        in fixed-size windows (normally one; a loop covers routing imbalance) and
+        scatter-adds the weighted outputs per token. The math is unchanged; only the
+        f32 summation order differs.
+        """
+        from sgl_jax.srt.kernels.mxfp4_gmm import mxfp4_moe_mlp
+
+        num_tokens, top_k = topk_ids.shape
+        rows = num_tokens * top_k
+        e_l = self.experts_per_device
+        flat_experts = jnp.ravel(topk_ids).astype(jnp.int32)
+        sorted_pos = jnp.argsort(flat_experts, stable=True).astype(jnp.int32)
+        group_sizes = jnp.bincount(flat_experts, length=self.num_experts).astype(jnp.int32)
+        group_offset = (jax.lax.axis_index("expert") * e_l).astype(jnp.int32)
+        local_sizes = jax.lax.dynamic_slice_in_dim(group_sizes, group_offset, e_l)
+        start = jnp.sum(jnp.where(jnp.arange(self.num_experts) < group_offset, group_sizes, 0))
+        local_rows = jnp.sum(local_sizes)
+        local_cum = jnp.concatenate(
+            [jnp.zeros((1,), jnp.int32), jnp.cumsum(local_sizes).astype(jnp.int32)]
+        )
+        flat_w = jnp.ravel(topk_weights).astype(jnp.float32)
+        cap = self._window_capacity(rows)
+        no_groups = jnp.zeros((self.num_experts,), jnp.int32)
+
+        def window(w, acc):
+            base = w * cap
+            rel = base + jnp.arange(cap, dtype=jnp.int32)
+            valid = rel < local_rows
+            pos = sorted_pos[jnp.clip(start + rel, 0, rows - 1)]  # flat (token, k) slot
+            tok = pos // top_k
+            x = hidden_states[tok].astype(self.dtype)
+            # Local experts' row counts inside this window; non-local groups stay empty,
+            # so the local rows start at row 0 of x.
+            sizes = jnp.clip(local_cum[1:] - base, 0, cap) - jnp.clip(local_cum[:-1] - base, 0, cap)
+            win_group_sizes = jax.lax.dynamic_update_slice_in_dim(
+                no_groups, sizes.astype(jnp.int32), group_offset, 0
+            )
+            y = mxfp4_moe_mlp(
+                x,
+                win_group_sizes,
+                group_offset,
+                w_gate,
+                s_gate,
+                w_up,
+                s_up,
+                w_down,
+                s_down,
+                situ_beta=self.situ_beta,
+                situ_linear_beta=self.situ_linear_beta,
+                act_input_dtype=self.dtype,
+                out_dtype=self.dtype,
+                zero_unvisited=False,  # rows past the local groups are masked below
+                interpret=not is_tpu_runtime(),
+            )
+            contrib = jnp.where(valid[:, None], y.astype(jnp.float32) * flat_w[pos][:, None], 0.0)
+            return acc.at[tok].add(contrib)
+
+        n_windows = (local_rows + cap - 1) // cap
+        acc = jnp.zeros((num_tokens, w_down.shape[-1]), jnp.float32)
+        acc = jax.lax.fori_loop(0, n_windows, window, acc)
+        return acc.astype(self.dtype)
 
     def _gmm_compute(
         self,
