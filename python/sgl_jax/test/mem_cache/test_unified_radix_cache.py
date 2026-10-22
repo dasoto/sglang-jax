@@ -1511,8 +1511,8 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         self.assertIsNone(req.recurrent_cow_src_index)
         self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
 
-    def test_shorter_prefix_after_longer_skips_internal(self):
-        """Committing on an internal node is skipped (leaf-only); the caller frees the slot."""
+    def test_shorter_prefix_after_longer_commits_branch_snapshot(self):
+        """Committing on an internal node keeps the snapshot as a branch point."""
         state_pool, pool, _, cache = self._create_recurrent_setup()
 
         long_key = [1, 2, 3, 4]
@@ -1524,10 +1524,15 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         short_val = np.arange(20, 22, dtype=np.int32)
         short_slot, short_res = self._commit(cache, pool, short_key, short_val)
 
-        self.assertFalse(short_res.recurrent_committed)
-        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 1)
-        pool.free_recurrent_slot(short_slot, 0)
+        # The tree owns both slots; both stay LRU-evictable.
+        self.assertTrue(short_res.recurrent_committed)
+        self.assertEqual(cache.component_evictable_size_[ComponentType.RECURRENT][0], 2)
         self.assertEqual(cache.assert_recurrent_slot_ledger(0), 0)
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey([1, 2, 9], None, 0)))
+        self.assertEqual(len(match.device_indices), 2)
+        evict_result = cache.evict(EvictParams(recurrent_num=2, dp_rank=0))
+        self.assertEqual(evict_result.recurrent_num_evicted, 2)
+        self.assertEqual(pool.recurrent_available_size(0), pool.slots_per_rank)
 
     def test_lock_protects_recurrent_leaf(self):
         state_pool, pool, _, cache = self._create_recurrent_setup()

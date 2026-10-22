@@ -153,22 +153,92 @@ def _new_req(rid: str, token_ids: list[int], cache: UnifiedRadixCache) -> Req:
 
 
 class TestRecurrentBranchPrefixCache(unittest.TestCase):
-    def test_unary_chain_keeps_only_leaf_snapshot(self):
+    def test_unary_chain_keeps_only_tail_snapshots(self):
         cache, req_pool, allocator = _build_cache(page_size=128, interval=128)
-        tokens = list(range(1, 385))  # 3 chunks of 128
+        tokens = list(range(1, 769))  # 6 chunks of 128
         req = _new_req("r1", tokens, cache)
         self.assertEqual(len(req.fill_ids), 0)
 
+        for start in range(0, 640, 128):
+            _alloc_and_step_chunk(
+                cache, req_pool, allocator, req, tokens[start : start + 128], is_finished=False
+            )
+            cache.assert_recurrent_slot_ledger(0, [req])
+
+        _alloc_and_step_chunk(cache, req_pool, allocator, req, tokens[640:768], is_finished=True)
+        cache.assert_recurrent_slot_ledger(0, [])
+        # A unary chain of 6 chunks keeps only the last two prompt boundaries
+        # (640 and the 768 leaf), not one snapshot per chunk.
+        self.assertEqual(cache.recurrent_evictable_size(0), 2)
+
+    def test_unary_chain_legacy_keeps_only_leaf_snapshot(self):
+        old = os.environ.get("SGLANG_JAX_RECURRENT_TAIL_CHECKPOINTS")
+        os.environ["SGLANG_JAX_RECURRENT_TAIL_CHECKPOINTS"] = "0"
+        try:
+            cache, req_pool, allocator = _build_cache(page_size=128, interval=128)
+        finally:
+            if old is None:
+                os.environ.pop("SGLANG_JAX_RECURRENT_TAIL_CHECKPOINTS")
+            else:
+                os.environ["SGLANG_JAX_RECURRENT_TAIL_CHECKPOINTS"] = old
+        tokens = list(range(1, 385))  # 3 chunks of 128
+        req = _new_req("r1", tokens, cache)
         _alloc_and_step_chunk(cache, req_pool, allocator, req, tokens[0:128], is_finished=False)
-        cache.assert_recurrent_slot_ledger(0, [req])
-
         _alloc_and_step_chunk(cache, req_pool, allocator, req, tokens[128:256], is_finished=False)
-        cache.assert_recurrent_slot_ledger(0, [req])
-
         _alloc_and_step_chunk(cache, req_pool, allocator, req, tokens[256:384], is_finished=True)
         cache.assert_recurrent_slot_ledger(0, [])
-        # Unary chain of 3 chunks must hold only 1 recurrent snapshot (at the leaf).
         self.assertEqual(cache.recurrent_evictable_size(0), 1)
+
+    def _run_turn_with_decode(self, cache, req_pool, allocator, rid, prompt, decode):
+        """Chunked prefill of ``prompt`` (128-token chunks), then a decode run."""
+        req = _new_req(rid, prompt, cache)
+        start = len(req.fill_ids)
+        while start < len(prompt):
+            end = min(start + 128 - start % 128, len(prompt))
+            _alloc_and_step_chunk(
+                cache, req_pool, allocator, req, prompt[start:end], is_finished=False
+            )
+            start = end
+        req.output_ids = list(decode)
+        _alloc_and_step_chunk(cache, req_pool, allocator, req, decode, is_finished=True)
+        cache.assert_recurrent_slot_ledger(0, [])
+        return req
+
+    def test_prompt_end_checkpoint_survives_decode_extension(self):
+        # Turn N decodes past a track boundary; turn N+1 resends turn N's prompt
+        # followed by a different assistant message (agentic replay). Before the
+        # prompt-tail checkpoints the prompt-end snapshot was freed once the
+        # decode tokens became its only child, so turn N+1 missed entirely.
+        cache, req_pool, allocator = _build_cache(page_size=128, interval=128)
+        prompt = list(range(1, 385))  # 384 tokens
+        decode = list(range(5000, 5128))  # crosses the 512 boundary
+        self._run_turn_with_decode(cache, req_pool, allocator, "t0", prompt, decode)
+
+        next_turn = prompt + list(range(7000, 7200))
+        r1 = _new_req("t1", next_turn, cache)
+        self.assertEqual(len(r1.prefix_indices), 384)
+        self.assertIsNotNone(r1.recurrent_cow_src_index)
+        cache.dec_lock_ref(r1.last_node, r1.cache_lock_params)
+
+    def test_prompt_tail_checkpoint_covers_pullback(self):
+        # Turn N+1 drops the last tokens of turn N's prompt (a trace pull-back),
+        # diverging before the prompt-end boundary: the previous boundary hits.
+        cache, req_pool, allocator = _build_cache(page_size=128, interval=128)
+        prompt = list(range(1, 385))  # 384 tokens: boundaries 128, 256, 384
+        decode = list(range(5000, 5256))  # ends on the 640 boundary
+        self._run_turn_with_decode(cache, req_pool, allocator, "t0", prompt, decode)
+
+        pullback = prompt[:300] + list(range(8000, 8100))
+        r1 = _new_req("t1", pullback, cache)
+        self.assertEqual(len(r1.prefix_indices), 256)
+        cache.dec_lock_ref(r1.last_node, r1.cache_lock_params)
+
+        # Prompt-tail snapshots stay LRU-evictable: nothing is pinned.
+        evictable = cache.recurrent_evictable_size(0)
+        evict_res = cache.evict(EvictParams(recurrent_num=evictable, dp_rank=0))
+        self.assertEqual(evict_res.recurrent_num_evicted, evictable)
+        self.assertEqual(cache.recurrent_evictable_size(0), 0)
+        cache.assert_recurrent_slot_ledger(0, [])
 
     def test_sequential_shared_prefix_branch_retains_snapshot(self):
         cache, req_pool, allocator = _build_cache(page_size=128, interval=128)
@@ -177,20 +247,21 @@ class TestRecurrentBranchPrefixCache(unittest.TestCase):
         suffix_b = list(range(2000, 2128))  # 128 tokens
         suffix_c = list(range(3000, 3128))  # 128 tokens
 
-        # R1 = [P, A] runs and finishes -> unary chain, leaf at [P, A].
+        # R1 = [P, A] runs and finishes at the end of its prefill: the leaf [P, A]
+        # and the previous prompt boundary N_P (a prompt-tail checkpoint) keep
+        # snapshots.
         r1_tokens = prefix_p + suffix_a
         r1 = _new_req("r1", r1_tokens, cache)
         _alloc_and_step_chunk(cache, req_pool, allocator, r1, prefix_p, is_finished=False)
         _alloc_and_step_chunk(cache, req_pool, allocator, r1, suffix_a, is_finished=True)
         cache.assert_recurrent_slot_ledger(0, [])
-        self.assertEqual(cache.recurrent_evictable_size(0), 1)
+        self.assertEqual(cache.recurrent_evictable_size(0), 2)
 
-        # R2 = [P, B] arrives, chunks at P (128), attaches snapshot to internal node N_P,
-        # and then finishes at [P, B]. Both N_P and N_PB + N_PA hold snapshots (3 total).
+        # R2 = [P, B] hits N_P and finishes at [P, B]: N_P (now a branch point),
+        # N_PA and N_PB hold snapshots (3 total).
         r2_tokens = prefix_p + suffix_b
         r2 = _new_req("r2", r2_tokens, cache)
-        _alloc_and_step_chunk(cache, req_pool, allocator, r2, prefix_p, is_finished=False)
-        cache.assert_recurrent_slot_ledger(0, [r2])
+        self.assertEqual(len(r2.prefix_indices), 128)
         _alloc_and_step_chunk(cache, req_pool, allocator, r2, suffix_b, is_finished=True)
         cache.assert_recurrent_slot_ledger(0, [])
         self.assertEqual(cache.recurrent_evictable_size(0), 3)
@@ -208,6 +279,46 @@ class TestRecurrentBranchPrefixCache(unittest.TestCase):
         # Evict all 4 recurrent snapshots (3 leaves + 1 internal branch node) and verify ledger.
         evict_res = cache.evict(EvictParams(recurrent_num=4, dp_rank=0))
         self.assertEqual(evict_res.recurrent_num_evicted, 4)
+        self.assertEqual(cache.recurrent_evictable_size(0), 0)
+        cache.assert_recurrent_slot_ledger(0, [])
+
+    def test_commit_on_internal_node_retains_branch_snapshot(self):
+        cache, req_pool, allocator = _build_cache(page_size=128, interval=128)
+        prefix_p = list(range(100, 228))  # 128 tokens
+        tail_a = list(range(1000, 1384))  # 384 tokens
+        suffix_b = list(range(2000, 2128))
+        suffix_c = list(range(3000, 3128))
+
+        # R1 = [P, A] (4 chunks): N_P is outside the prompt tail, so only the
+        # 384 boundary and the 512 leaf keep snapshots.
+        r1 = _new_req("r1", prefix_p + tail_a, cache)
+        _alloc_and_step_chunk(cache, req_pool, allocator, r1, prefix_p, is_finished=False)
+        _alloc_and_step_chunk(cache, req_pool, allocator, r1, tail_a[:128], is_finished=False)
+        _alloc_and_step_chunk(cache, req_pool, allocator, r1, tail_a[128:256], is_finished=False)
+        _alloc_and_step_chunk(cache, req_pool, allocator, r1, tail_a[256:], is_finished=True)
+        cache.assert_recurrent_slot_ledger(0, [])
+        self.assertEqual(cache.recurrent_evictable_size(0), 2)
+
+        # R2 = [P, B] misses, chunks at P and commits its snapshot on the
+        # existing internal node N_P, which is retained as a branch point.
+        r2 = _new_req("r2", prefix_p + suffix_b, cache)
+        self.assertEqual(len(r2.prefix_indices), 0)
+        _alloc_and_step_chunk(cache, req_pool, allocator, r2, prefix_p, is_finished=False)
+        cache.assert_recurrent_slot_ledger(0, [r2])
+        _alloc_and_step_chunk(cache, req_pool, allocator, r2, suffix_b, is_finished=True)
+        cache.assert_recurrent_slot_ledger(0, [])
+        self.assertEqual(cache.recurrent_evictable_size(0), 4)
+
+        # R3 = [P, C] hits N_P.
+        r3 = _new_req("r3", prefix_p + suffix_c, cache)
+        self.assertEqual(len(r3.prefix_indices), 128)
+        self.assertIsNotNone(r3.recurrent_cow_src_index)
+        _alloc_and_step_chunk(cache, req_pool, allocator, r3, suffix_c, is_finished=True)
+        cache.assert_recurrent_slot_ledger(0, [])
+        self.assertEqual(cache.recurrent_evictable_size(0), 5)
+
+        evict_res = cache.evict(EvictParams(recurrent_num=5, dp_rank=0))
+        self.assertEqual(evict_res.recurrent_num_evicted, 5)
         self.assertEqual(cache.recurrent_evictable_size(0), 0)
         cache.assert_recurrent_slot_ledger(0, [])
 

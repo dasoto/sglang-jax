@@ -1,7 +1,10 @@
 """Recurrent-state (KDA/GDN/GLA) component for UnifiedRadixCache.
 
-State is one RecurrentStatePool slot per leaf, so the component is leaf-only:
-it rides the core's ``evictable_device_leaves`` rather than an LRU list.
+State is one RecurrentStatePool slot per snapshot node. Leaves hold snapshots;
+interior nodes keep theirs only when they are branch points or prompt-tail
+checkpoints (extra-buffer path), and are LRU-evicted through
+``aux_evictable_device_nodes``. Unary-chain nodes drop their slot so a single
+long prefill does not keep one slot per chunk boundary.
 
 The base path (page_size=1): finished-request commit + prefix-hit
 copy-on-write clone. The extra-buffer path (page_size>=128) adds a
@@ -10,6 +13,7 @@ page-aligned ping-pong extra buffer and unfinished/fork donation."""
 from __future__ import annotations
 
 import heapq
+import os
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -60,6 +64,19 @@ class RecurrentComponent(TreeComponent):
         self.req_to_token_pool = cache.req_to_token_pool
         self.recurrent_state_pool = cache.req_to_token_pool.recurrent_state_pool
         self.enable_recurrent_extra_buffer = getattr(cache, "enable_recurrent_extra_buffer", False)
+        # Prompt-tail checkpoints (extra-buffer path only): keep the snapshots at
+        # the last N track boundaries of each request's prompt even after the
+        # request's own decode extends the tree below them. Multi-turn clients
+        # rarely resend the exact generated tokens (agentic trace replay, stripped
+        # reasoning, re-rendered tool calls) and sometimes drop the tail of the
+        # previous prompt, so the next turn diverges at or slightly before the
+        # previous prompt end, never at the decode leaf. 0 restores the old
+        # behavior (only leaves and branch points keep snapshots).
+        self.prompt_tail_checkpoints = max(
+            0, int(os.environ.get("SGLANG_JAX_RECURRENT_TAIL_CHECKPOINTS", "2"))
+        )
+        interval = getattr(cache, "recurrent_track_interval", None) or 0
+        self.prompt_tail_window = max(0, self.prompt_tail_checkpoints - 1) * interval
 
     # ---- matching -----------------------------------------------------------
 
@@ -88,6 +105,45 @@ class RecurrentComponent(TreeComponent):
         return result
 
     # ---- insert / commit ----------------------------------------------------
+
+    def _retain_checkpoint(self, node: UnifiedTreeNode | None) -> None:
+        """Keep ``node``'s snapshot when it goes internal, like a branch point.
+
+        The node stays an LRU eviction candidate (aux_evictable_device_nodes), so
+        retention never blocks admission under recurrent-slot pressure.
+        """
+        if node is None or node is self.cache.root_node:
+            return
+        if node.component_data[self.component_type].value is None:
+            return
+        node._recurrent_branch_retained = True
+
+    def _mark_prompt_tail_checkpoint(self, req: Req, is_finished: bool) -> None:
+        """Retain ``req.last_node`` if it is one of the prompt-tail boundaries.
+
+        ``req.last_node`` is the deepest snapshot node the request holds a lock on
+        before this caching call. On the finished call it is the prompt-end
+        checkpoint (the last prefill boundary, or the matched node when the
+        prefill crossed none), which the decode insert is about to turn into a
+        unary-chain node. On unfinished (chunk) calls it is the previous chunk
+        boundary, kept when it lies within ``prompt_tail_window`` of the prompt
+        end so a next turn that drops the tail of this prompt still hits.
+        """
+        if self.prompt_tail_checkpoints <= 0:
+            return
+        last_node = getattr(req, "last_node", None)
+        if is_finished:
+            self._retain_checkpoint(last_node)
+            return
+        if self.prompt_tail_window <= 0 or last_node is None:
+            return
+        fill_ids = getattr(req, "fill_ids", None)
+        origin_input_ids = getattr(req, "origin_input_ids", None)
+        if fill_ids is None or origin_input_ids is None:
+            return
+        target_len = len(origin_input_ids) + len(getattr(req, "output_ids", None) or ())
+        if target_len - len(fill_ids) < self.prompt_tail_window:
+            self._retain_checkpoint(last_node)
 
     def redistribute_on_node_split(self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode):
         ct = self.component_type
@@ -154,6 +210,7 @@ class RecurrentComponent(TreeComponent):
 
         # Extra-buffer (page>=128): donate the materialized page-boundary snapshot
         # held by the KEEP ping-pong slot, capping the tree key at that boundary.
+        self._mark_prompt_tail_checkpoint(req, is_finished)
         cache_len = req.recurrent_last_track_seqlen
         if cache_len is None:
             # No materialized boundary: nothing to donate; cleanup frees owned slots.
