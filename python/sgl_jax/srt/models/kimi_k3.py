@@ -122,11 +122,39 @@ class KimiK3MLP(nnx.Module):
         )
 
     def __call__(self, hidden_states: jax.Array) -> jax.Array:
+        output, _ = self.down_proj(self.activation(hidden_states))
+        return output
+
+    def activation(self, hidden_states: jax.Array) -> jax.Array:
+        """SiTU-GLU of the gate/up projections: the down projection's input."""
         gate, _ = self.gate_proj(hidden_states)
         up, _ = self.up_proj(hidden_states)
-        act = situ_and_mul(gate, up, beta=self.situ_beta, linear_beta=self.situ_linear_beta)
-        output, _ = self.down_proj(act)
-        return output
+        return situ_and_mul(gate, up, beta=self.situ_beta, linear_beta=self.situ_linear_beta)
+
+
+def _row_parallel_sum(mesh, x1, w1, x2, w2) -> jax.Array:
+    """``x1 @ w1 + x2 @ w2`` for two row-parallel projections, with one all-reduce.
+
+    Inputs are P("data", "tensor"), weights P("tensor", None), output P("data", None).
+    Separate row-parallel linears all-reduce each partial product over "tensor"; here
+    both local products are summed in f32 first, so the sum costs one all-reduce.
+    """
+
+    def local(a, b, c, d):
+        y = jnp.dot(a, b, preferred_element_type=jnp.float32)
+        y = y + jnp.dot(c, d, preferred_element_type=jnp.float32)
+        return jax.lax.psum(y.astype(a.dtype), "tensor")
+
+    spec_x, spec_w = P("data", "tensor"), P("tensor", None)
+    x1 = jax.sharding.reshard(x1, NamedSharding(mesh, spec_x))
+    x2 = jax.sharding.reshard(x2, NamedSharding(mesh, spec_x))
+    return jax.shard_map(
+        local,
+        mesh=mesh,
+        in_specs=(spec_x, spec_w, spec_x, spec_w),
+        out_specs=P("data", None),
+        check_vma=False,
+    )(x1, w1, x2, w2)
 
 
 class AttnResMix(nnx.Module):
@@ -354,6 +382,7 @@ class KimiK3LatentMoE(nnx.Module):
         quantization_config,
     ):
         self.hidden_size = config.hidden_size
+        self.mesh = mesh
         # HF: LatentMoE whenever routed_expert_hidden_size is set.
         self.use_latent = getattr(config, "routed_expert_hidden_size", None) is not None
         self.latent_size = config.routed_expert_hidden_size if self.use_latent else self.hidden_size
@@ -476,11 +505,39 @@ class KimiK3LatentMoE(nnx.Module):
             routed = self.experts(latent, topk_weights, topk_ids)
         if self.routed_expert_norm is not None:
             routed = self.routed_expert_norm(routed)
+        if self._fuse_output_allreduce(routed):
+            # The RS combine left `routed` P("data", "tensor"): sum the row-parallel
+            # routed_expert_up_proj and shared-expert down_proj products, then all-reduce once.
+            routed = _row_parallel_sum(
+                self.mesh,
+                routed,
+                self.routed_expert_up_proj.weight.value,
+                self.shared_experts.activation(hidden_states),
+                self.shared_experts.down_proj.weight.value,
+            )
+            return routed, topk_ids
         if self.routed_expert_up_proj is not None:
             routed, _ = self.routed_expert_up_proj(routed)
         if self.shared_experts is not None:
             routed = routed + self.shared_experts(hidden_states)
         return routed, topk_ids
+
+    def _fuse_output_allreduce(self, routed: jax.Array) -> bool:
+        """One all-reduce for the routed up-projection plus the shared experts.
+
+        On with the MoE reduce-scatter combine, whose P("data", "tensor") output is what the
+        fused row-parallel product consumes; needs both projections and a divisible shape.
+        """
+        if self.routed_expert_up_proj is None or self.shared_experts is None:
+            return False
+        if not getattr(self.experts, "rs_combine", False) or routed.ndim != 2:
+            return False
+        shape = dict(self.mesh.shape)
+        if set(shape) != {"data", "tensor"}:
+            return False
+        dp, tp = shape["data"], shape["tensor"]
+        inter = self.shared_experts.down_proj.weight.value.shape[0]
+        return routed.shape[0] % dp == 0 and routed.shape[1] % tp == 0 and inter % tp == 0
 
 
 class KimiK3DecoderLayer(nnx.Module):
