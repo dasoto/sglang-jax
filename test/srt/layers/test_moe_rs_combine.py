@@ -192,3 +192,58 @@ def test_rs_combine_falls_back_when_tokens_not_divisible():
         _, rs = _layers(mesh, H, I, E, topk, ep, seed=31)
         hs = jax.device_put(jnp.zeros((5, H), jnp.bfloat16), NamedSharding(mesh, P(None, None)))
         assert rs._rs_combine_blocks(hs) is None
+
+
+@pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (CPU) devices")
+@pytest.mark.parametrize("T", [16, 4096])  # one-op gather, and "data" then "tensor" (>= 8 MiB)
+def test_mesh_gather_packs_routing_bit_exact(T):
+    """Mesh mode gathers the router outputs inside the hidden-state all-gather, bit-exactly."""
+    H, I, E, topk, ep = 1024, 256, 8, 4, 4
+    mesh = jax.make_mesh(
+        (2, 4), ("data", "tensor"), axis_types=(jax.sharding.AxisType.Explicit,) * 2
+    )
+    with jax.set_mesh(mesh):
+        _, rs = _layers(mesh, H, I, E, topk, ep, seed=41, mesh_mode=True)
+        rng = np.random.default_rng(T)
+        hs_np = rng.standard_normal((T, H)).astype(np.float32)
+        w_np = (rng.standard_normal((T, topk)) * 1e3).astype(np.float32)
+        w_np[0, 0], w_np[1, 1] = -0.0, np.float32(1e-40)  # signed zero, subnormal
+        ids_np = rng.integers(0, E + 1, (T, topk)).astype(np.int32)  # E = masked sentinel
+        hs = jax.device_put(
+            jnp.asarray(hs_np, jnp.bfloat16), NamedSharding(mesh, P("data", "tensor"))
+        )
+        tw = jax.device_put(jnp.asarray(w_np), NamedSharding(mesh, P("data", None)))
+        ti = jax.device_put(jnp.asarray(ids_np), NamedSharding(mesh, P("data", None)))
+        h2, w2, i2 = jax.jit(lambda a, b, c: rs._mesh_gather_tokens(a, (2, 4), b, c))(hs, tw, ti)
+        assert h2.sharding.spec == w2.sharding.spec == i2.sharding.spec == P(None, None)
+        assert w2.dtype == jnp.float32 and i2.dtype == jnp.int32
+    np.testing.assert_array_equal(np.asarray(h2).view(np.uint16), np.asarray(hs).view(np.uint16))
+    np.testing.assert_array_equal(np.asarray(w2).view(np.uint32), w_np.view(np.uint32))
+    np.testing.assert_array_equal(np.asarray(i2), ids_np)
+
+
+@pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (CPU) devices")
+@pytest.mark.parametrize("T,window", [(8, False), (64, True)])
+def test_mesh_mode_with_data_sharded_routing(T, window):
+    """Router outputs sharded like the gate's (P("data", None)) take the packed gather."""
+    H, I, E, topk, ep = 256, 256, 8, 3, 4
+    mesh = jax.make_mesh(
+        (2, 4), ("data", "tensor"), axis_types=(jax.sharding.AxisType.Explicit,) * 2
+    )
+    with jax.set_mesh(mesh):
+        ar, rs = _layers(mesh, H, I, E, topk, ep, seed=51, mesh_mode=True)
+        for layer in (ar, rs):
+            layer.local_window_min_rows = 1 if window else 1 << 30
+        ids, w = _routing(T, E, topk, seed=3 + T)
+        route = NamedSharding(mesh, P("data", None))
+        hs = jax.device_put(
+            jnp.asarray(np.random.default_rng(T).standard_normal((T, H)), jnp.bfloat16),
+            NamedSharding(mesh, P("data", "tensor")),
+        )
+        tw = jax.device_put(jnp.asarray(w), route)
+        ti = jax.device_put(jnp.asarray(ids), route)
+        out_ar = np.asarray(jax.jit(ar)(hs, tw, ti).astype(jnp.float32))
+        out_rs = np.asarray(jax.jit(rs)(hs, tw, ti).astype(jnp.float32))
+    scale = np.abs(out_ar).max()
+    np.testing.assert_allclose(out_rs, out_ar, rtol=0, atol=1e-2 * scale)
+    assert np.abs(out_rs - out_ar).mean() < 3e-3 * np.abs(out_ar).mean()

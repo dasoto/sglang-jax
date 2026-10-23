@@ -215,7 +215,9 @@ class MXFP4EPMoE(EPMoE):
             # Mesh mode emits each chip's unreduced [dp*tp, T/dp, H/tp] blocks (reduced after).
             out_specs = P(("expert", "tensor"), None, None, *([None] if self.rs_combine_mesh else []))
             if self.rs_combine_mesh:
-                hidden_states = self._mesh_gather_tokens(hidden_states, rs_blocks)
+                hidden_states, topk_weights, topk_ids = self._mesh_gather_tokens(
+                    hidden_states, rs_blocks, topk_weights, topk_ids
+                )
 
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
@@ -347,34 +349,90 @@ class MXFP4EPMoE(EPMoE):
         out = jnp.transpose(blocks, (0, 2, 1, 3))
         return jnp.reshape(out, (t, h), out_sharding=P("data", "tensor"))
 
-    def _mesh_gather_tokens(self, hidden_states, rs_blocks):
+    def _mesh_gather_tokens(self, hidden_states, rs_blocks, topk_weights=None, topk_ids=None):
         """[T, H] with P("data", "tensor") -> replicated, by explicit model-mesh all-gathers.
 
         Replaces the implicit reshard to replicated (0.72 ms at T=4096 on v5e-256) with
         "data" then "tensor" for large inputs (0.52 ms) or one gather over both axes plus
         a local transpose for small ones (0.060 vs 0.077 ms at T=256). Other input
         shardings are returned unchanged (the caller's reshard handles them).
+
+        When the router outputs (P("data", None), f32 weights and int32 ids) are passed and
+        the hidden states are 16-bit, they ride in the same collective: their 32-bit words
+        are split into 16-bit halves, each "tensor" shard sends its slice of those columns
+        next to its hidden-state block, and they are bit-cast back after the gather. Decode
+        steps are latency-bound, so this saves the two separate all-gathers per MoE layer.
+        Returns ``(hidden_states, topk_weights, topk_ids)``.
         """
         if _spec_axes(jax.typeof(hidden_states).sharding.spec, 2) != (("data",), ("tensor",)):
-            return hidden_states
+            return hidden_states, topk_weights, topk_ids
         dp, tp = rs_blocks
         t, h = hidden_states.shape
         two_step = t * h * hidden_states.dtype.itemsize >= self.mesh_gather_two_step_bytes
+        pack = (
+            topk_weights is not None
+            and topk_ids is not None
+            and hidden_states.dtype.itemsize == 2
+            and topk_weights.dtype == jnp.float32
+            and topk_ids.dtype == jnp.int32
+            and topk_weights.shape == topk_ids.shape == (t, topk_ids.shape[1])
+            and (4 * topk_ids.shape[1]) % tp == 0
+            and all(
+                _spec_axes(jax.typeof(a).sharding.spec, 2) == (("data",), ())
+                for a in (topk_weights, topk_ids)
+            )
+        )
+        hdt = hidden_states.dtype
+        k = topk_ids.shape[1] if pack else 0
+        c = 4 * k // tp  # 16-bit routing columns per "tensor" shard
 
-        def gather(x):  # [T/dp, H/tp] -> [T, H]
+        def all_gather(x):  # [T/dp, w] -> [T, tp, w] (tensor-shard blocks along axis 1)
             if two_step:
                 y = jax.lax.all_gather(x, "data", axis=0, tiled=True)
-                return jax.lax.all_gather(y, "tensor", axis=1, tiled=True)
+                y = jax.lax.all_gather(y, "tensor", axis=1, tiled=True)
+                return y.reshape(t, tp, x.shape[1])
             y = jax.lax.all_gather(x[None], ("data", "tensor"), axis=0, tiled=True)
-            return y.reshape(dp, tp, t // dp, h // tp).transpose(0, 2, 1, 3).reshape(t, h)
+            return y.reshape(dp, tp, t // dp, x.shape[1]).transpose(0, 2, 1, 3).reshape(
+                t, tp, x.shape[1]
+            )
 
+        def gather(x):  # [T/dp, H/tp] -> [T, H]
+            return all_gather(x).reshape(t, h)
+
+        def gather_packed(x, wts, ids):
+            words = jnp.concatenate(
+                [
+                    jax.lax.bitcast_convert_type(wts, jnp.uint32),
+                    jax.lax.bitcast_convert_type(ids, jnp.uint32),
+                ],
+                axis=1,
+            )  # [T/dp, 2k]
+            halves = jax.lax.bitcast_convert_type(words, jnp.uint16).reshape(t // dp, 4 * k)
+            mine = jax.lax.dynamic_slice_in_dim(halves, jax.lax.axis_index("tensor") * c, c, 1)
+            x16 = jax.lax.bitcast_convert_type(x, jnp.uint16)
+            full = all_gather(jnp.concatenate([x16, mine], axis=1))  # [T, tp, H/tp + c]
+            hid = jax.lax.bitcast_convert_type(full[:, :, : h // tp].reshape(t, h), hdt)
+            rout = full[:, :, h // tp :].reshape(t, 2 * k, 2)
+            rout = jax.lax.bitcast_convert_type(rout, jnp.uint32)  # [T, 2k]
+            return (
+                hid,
+                jax.lax.bitcast_convert_type(rout[:, :k], jnp.float32),
+                jax.lax.bitcast_convert_type(rout[:, k:], jnp.int32),
+            )
+
+        rep = P(None, None)
+        if not pack:
+            hidden_states = shard_map(
+                gather, mesh=self.mesh, in_specs=P("data", "tensor"), out_specs=rep, check_vma=False
+            )(hidden_states)
+            return hidden_states, topk_weights, topk_ids
         return shard_map(
-            gather,
+            gather_packed,
             mesh=self.mesh,
-            in_specs=P("data", "tensor"),
-            out_specs=P(None, None),
+            in_specs=(P("data", "tensor"), P("data", None), P("data", None)),
+            out_specs=(rep, rep, rep),
             check_vma=False,
-        )(hidden_states)
+        )(hidden_states, topk_weights, topk_ids)
 
     def _forward(
         self,
