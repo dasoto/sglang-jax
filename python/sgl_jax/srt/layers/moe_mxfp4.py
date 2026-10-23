@@ -283,11 +283,13 @@ class MXFP4EPMoE(EPMoE):
         # [ep, moe_tp, T/dp, H/tp]: block (e, x) is device 2e + x's. Two single-axis reduce-scatters
         # (same total traffic as one over both axes): XLA rejects the replica groups of one
         # collective spanning both MoE axes, which are sub-axes of the model mesh's "tensor".
+        # "expert" first: XLA lowers the 2-way "tensor" reduce-scatter as an all-reduce of its
+        # whole input, which is then only [moe_tp, T/dp, H/tp] instead of all of [T, H].
         blocks = blocks.reshape(self.ep_size, self.tp_size, t // dp, h // tp)
-        if self.tp_size > 1:
-            blocks = jax.lax.psum_scatter(blocks, "tensor", scatter_dimension=1, tiled=True)
         if self.ep_size > 1:
             blocks = jax.lax.psum_scatter(blocks, "expert", scatter_dimension=0, tiled=True)
+        if self.tp_size > 1:
+            blocks = jax.lax.psum_scatter(blocks, "tensor", scatter_dimension=1, tiled=True)
         return blocks.reshape(1, t // dp, h // tp)
 
     def _rs_combine_output(self, result, shape, rs_blocks):
@@ -391,16 +393,18 @@ class MXFP4EPMoE(EPMoE):
         rows = num_tokens * top_k
         e_l = self.experts_per_device
         flat_experts = jnp.ravel(topk_ids).astype(jnp.int32)
-        sorted_pos = jnp.argsort(flat_experts, stable=True).astype(jnp.int32)
-        # Group sizes from the sorted ids by binary search: jnp.bincount lowers to a
-        # scatter-add over all T*top_k rows, which cost ~0.8 ms per layer on v5e.
+        # One stable key/value sort gives the expert-sorted order without a separate gather
+        # (a 65K-index gather cost ~0.6 ms per layer on v5e). Group sizes by comparison and
+        # reduction instead of jnp.bincount, whose scatter-add cost ~0.8 ms per layer.
         # Ids >= num_experts (masked DP padding) sort last and are not counted.
-        bounds = jnp.searchsorted(
-            flat_experts[sorted_pos],
-            jnp.arange(self.num_experts + 1, dtype=jnp.int32),
-            side="left",
-        ).astype(jnp.int32)
-        group_sizes = bounds[1:] - bounds[:-1]
+        _, sorted_pos = jax.lax.sort_key_val(
+            flat_experts, jnp.arange(rows, dtype=jnp.int32), is_stable=True
+        )
+        group_sizes = jnp.sum(
+            flat_experts[:, None] == jnp.arange(self.num_experts, dtype=jnp.int32)[None, :],
+            axis=0,
+            dtype=jnp.int32,
+        )
         group_offset = (jax.lax.axis_index("expert") * e_l).astype(jnp.int32)
         local_sizes = jax.lax.dynamic_slice_in_dim(group_sizes, group_offset, e_l)
         start = jnp.sum(jnp.where(jnp.arange(self.num_experts) < group_offset, group_sizes, 0))
