@@ -41,6 +41,8 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 
 # Fused MXFP4 grouped-matmul Pallas kernel (kernels/mxfp4_gmm): opt-in until validated on TPU.
 MXFP4_GMM_KERNEL_ENV = "SGLANG_JAX_MXFP4_GMM_KERNEL"
+# Reduce-scatter MoE combine into the model mesh's P("data", "tensor") layout (see MXFP4EPMoE).
+MOE_RS_COMBINE_ENV = "SGLANG_JAX_MOE_RS_COMBINE"
 
 
 def mxfp4_gmm_kernel_enabled() -> bool:
@@ -80,6 +82,17 @@ class MXFP4EPMoE(EPMoE):
         )
         self.local_window_capacity = None  # fixed window rows (tests); None = derive from load
         self.supports_token_mask = True
+        # Reduce-scatter combine (SGLANG_JAX_MOE_RS_COMBINE=1): instead of all-reducing the full
+        # [T, H] output over "tensor" and then "expert" and replicating it everywhere, one
+        # reduce-scatter over the whole (expert, tensor) mesh lands each chip's block of the
+        # model mesh's P("data", "tensor") layout directly (its DP group's tokens x its slice of
+        # H), which is what the row-parallel routed_expert_up_proj consumes.
+        self.rs_combine = os.environ.get(MOE_RS_COMBINE_ENV, "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         if self.replicate_experts:
             raise NotImplementedError("MXFP4EPMoE does not support moe_dp_size > 1")
         if self.quantized_dtype is not None or self.activation_quantized_dtype is not None:
@@ -184,6 +197,9 @@ class MXFP4EPMoE(EPMoE):
             and self.gmm_kernel_weights_ready
             and rows >= self.local_window_min_rows
         )
+        rs_blocks = self._rs_combine_blocks(hidden_states)
+        if rs_blocks is not None:
+            out_specs = P(("expert", "tensor"), None, None)
 
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
@@ -195,7 +211,7 @@ class MXFP4EPMoE(EPMoE):
                     mask[:, None], topk_ids_reshard, jnp.asarray(self.num_experts, topk_ids_reshard.dtype)
                 )
             result = shard_map(
-                partial(self._forward, scatter_on_tensor=scatter_on_tensor),
+                partial(self._forward, scatter_on_tensor=scatter_on_tensor, rs_blocks=rs_blocks),
                 mesh=self.moe_mesh,
                 in_specs=(
                     P(None),
@@ -230,7 +246,62 @@ class MXFP4EPMoE(EPMoE):
                 None,
                 None,
             )
+        if rs_blocks is not None:
+            return self._rs_combine_output(result, hidden_states.shape, rs_blocks)
         return jax.sharding.reshard(result, out_sharding)
+
+    def _rs_combine_blocks(self, hidden_states) -> tuple[int, int] | None:
+        """(dp, tp) of the model mesh when the reduce-scatter combine applies, else None.
+
+        Needs a 2-D [tokens, H] input, a ("data", "tensor") model mesh covering the same devices
+        as the (expert, tensor) MoE mesh, tokens divisible by dp and H divisible by tp.
+        """
+        if not self.rs_combine or self.replicate_experts or hidden_states.ndim != 2:
+            return None
+        shape = dict(self.mesh.shape)
+        if set(shape) != {"data", "tensor"}:
+            return None
+        dp, tp = shape["data"], shape["tensor"]
+        if dp * tp != self.ep_size * self.tp_size:
+            return None
+        t, h = hidden_states.shape
+        if t % dp or h % tp:
+            return None
+        return dp, tp
+
+    def _rs_reduce(self, output, rs_blocks):
+        """Shard-local: [T, H] partial output -> this chip's [1, T/dp, H/tp] reduced block.
+
+        Block (d, t) holds DP group d's tokens and H slice t, ordered like the flattened model
+        mesh, whose device order the (expert, tensor) mesh shares (EPMoE builds it by reshaping
+        the model mesh's device list), so a tiled reduce-scatter over both MoE axes hands
+        block i to device i. Replaces the all-reduces over "tensor" and "expert".
+        """
+        dp, tp = rs_blocks
+        t, h = output.shape
+        blocks = output.reshape(dp, t // dp, tp, h // tp).transpose(0, 2, 1, 3)
+        # [ep, moe_tp, T/dp, H/tp]: block (e, x) is device 2e + x's. Two single-axis reduce-scatters
+        # (same total traffic as one over both axes): XLA rejects the replica groups of one
+        # collective spanning both MoE axes, which are sub-axes of the model mesh's "tensor".
+        blocks = blocks.reshape(self.ep_size, self.tp_size, t // dp, h // tp)
+        if self.tp_size > 1:
+            blocks = jax.lax.psum_scatter(blocks, "tensor", scatter_dimension=1, tiled=True)
+        if self.ep_size > 1:
+            blocks = jax.lax.psum_scatter(blocks, "expert", scatter_dimension=0, tiled=True)
+        return blocks.reshape(1, t // dp, h // tp)
+
+    def _rs_combine_output(self, result, shape, rs_blocks):
+        """[dp*tp, T/dp, H/tp] blocks on the MoE mesh -> [T, H] with P("data", "tensor")."""
+        dp, tp = rs_blocks
+        t, h = shape
+        blocks = jax.sharding.reshard(
+            result, NamedSharding(self.mesh, P(("data", "tensor"), None, None))
+        )
+        blocks = jnp.reshape(
+            blocks, (dp, tp, t // dp, h // tp), out_sharding=P("data", "tensor", None, None)
+        )
+        out = jnp.transpose(blocks, (0, 2, 1, 3))
+        return jnp.reshape(out, (t, h), out_sharding=P("data", "tensor"))
 
     def _forward(
         self,
@@ -248,8 +319,10 @@ class MXFP4EPMoE(EPMoE):
         wo_kernel_bias=None,
         *,
         scatter_on_tensor: bool = False,
+        rs_blocks: tuple[int, int] | None = None,
     ):
         rows = topk_ids.shape[0] * topk_ids.shape[1]
+        reduce_fn = partial(self._rs_reduce, rs_blocks=rs_blocks) if rs_blocks else None
         if not (self.gmm_kernel_weights_ready and rows >= self.local_window_min_rows):
             return super()._forward(
                 hidden_states,
@@ -265,6 +338,7 @@ class MXFP4EPMoE(EPMoE):
                 w1_kernel_bias,
                 wo_kernel_bias,
                 scatter_on_tensor=scatter_on_tensor,
+                reduce_fn=reduce_fn,
             )
         output = self._forward_local_window(
             hidden_states,
@@ -277,6 +351,8 @@ class MXFP4EPMoE(EPMoE):
             w1_kernel_scale,
             wo_kernel_scale,
         )
+        if reduce_fn is not None:
+            return reduce_fn(output)
         # Same reductions as EPMoE._forward.
         if self.tp_size > 1:
             if scatter_on_tensor:
@@ -316,7 +392,15 @@ class MXFP4EPMoE(EPMoE):
         e_l = self.experts_per_device
         flat_experts = jnp.ravel(topk_ids).astype(jnp.int32)
         sorted_pos = jnp.argsort(flat_experts, stable=True).astype(jnp.int32)
-        group_sizes = jnp.bincount(flat_experts, length=self.num_experts).astype(jnp.int32)
+        # Group sizes from the sorted ids by binary search: jnp.bincount lowers to a
+        # scatter-add over all T*top_k rows, which cost ~0.8 ms per layer on v5e.
+        # Ids >= num_experts (masked DP padding) sort last and are not counted.
+        bounds = jnp.searchsorted(
+            flat_experts[sorted_pos],
+            jnp.arange(self.num_experts + 1, dtype=jnp.int32),
+            side="left",
+        ).astype(jnp.int32)
+        group_sizes = bounds[1:] - bounds[:-1]
         group_offset = (jax.lax.axis_index("expert") * e_l).astype(jnp.int32)
         local_sizes = jax.lax.dynamic_slice_in_dim(group_sizes, group_offset, e_l)
         start = jnp.sum(jnp.where(jnp.arange(self.num_experts) < group_offset, group_sizes, 0))

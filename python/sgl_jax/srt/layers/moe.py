@@ -669,6 +669,7 @@ class EPMoE(nnx.Module):
         wo_kernel_bias=None,
         *,
         scatter_on_tensor: bool = False,
+        reduce_fn=None,
     ):
         expert_shard_id = (
             jnp.array(0, dtype=jnp.int32)
@@ -730,6 +731,10 @@ class EPMoE(nnx.Module):
         # Reduce on the "tensor" axis. RS (psum_scatter) when caller asked
         # for SP layout on the token dim, AR (psum) otherwise. The matching
         # out_specs is set in __call__ from the same source of truth.
+        # ``reduce_fn`` lets a subclass replace both reductions: it gets this
+        # shard's partial output and returns what the shard_map emits.
+        if reduce_fn is not None:
+            return reduce_fn(output)
         if self.tp_size > 1:
             if scatter_on_tensor:
                 output = jax.lax.psum_scatter(output, "tensor", scatter_dimension=0, tiled=True)
