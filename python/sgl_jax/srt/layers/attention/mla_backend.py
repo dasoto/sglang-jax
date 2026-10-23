@@ -14,6 +14,7 @@ projects it through `W_UV → W_O` (see `docs/design/MLA.md` §3.9).
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -38,6 +39,13 @@ if TYPE_CHECKING:
     from sgl_jax.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
+
+# DCP combine by reduce-scatter instead of all_to_all (see _run_dcp). Read at trace time.
+MLA_DCP_RS_COMBINE_ENV = "SGLANG_JAX_MLA_DCP_RS_COMBINE"
+
+
+def _dcp_rs_combine_enabled() -> bool:
+    return os.environ.get(MLA_DCP_RS_COMBINE_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
 
 
 @register_pytree_node_class
@@ -574,6 +582,24 @@ class MLAAttentionBackend(AttentionBackend):
                 decode_batch_size=self.decode_batch_size,
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
+
+            if _dcp_rs_combine_enabled():
+                # Same LSE-weighted combine as below, with a reduce-scatter over "tensor"
+                # (scattering the head axis, so rank g gets head group g) instead of the
+                # all_to_all: on v5e's torus a reduce-scatter moves each byte about one hop,
+                # while the all_to_all is bisection-bound (~3 ms per MLA layer for a
+                # 4096-token prefill on v5e-256). Weighting by exp(lse - global max) before
+                # the sum keeps every term <= 1; the sums run in f32.
+                lse_max = jax.lax.pmax(lse_partial, "tensor")
+                lse_max_safe = jnp.where(jnp.isneginf(lse_max), 0.0, lse_max)
+                w = jnp.where(jnp.isneginf(lse_partial), 0.0, jnp.exp(lse_partial - lse_max_safe))
+                num = jnp.where(
+                    w[..., None] > 0.0, o_partial.astype(jnp.float32) * w[..., None], 0.0
+                )
+                num = jax.lax.psum_scatter(num, "tensor", scatter_dimension=1, tiled=True)
+                den = jax.lax.psum_scatter(w, "tensor", scatter_dimension=1, tiled=True)
+                o_combined = num / jnp.where(den > 0.0, den, 1.0)[..., None]
+                return o_combined.astype(ql_nope_.dtype), cache_updated
 
             # Combine (o_partial, lse_partial) across the "tensor" (DCP) axis.
             # o_partial: [T_dp, N_h, lkv_dim], lse_partial: [T_dp, N_h]
