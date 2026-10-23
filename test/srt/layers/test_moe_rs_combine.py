@@ -3,6 +3,8 @@
 The RS combine lands each chip's block of the model mesh's P("data", "tensor") layout with one
 reduce-scatter over the whole (expert, tensor) MoE mesh instead of all-reducing [T, H] over
 "tensor" and "expert". Values must match the all-reduce path; only the output sharding changes.
+Mesh mode (SGLANG_JAX_MOE_RS_COMBINE=2) runs that reduce-scatter and the token all-gather over
+the model mesh's axes instead; it is checked the same way.
 
 Run:
     JAX_PLATFORMS=cpu python -m pytest test/srt/layers/test_moe_rs_combine.py -q
@@ -33,13 +35,27 @@ def _routing(T, num_experts, topk, seed):
     return ids, w.astype(np.float32)
 
 
-def _layers(mesh, H, I, E, topk, ep, seed):
-    common = dict(hidden_size=H, num_experts=E, num_experts_per_tok=topk, ep_size=ep, mesh=mesh,
-                  intermediate_dim=I, activation="situ", situ_beta=4.0, situ_linear_beta=25.0)
+def _layers(mesh, H, I, E, topk, ep, seed, mesh_mode=False):
+    common = dict(
+        hidden_size=H,
+        num_experts=E,
+        num_experts_per_tok=topk,
+        ep_size=ep,
+        mesh=mesh,
+        intermediate_dim=I,
+        activation="situ",
+        situ_beta=4.0,
+        situ_linear_beta=25.0,
+    )
     ar = MXFP4EPMoE(use_gmm_kernel=True, **common)
     rs = MXFP4EPMoE(use_gmm_kernel=True, **common)
     ar.rs_combine, rs.rs_combine = False, True
-    for name, (k, n), s in (("w1", (H, I), seed), ("w3", (H, I), seed + 1), ("w2", (I, H), seed + 2)):
+    ar.rs_combine_mesh, rs.rs_combine_mesh = False, mesh_mode
+    for name, (k, n), s in (
+        ("w1", (H, I), seed),
+        ("w3", (H, I), seed + 1),
+        ("w2", (I, H), seed + 2),
+    ):
         packed, scale = F.random_mxfp4((k, n), E, seed=s, zero_frac=0.1)
         for layer in (ar, rs):
             for suffix, arr in (("weight_packed", packed), ("weight_scale", scale)):
@@ -52,12 +68,15 @@ def _layers(mesh, H, I, E, topk, ep, seed):
 @pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (CPU) devices")
 @pytest.mark.parametrize("T,window", [(8, False), (40, False), (40, True), (64, True)])
 @pytest.mark.parametrize("in_spec", [P(None, None), P("data", "tensor")])
-def test_rs_combine_matches_allreduce(T, window, in_spec):
+@pytest.mark.parametrize("mesh_mode", [False, True])
+def test_rs_combine_matches_allreduce(T, window, in_spec, mesh_mode):
     """Generic (decode) and local-window (prefill) paths, replicated or sharded input."""
     H, I, E, topk, ep = 256, 256, 8, 3, 4  # 8 devices: data 2 x tensor 4; MoE expert 4 x tensor 2
-    mesh = jax.make_mesh((2, 4), ("data", "tensor"), axis_types=(jax.sharding.AxisType.Explicit,) * 2)
+    mesh = jax.make_mesh(
+        (2, 4), ("data", "tensor"), axis_types=(jax.sharding.AxisType.Explicit,) * 2
+    )
     with jax.set_mesh(mesh):
-        ar, rs = _layers(mesh, H, I, E, topk, ep, seed=11)
+        ar, rs = _layers(mesh, H, I, E, topk, ep, seed=11, mesh_mode=mesh_mode)
         for layer in (ar, rs):
             layer.local_window_min_rows = 1 if window else 1 << 30
         ids, w = _routing(T, E, topk, seed=T)
@@ -85,17 +104,30 @@ def test_rs_combine_matches_allreduce(T, window, in_spec):
 
 @pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (CPU) devices")
 @pytest.mark.parametrize("T", [8, 24])
-def test_rs_combine_exact_in_f32(T):
+@pytest.mark.parametrize("mesh_mode", [False, True])
+def test_rs_combine_exact_in_f32(T, mesh_mode):
     """f32 activations (XLA dequant + GMM path): the two combines agree to f32 rounding."""
     H, I, E, topk, ep = 256, 256, 8, 3, 4
-    mesh = jax.make_mesh((2, 4), ("data", "tensor"), axis_types=(jax.sharding.AxisType.Explicit,) * 2)
+    mesh = jax.make_mesh(
+        (2, 4), ("data", "tensor"), axis_types=(jax.sharding.AxisType.Explicit,) * 2
+    )
     with jax.set_mesh(mesh):
-        common = dict(hidden_size=H, num_experts=E, num_experts_per_tok=topk, ep_size=ep, mesh=mesh,
-                      intermediate_dim=I, activation="situ", situ_beta=4.0, situ_linear_beta=25.0,
-                      dtype=jnp.float32)
+        common = dict(
+            hidden_size=H,
+            num_experts=E,
+            num_experts_per_tok=topk,
+            ep_size=ep,
+            mesh=mesh,
+            intermediate_dim=I,
+            activation="situ",
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+            dtype=jnp.float32,
+        )
         ar = MXFP4EPMoE(use_gmm_kernel=False, **common)
         rs = MXFP4EPMoE(use_gmm_kernel=False, **common)
         ar.rs_combine, rs.rs_combine = False, True
+        ar.rs_combine_mesh, rs.rs_combine_mesh = False, mesh_mode
         for name, (k, n), s in (("w1", (H, I), 41), ("w3", (H, I), 42), ("w2", (I, H), 43)):
             packed, scale = F.random_mxfp4((k, n), E, seed=s, zero_frac=0.1)
             for layer in (ar, rs):
@@ -116,12 +148,15 @@ def test_rs_combine_exact_in_f32(T):
 
 
 @pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (CPU) devices")
-def test_rs_combine_with_masked_padding_and_jit():
+@pytest.mark.parametrize("mesh_mode", [False, True])
+def test_rs_combine_with_masked_padding_and_jit(mesh_mode):
     """Under jit, with DP-padding tokens masked out (prefill path): zero rows stay zero."""
     T, H, I, E, topk, ep = 48, 256, 256, 8, 3, 4
-    mesh = jax.make_mesh((2, 4), ("data", "tensor"), axis_types=(jax.sharding.AxisType.Explicit,) * 2)
+    mesh = jax.make_mesh(
+        (2, 4), ("data", "tensor"), axis_types=(jax.sharding.AxisType.Explicit,) * 2
+    )
     with jax.set_mesh(mesh):
-        ar, rs = _layers(mesh, H, I, E, topk, ep, seed=21)
+        ar, rs = _layers(mesh, H, I, E, topk, ep, seed=21, mesh_mode=mesh_mode)
         for layer in (ar, rs):
             layer.local_window_min_rows = 1
             layer.local_window_capacity = 16
@@ -150,7 +185,9 @@ def test_rs_combine_with_masked_padding_and_jit():
 def test_rs_combine_falls_back_when_tokens_not_divisible():
     """T not divisible by the data axis keeps the all-reduce combine (replicated output)."""
     H, I, E, topk, ep = 256, 256, 8, 2, 4
-    mesh = jax.make_mesh((2, 4), ("data", "tensor"), axis_types=(jax.sharding.AxisType.Explicit,) * 2)
+    mesh = jax.make_mesh(
+        (2, 4), ("data", "tensor"), axis_types=(jax.sharding.AxisType.Explicit,) * 2
+    )
     with jax.set_mesh(mesh):
         _, rs = _layers(mesh, H, I, E, topk, ep, seed=31)
         hs = jax.device_put(jnp.zeros((5, H), jnp.bfloat16), NamedSharding(mesh, P(None, None)))

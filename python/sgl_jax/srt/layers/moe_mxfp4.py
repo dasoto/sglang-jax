@@ -48,6 +48,15 @@ MOE_RS_COMBINE_ENV = "SGLANG_JAX_MOE_RS_COMBINE"
 def mxfp4_gmm_kernel_enabled() -> bool:
     return os.environ.get(MXFP4_GMM_KERNEL_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
 
+
+def _spec_axes(spec, ndim: int) -> tuple[tuple[str, ...], ...]:
+    """PartitionSpec -> per-dimension tuples of mesh axes, padded to ``ndim``."""
+    entries = list(spec) + [None] * (ndim - len(spec))
+    return tuple(
+        () if e is None else ((e,) if isinstance(e, str) else tuple(e)) for e in entries[:ndim]
+    )
+
+
 # k-major MXFP4 layouts on the (expert, tensor) mesh.
 _WI_SPEC = P("expert", None, "tensor")  # gate/up: [E, H//2 | H//32, I]
 _WO_SPEC = P("expert", "tensor", None)  # down:    [E, I//2 | I//32, H]
@@ -87,12 +96,16 @@ class MXFP4EPMoE(EPMoE):
         # reduce-scatter over the whole (expert, tensor) mesh lands each chip's block of the
         # model mesh's P("data", "tensor") layout directly (its DP group's tokens x its slice of
         # H), which is what the row-parallel routed_expert_up_proj consumes.
-        self.rs_combine = os.environ.get(MOE_RS_COMBINE_ENV, "0").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
+        # SGLANG_JAX_MOE_RS_COMBINE=2 also runs that reduce-scatter, and the token all-gather
+        # that feeds the experts, as collectives over the model mesh's own axes (see
+        # _rs_combine_output and _mesh_gather_tokens), which v5e runs faster than collectives
+        # over the MoE mesh's strided "expert" axis.
+        rs_mode = os.environ.get(MOE_RS_COMBINE_ENV, "0").strip().lower()
+        self.rs_combine = rs_mode in ("1", "true", "yes", "on", "2", "mesh")
+        self.rs_combine_mesh = rs_mode in ("2", "mesh")
+        # Token all-gather: one collective over both model-mesh axes for small inputs; for
+        # large ones "data" then "tensor", which measured faster on v5e-256 at 29 MB.
+        self.mesh_gather_two_step_bytes = 8 << 20
         if self.replicate_experts:
             raise NotImplementedError("MXFP4EPMoE does not support moe_dp_size > 1")
         if self.quantized_dtype is not None or self.activation_quantized_dtype is not None:
@@ -199,7 +212,10 @@ class MXFP4EPMoE(EPMoE):
         )
         rs_blocks = self._rs_combine_blocks(hidden_states)
         if rs_blocks is not None:
-            out_specs = P(("expert", "tensor"), None, None)
+            # Mesh mode emits each chip's unreduced [dp*tp, T/dp, H/tp] blocks (reduced after).
+            out_specs = P(("expert", "tensor"), None, None, *([None] if self.rs_combine_mesh else []))
+            if self.rs_combine_mesh:
+                hidden_states = self._mesh_gather_tokens(hidden_states, rs_blocks)
 
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
@@ -280,6 +296,9 @@ class MXFP4EPMoE(EPMoE):
         dp, tp = rs_blocks
         t, h = output.shape
         blocks = output.reshape(dp, t // dp, tp, h // tp).transpose(0, 2, 1, 3)
+        if self.rs_combine_mesh:
+            # Unreduced; _rs_combine_output reduce-scatters it over the model mesh.
+            return blocks.reshape(1, dp * tp, t // dp, h // tp)
         # [ep, moe_tp, T/dp, H/tp]: block (e, x) is device 2e + x's. Two single-axis reduce-scatters
         # (same total traffic as one over both axes): XLA rejects the replica groups of one
         # collective spanning both MoE axes, which are sub-axes of the model mesh's "tensor".
@@ -293,9 +312,32 @@ class MXFP4EPMoE(EPMoE):
         return blocks.reshape(1, t // dp, h // tp)
 
     def _rs_combine_output(self, result, shape, rs_blocks):
-        """[dp*tp, T/dp, H/tp] blocks on the MoE mesh -> [T, H] with P("data", "tensor")."""
+        """MoE-mesh shard_map output -> [T, H] with P("data", "tensor").
+
+        ``result`` is [dp*tp, T/dp, H/tp] reduced blocks, or in mesh mode every chip's
+        unreduced [1, dp*tp, T/dp, H/tp] blocks stacked to [dp*tp, dp*tp, T/dp, H/tp].
+        """
         dp, tp = rs_blocks
         t, h = shape
+        if self.rs_combine_mesh:
+            # Same devices in the same order on both meshes: this reshard moves no data.
+            stacked = jax.sharding.reshard(
+                result, NamedSharding(self.mesh, P(("data", "tensor"), None, None, None))
+            )
+
+            def reduce_blocks(x):  # [1, dp*tp, T/dp, H/tp] partial -> [T/dp, H/tp] reduced
+                # One reduce-scatter over both model-mesh axes (block i -> device i): 0.57 ms
+                # vs 0.88 ms for v2's expert + tensor pair at T=4096 on v5e-256.
+                y = jax.lax.psum_scatter(x, ("data", "tensor"), scatter_dimension=1, tiled=True)
+                return y.reshape(t // dp, h // tp)
+
+            return shard_map(
+                reduce_blocks,
+                mesh=self.mesh,
+                in_specs=P(("data", "tensor"), None, None, None),
+                out_specs=P("data", "tensor"),
+                check_vma=False,
+            )(stacked)
         blocks = jax.sharding.reshard(
             result, NamedSharding(self.mesh, P(("data", "tensor"), None, None))
         )
@@ -304,6 +346,35 @@ class MXFP4EPMoE(EPMoE):
         )
         out = jnp.transpose(blocks, (0, 2, 1, 3))
         return jnp.reshape(out, (t, h), out_sharding=P("data", "tensor"))
+
+    def _mesh_gather_tokens(self, hidden_states, rs_blocks):
+        """[T, H] with P("data", "tensor") -> replicated, by explicit model-mesh all-gathers.
+
+        Replaces the implicit reshard to replicated (0.72 ms at T=4096 on v5e-256) with
+        "data" then "tensor" for large inputs (0.52 ms) or one gather over both axes plus
+        a local transpose for small ones (0.060 vs 0.077 ms at T=256). Other input
+        shardings are returned unchanged (the caller's reshard handles them).
+        """
+        if _spec_axes(jax.typeof(hidden_states).sharding.spec, 2) != (("data",), ("tensor",)):
+            return hidden_states
+        dp, tp = rs_blocks
+        t, h = hidden_states.shape
+        two_step = t * h * hidden_states.dtype.itemsize >= self.mesh_gather_two_step_bytes
+
+        def gather(x):  # [T/dp, H/tp] -> [T, H]
+            if two_step:
+                y = jax.lax.all_gather(x, "data", axis=0, tiled=True)
+                return jax.lax.all_gather(y, "tensor", axis=1, tiled=True)
+            y = jax.lax.all_gather(x[None], ("data", "tensor"), axis=0, tiled=True)
+            return y.reshape(dp, tp, t // dp, h // tp).transpose(0, 2, 1, 3).reshape(t, h)
+
+        return shard_map(
+            gather,
+            mesh=self.mesh,
+            in_specs=P("data", "tensor"),
+            out_specs=P(None, None),
+            check_vma=False,
+        )(hidden_states)
 
     def _forward(
         self,
