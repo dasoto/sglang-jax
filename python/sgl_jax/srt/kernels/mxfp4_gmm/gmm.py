@@ -275,6 +275,20 @@ def mxfp4_gmm(
     if M == 0:
         return jnp.zeros((0, N), out_dtype)
 
+    G = group_sizes.shape[0]
+    if G > E_l + 2:
+        # Build the metadata over the local groups only: the rows before them become one
+        # leading group and the rows after them one trailing group, so the row offsets of
+        # the local groups are unchanged. make_group_metadata's repeat/histogram are
+        # scatter-style ops over all G groups (G = 896 for Kimi-K3: ~10 ms per decode step
+        # on v5e-256 for the two GMMs of every MoE layer).
+        ids = jnp.arange(G, dtype=jnp.int32)
+        before = jnp.sum(jnp.where(ids < group_offset, group_sizes, 0))
+        local = lax.dynamic_slice_in_dim(group_sizes, group_offset, E_l)
+        after = jnp.sum(group_sizes) - before - jnp.sum(local)
+        group_sizes = jnp.concatenate([before[None], local, after[None]]).astype(jnp.int32)
+        group_offset = jnp.ones((), jnp.int32)
+
     pad = (-M) % tm
     if pad:
         lhs = jnp.pad(lhs, ((0, pad), (0, 0)))

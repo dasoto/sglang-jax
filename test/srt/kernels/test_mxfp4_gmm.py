@@ -127,6 +127,9 @@ CASES = [
     (3, 3, 0, [70, 2, 50], 16, (256, 128), "situ_glu", True),  # (bn, nl): lane sub-tiles
     (3, 3, 0, [70, 2, 50], 16, (256, 128), "situ_glu", "mask"),  # cache=True + zero_mode="mask"
     (2, 2, 0, [300, 213], 256, 256, "situ_glu", True),  # big tile: VMEM accumulator path
+    # Many non-local groups (metadata built over the local ones only), incl. an empty local group.
+    (40, 3, 17, [(i * 7) % 11 for i in range(40)], 16, 128, None, True),
+    (40, 3, 22, [(i * 7) % 11 for i in range(40)], 16, 128, "situ_glu", True),
 ]
 
 
