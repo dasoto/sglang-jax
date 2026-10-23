@@ -118,6 +118,34 @@ def test_hot_prefix_spills_when_owning_rank_is_full():
     assert _pick([1, 2, 3], counts, tokens, matches, prompt_len=512) == 2
 
 
+def _sticky(eligible, matches, prompt_len, max_spill_tokens):
+    counts = [0] * 4
+    return pick(eligible, counts, counts, matches, prompt_len, counts, counts, 0, 0,
+                max_spill_tokens=max_spill_tokens)
+
+
+def test_sticky_defers_when_full_rank_holds_a_much_longer_prefix():
+    # Rank 0 (full) caches 70K of a 72K-token session prompt; spilling would re-prefill 70K.
+    matches = {0: 70_000, 1: 0, 2: 0, 3: 0}
+    assert _sticky([1, 2, 3], matches, 72_000, max_spill_tokens=16_384) is None
+
+
+def test_sticky_spills_when_the_extra_prefill_is_small():
+    # A shared 10K system prompt on a full rank is cheap to re-prefill: route by load.
+    matches = {0: 10_000, 1: 0, 2: 0, 3: 0}
+    assert _sticky([1, 2, 3], matches, 30_000, max_spill_tokens=16_384) == 1
+
+
+def test_sticky_routes_to_an_eligible_holder_of_a_similar_prefix():
+    matches = {0: 70_000, 1: 0, 2: 69_000, 3: 0}
+    assert _sticky([1, 2, 3], matches, 72_000, max_spill_tokens=16_384) == 2
+
+
+def test_sticky_off_keeps_spilling_to_cold_ranks():
+    matches = {0: 70_000, 1: 0, 2: 0, 3: 0}
+    assert _sticky([1, 2, 3], matches, 72_000, max_spill_tokens=None) == 1
+
+
 def test_holder_and_load_tie_breaks_by_lowest_rank():
     counts = [2, 2, 2, 2]
     tokens = [20, 20, 20, 20]
