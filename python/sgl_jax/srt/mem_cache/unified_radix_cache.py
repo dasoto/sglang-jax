@@ -305,6 +305,11 @@ class UnifiedRadixCache(BasePrefixCache):
         tracker = {ct: 0 for ct in self.tree_components}
         for component in self._components_tuple:
             component.drive_eviction(params=params, tracker=tracker)
+        # Diagnostics: cumulative (tokens, recurrent snapshots) evicted per DP rank.
+        diag = self.__dict__.setdefault("_diag_evicted", {})
+        dp = params.dp_rank or 0
+        tok, rec = diag.get(dp, (0, 0))
+        diag[dp] = (tok + tracker[BASE_COMPONENT_TYPE], rec + tracker.get(ComponentType.RECURRENT, 0))
 
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],

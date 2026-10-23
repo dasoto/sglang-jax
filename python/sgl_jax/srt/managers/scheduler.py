@@ -118,6 +118,7 @@ from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
+_DIAG_ROUTING = os.environ.get("SGLANG_JAX_DIAG_ROUTING", "0") == "1"
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
@@ -1238,6 +1239,7 @@ class Scheduler(
             return_hidden_states=recv_req.return_hidden_states,
         )
         req.tokenizer = self.tokenizer
+        req._dp_route_info = getattr(recv_req, "_dp_route_info", None)
         if (
             req.return_hidden_states
             and self.spec_algorithm is not None
@@ -2110,6 +2112,62 @@ class Scheduler(
 
         return ret
 
+    def _diag_admission(self, req, dp_rank: int) -> None:
+        """SGLANG_JAX_DIAG_ROUTING=1: account prompts at admission and log long ones that
+        arrive with less than half of their tokens cached, with the KV-only (no recurrent
+        snapshot) match on every DP rank and the recurrent slot state. Logging only."""
+        try:
+            st = self.__dict__.setdefault("_diag_stats", {"admitted": 0, "long": 0, "long_miss": 0,
+                                                          "long_tokens": 0, "long_cached": 0})
+            self._diag_periodic()
+            if getattr(req, "_diag_seen", False):  # count a request at its first admission try only
+                return
+            req._diag_seen = True
+            ids = getattr(req, "radix_input_ids", None)
+            if not isinstance(ids, list) or not ids or not isinstance(ids[0], int):
+                ids = list(req.origin_input_ids)
+            n, got = len(ids), len(req.prefix_indices)
+            st["admitted"] += 1
+            if n < 16384:
+                return
+            st["long"] += 1
+            st["long_tokens"] += n
+            st["long_cached"] += got
+            if got >= n // 2:
+                return
+            st["long_miss"] += 1
+            key = ids[: n - 1]
+            kv = [
+                len(self.tree_cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(key, req.extra_key, r), full_only=True)
+                ).device_indices)
+                for r in range(self.dp_size)
+            ]
+            free = [self.req_to_token_pool.recurrent_available_size(r) for r in range(self.dp_size)]
+            evictable = [self.tree_cache.recurrent_evictable_size(r) for r in range(self.dp_size)]
+            logger.info(
+                "[diag] miss: rid=%s dp=%d prompt=%d cached=%d kv_only_per_dp=%s "
+                "route(best,chosen,rank,deferrals)=%s recurrent_free=%s recurrent_evictable=%s",
+                req.rid, dp_rank, n, got, kv, getattr(req, "_dp_route_info", None), free, evictable,
+            )
+        except Exception as e:  # diagnostics must never break serving
+            logger.info("[diag] admission diagnostics failed: %r", e)
+
+    def _diag_periodic(self) -> None:
+        now = time.monotonic()
+        if now - self.__dict__.get("_diag_last_log", 0.0) < 60.0:
+            return
+        self._diag_last_log = now
+        st = self.__dict__.get("_diag_stats", {})
+        ev = getattr(self.tree_cache, "_diag_evicted", {})
+        free = [self.req_to_token_pool.recurrent_available_size(r) for r in range(self.dp_size)]
+        evictable = [self.tree_cache.recurrent_evictable_size(r) for r in range(self.dp_size)]
+        logger.info(
+            "[diag] totals: admissions=%s evicted(tokens,recurrent) per dp=%s recurrent_free=%s "
+            "recurrent_evictable=%s",
+            st, {r: ev.get(r, (0, 0)) for r in range(self.dp_size)}, free, evictable,
+        )
+
     def get_new_batch_prefill(self) -> ScheduleBatch | None:
         # Pathways-PD sets _pd_admission_paused while its D-pool token gate is
         # closed: existing chunked requests still advance, but nothing new is
@@ -2243,6 +2301,8 @@ class Scheduler(
                 continue  # host pool full: leave req in waiting_queue, retry next round
 
             req.init_next_round_input(self.tree_cache)
+            if _DIAG_ROUTING:
+                self._diag_admission(req, dp_rank)
 
             # Post-match refinement: a prefix hit locks its matched snapshot
             # (non-evictable for the req's lifetime); discount it so admission at

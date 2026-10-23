@@ -221,6 +221,9 @@ class DpRouter:
             output_tokens,
             max_spill_tokens=self.max_spill_tokens if sticky else None,
         )
+        if rank is not None:
+            # Diagnostics: longest cached prefix on any probed rank, on the chosen rank, deferrals.
+            req._dp_route_info = (max(matches.values(), default=0), matches.get(rank, 0), rank, deferrals)
         if rank is None and sticky:
             req._dp_defer_rounds = deferrals + 1
             if req._dp_defer_rounds == self.max_defer_rounds:
