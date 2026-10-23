@@ -362,6 +362,10 @@ class MXFP4EPMoE(EPMoE):
         are split into 16-bit halves, each "tensor" shard sends its slice of those columns
         next to its hidden-state block, and they are bit-cast back after the gather. Decode
         steps are latency-bound, so this saves the two separate all-gathers per MoE layer.
+        Only inputs below the two-step size (decode-sized batches) are packed: for
+        prefill-sized ones the pack and unpack copies cost more than the saved gathers
+        (v5e-256: +12 ms per 8 x 512-token prefill step), so the router outputs are returned
+        unchanged for the caller's reshard.
         Returns ``(hidden_states, topk_weights, topk_ids)``.
         """
         if _spec_axes(jax.typeof(hidden_states).sharding.spec, 2) != (("data",), ("tensor",)):
@@ -370,7 +374,8 @@ class MXFP4EPMoE(EPMoE):
         t, h = hidden_states.shape
         two_step = t * h * hidden_states.dtype.itemsize >= self.mesh_gather_two_step_bytes
         pack = (
-            topk_weights is not None
+            not two_step
+            and topk_weights is not None
             and topk_ids is not None
             and hidden_states.dtype.itemsize == 2
             and topk_weights.dtype == jnp.float32

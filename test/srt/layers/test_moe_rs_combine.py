@@ -197,7 +197,8 @@ def test_rs_combine_falls_back_when_tokens_not_divisible():
 @pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (CPU) devices")
 @pytest.mark.parametrize("T", [16, 4096])  # one-op gather, and "data" then "tensor" (>= 8 MiB)
 def test_mesh_gather_packs_routing_bit_exact(T):
-    """Mesh mode gathers the router outputs inside the hidden-state all-gather, bit-exactly."""
+    """Mesh mode gathers the router outputs inside the hidden-state all-gather, bit-exactly,
+    for decode-sized inputs; prefill-sized ones (two-step gather) return them unchanged."""
     H, I, E, topk, ep = 1024, 256, 8, 4, 4
     mesh = jax.make_mesh(
         (2, 4), ("data", "tensor"), axis_types=(jax.sharding.AxisType.Explicit,) * 2
@@ -215,7 +216,10 @@ def test_mesh_gather_packs_routing_bit_exact(T):
         tw = jax.device_put(jnp.asarray(w_np), NamedSharding(mesh, P("data", None)))
         ti = jax.device_put(jnp.asarray(ids_np), NamedSharding(mesh, P("data", None)))
         h2, w2, i2 = jax.jit(lambda a, b, c: rs._mesh_gather_tokens(a, (2, 4), b, c))(hs, tw, ti)
-        assert h2.sharding.spec == w2.sharding.spec == i2.sharding.spec == P(None, None)
+        packed = T * H * 2 < rs.mesh_gather_two_step_bytes
+        assert packed == (T == 16)
+        assert h2.sharding.spec == P(None, None)
+        assert w2.sharding.spec == i2.sharding.spec == (P(None, None) if packed else P("data", None))
         assert w2.dtype == jnp.float32 and i2.dtype == jnp.int32
     np.testing.assert_array_equal(np.asarray(h2).view(np.uint16), np.asarray(hs).view(np.uint16))
     np.testing.assert_array_equal(np.asarray(w2).view(np.uint32), w_np.view(np.uint32))
