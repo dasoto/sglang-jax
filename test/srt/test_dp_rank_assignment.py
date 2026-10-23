@@ -224,6 +224,57 @@ def test_cache_aware_only_probes_available_ranks():
     assert [call.args[2] for call in lookup.call_args_list] == [1]
 
 
+def _sticky_router(lookup):
+    # Rank 0 is full (limit 0); rank 1 has room.
+    return DpRouter(
+        DpLoadSnapshot((0, 0), (0, 0), (0, 0), (0, 256)),
+        "cache_aware",
+        Mock(return_value=(4, 4)),
+        lookup,
+    )
+
+
+def test_sticky_cache_aware_defers_for_a_full_holder(monkeypatch):
+    monkeypatch.setenv("SGLANG_JAX_DP_MAX_SPILL_TOKENS", "1")
+    lookup = Mock(side_effect=lambda tokens, key, rank: 3 if rank == 0 else 0)
+    router = _sticky_router(lookup)
+    req = _req()
+    assert router.assign(req) is None
+    assert [call.args[2] for call in lookup.call_args_list] == [0, 1]
+    assert router.request_counts == [0, 0]
+    assert req.dp_rank is None
+
+
+def test_sticky_cache_aware_spills_after_max_defer_rounds(monkeypatch):
+    monkeypatch.setenv("SGLANG_JAX_DP_MAX_SPILL_TOKENS", "1")
+    monkeypatch.setenv("SGLANG_JAX_DP_MAX_DEFER_ROUNDS", "2")
+    lookup = Mock(side_effect=lambda tokens, key, rank: 3 if rank == 0 else 0)
+    req = _req()
+    assert _sticky_router(lookup).assign(req) is None
+    assert _sticky_router(lookup).assign(req) is None
+    assert _sticky_router(lookup).assign(req) == 1
+    assert req.dp_rank == 1
+
+
+def test_sticky_cache_aware_spills_when_holder_gap_is_small(monkeypatch):
+    monkeypatch.setenv("SGLANG_JAX_DP_MAX_SPILL_TOKENS", "2")
+    lookup = Mock(side_effect=lambda tokens, key, rank: 3 if rank == 0 else 1)
+    assert _sticky_router(lookup).assign(_req()) == 1
+
+
+def test_sticky_setting_does_not_change_other_policies(monkeypatch):
+    monkeypatch.setenv("SGLANG_JAX_DP_MAX_SPILL_TOKENS", "1")
+    lookup = Mock(side_effect=lambda tokens, key, rank: 3 if rank == 0 else 0)
+    router = DpRouter(
+        DpLoadSnapshot((0, 0), (0, 0), (0, 0), (0, 256)),
+        "min_running_queue",
+        Mock(return_value=(4, 4)),
+        lookup,
+    )
+    assert router.assign(_req()) == 1
+    lookup.assert_not_called()
+
+
 @pytest.mark.parametrize("policy", ["min_running_queue", "round_robin"])
 def test_explicit_rank_keeps_existing_full_rank_bypass(policy):
     router = DpRouter(

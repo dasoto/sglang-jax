@@ -72,9 +72,16 @@ def pick_cache_aware_dp(
     output_counts: list[int],
     item_input: int = 0,
     item_output: int = 0,
+    max_spill_tokens: int | None = None,
 ) -> int | None:
     """Cache-affinity DP policy with shape-aware miss fallback.
 
+    0. Sticky affinity (only when ``max_spill_tokens`` is set; ``matches`` then also
+       covers admission-ineligible ranks): defer (return ``None``) when some rank
+       caches more than ``max_spill_tokens`` more of the prompt than the best
+       eligible rank, i.e. when routing now would re-prefill that many tokens a
+       full rank already holds. Multi-turn sessions otherwise spill to a cold rank
+       whenever their home rank is at its request cap.
     1. If the load skew across eligible ranks is large
        (``max-min > BALANCE_ABS`` and ``max > min*BALANCE_REL``), ignore cache
        affinity and pick the least-loaded rank.
@@ -92,6 +99,11 @@ def pick_cache_aware_dp(
 
     def least_loaded(ranks: list[int]) -> int:
         return min(ranks, key=lambda r: (counts[r], token_counts[r], r))
+
+    if max_spill_tokens is not None and prompt_len > 0 and matches:
+        best_eligible = max((matches.get(r, 0) for r in eligible), default=0)
+        if max(matches.values()) - best_eligible > max_spill_tokens:
+            return None
 
     loads = [counts[r] for r in eligible]
     max_load, min_load = max(loads), min(loads)

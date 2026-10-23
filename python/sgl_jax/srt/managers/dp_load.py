@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 
 from sgl_jax.srt.managers.dp_schedule_policy import (
@@ -61,6 +62,20 @@ class DpLoadSnapshot:
 logger = logging.getLogger(__name__)
 
 
+def _env_int(name: str) -> int | None:
+    value = os.environ.get(name, "").strip()
+    return int(value) if value else None
+
+
+# Sticky cache affinity for the ``cache_aware`` policy (off unless set). A request is
+# deferred instead of routed to an available rank when a full rank caches more than
+# SGLANG_JAX_DP_MAX_SPILL_TOKENS more of its prompt (see ``pick_cache_aware_dp``). After
+# SGLANG_JAX_DP_MAX_DEFER_ROUNDS deferrals it may spill again. A round is one intake call,
+# made once per scheduler iteration in lockstep on every node, so the count is identical
+# across nodes and routing stays deterministic.
+_DEFAULT_MAX_DEFER_ROUNDS = 500
+
+
 class DpRouter:
     """Assign requests using mutable load counters private to one intake round.
 
@@ -86,6 +101,11 @@ class DpRouter:
         self._estimate_io = estimate_io
         self._lookup_prefix = lookup_prefix
         self.round_robin_counter = round_robin_start
+        self.max_spill_tokens = (
+            _env_int("SGLANG_JAX_DP_MAX_SPILL_TOKENS") if policy == "cache_aware" else None
+        )
+        max_defer = _env_int("SGLANG_JAX_DP_MAX_DEFER_ROUNDS")
+        self.max_defer_rounds = _DEFAULT_MAX_DEFER_ROUNDS if max_defer is None else max_defer
 
     def assign(self, req) -> int | None:
         """Choose or preserve a DP rank, then record its load exactly once.
@@ -163,24 +183,51 @@ class DpRouter:
         self, req, eligible: list[int], input_tokens: int, output_tokens: int
     ) -> int | None:
         token_ids, extra_key = req_prefix_match_key(req)
+        deferrals = getattr(req, "_dp_defer_rounds", 0)
+        sticky = self.max_spill_tokens is not None and deferrals < self.max_defer_rounds
         matches = {}
         if token_ids:
             # Force-cache-aware must see full holders too: defer instead of
             # silently choosing a smaller cache hit on an available rank.
-            probe_ranks = range(self.dp_size) if self.policy == "force_cache_aware" else eligible
+            # Sticky cache-aware probes them to measure the cost of spilling.
+            probe_ranks = (
+                range(self.dp_size) if self.policy == "force_cache_aware" or sticky else eligible
+            )
             for rank in probe_ranks:
                 matches[rank] = self._lookup_prefix(token_ids, extra_key, rank)
-        picker = (
-            pick_force_cache_aware_dp if self.policy == "force_cache_aware" else pick_cache_aware_dp
-        )
-        return picker(
+        prompt_len = len(token_ids) if token_ids else 0
+        loads = [i + o for i, o in zip(self.input_tokens, self.output_tokens)]
+        if self.policy == "force_cache_aware":
+            return pick_force_cache_aware_dp(
+                eligible,
+                self.request_counts,
+                loads,
+                matches,
+                prompt_len,
+                self.input_tokens,
+                self.output_tokens,
+                input_tokens,
+                output_tokens,
+            )
+        rank = pick_cache_aware_dp(
             eligible,
             self.request_counts,
-            [i + o for i, o in zip(self.input_tokens, self.output_tokens)],
+            loads,
             matches,
-            len(token_ids) if token_ids else 0,
+            prompt_len,
             self.input_tokens,
             self.output_tokens,
             input_tokens,
             output_tokens,
+            max_spill_tokens=self.max_spill_tokens if sticky else None,
         )
+        if rank is None and sticky:
+            req._dp_defer_rounds = deferrals + 1
+            if req._dp_defer_rounds == self.max_defer_rounds:
+                logger.info(
+                    "DP router: request %s deferred %d rounds for its cache holder; "
+                    "it may now spill to another rank",
+                    req.rid,
+                    req._dp_defer_rounds,
+                )
+        return rank
