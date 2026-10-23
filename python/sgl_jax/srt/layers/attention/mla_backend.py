@@ -547,14 +547,13 @@ class MLAAttentionBackend(AttentionBackend):
             )
             local_page = ((logical_page - 1) // self.dcp_size) + 1
 
-            cache_flat = cache_.reshape(-1, cache_.shape[-1])
-            local_slot = jnp.where(
-                is_owned,
-                local_page * self.page_size + in_page,
-                cache_flat.shape[0],
-            )
-            cache_flat = cache_flat.at[local_slot].set(new_kv_fused, mode="drop")
-            cache_updated = cache_flat.reshape(cache_.shape)
+            # Scatter into the cache in its own (packed, paged) shape: reshaping it to
+            # [-1, dim] and back changes the TPU tiling, which copied the whole layer cache
+            # twice per step (~4 ms per decode step on v5e-256). Same slots as the flat view.
+            flat_slot = local_page * self.page_size + in_page
+            idx = list(jnp.unravel_index(jnp.where(is_owned, flat_slot, 0), cache_.shape[:-1]))
+            idx[0] = jnp.where(is_owned, idx[0], cache_.shape[0])  # out of bounds: dropped
+            cache_updated = cache_.at[tuple(idx)].set(new_kv_fused, mode="drop")
 
             # Gather all query heads so every DCP rank computes attention for all heads on its local KV pages.
             ql_nope_all = jax.lax.all_gather(ql_nope_, axis_name="tensor", axis=1, tiled=True)
