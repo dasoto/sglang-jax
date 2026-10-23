@@ -9,7 +9,13 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.kda import naive_recurrent_kda
-from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend, l2_normalize
+from sgl_jax.srt.layers.attention.linear.kda_backend import (
+    KDAAttnBackend,
+    conv_state_shards,
+    conv_states_from_packed,
+    conv_states_to_packed,
+    l2_normalize,
+)
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.managers.schedule_batch import PADDING_BUCKETS, ModelWorkerBatch
 from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
@@ -385,6 +391,10 @@ def create_test_data(
     ssm_init_dev = jax.device_put(
         jnp.asarray(ssm_init_full_dev, dtype=pool.temporal_dtype), pool.recurrent_sharding
     )
+    # The pool stores conv states in the backend's packed layout (see conv_state_shards).
+    conv_init_full_dev = conv_states_to_packed(
+        conv_init_full_dev, conv_state_shards(pool.conv_sharding.mesh, pool.proj_size)
+    )
     conv_init_dev = jax.device_put(
         jnp.asarray(conv_init_full_dev, dtype=pool.conv_dtype), pool.conv_sharding
     )
@@ -546,7 +556,9 @@ def assert_pool_state_per_rank(
     err_prefix: str,
 ):
     rec_np = np.asarray(rec_buf)
-    conv_np = np.asarray(conv_buf)
+    conv_np = conv_states_from_packed(
+        np.asarray(conv_buf), conv_state_shards(conv_buf.sharding.mesh, conv_buf.shape[1])
+    )
     rank_stride = rec_np.shape[0] // dp_size
     for dp_rank in range(dp_size):
         info = per_dp_infos[dp_rank]

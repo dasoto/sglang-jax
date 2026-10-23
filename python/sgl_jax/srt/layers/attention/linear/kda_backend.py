@@ -33,6 +33,44 @@ def l2_normalize(x: jax.Array, epsilon: float = 1e-6) -> jax.Array:
     return (x32 * rstd).astype(x.dtype)
 
 
+def conv_state_shards(mesh: jax.sharding.Mesh | None, proj_size: int) -> int:
+    """How many "tensor" shards the packed KDA conv-state layout interleaves over.
+
+    1 means the plain [q | k | v] channel layout. Otherwise each "tensor" shard's slice of
+    the packed channel axis holds that shard's own [q | k | v] channels, so packing and
+    unpacking stay on-chip. A three-way split of the plain layout moves data between chips
+    (about 15 small collective-permutes per KDA layer per step) whenever proj_size / 3 is not
+    a multiple of the per-shard width, e.g. Kimi-K3 on v5e-256: 12288 channels per stream,
+    1152 packed channels per shard.
+    """
+    shape = dict(mesh.shape) if mesh is not None else {}
+    tp = shape.get("tensor", 1)
+    if tp > 1 and "data" in shape and proj_size % 3 == 0 and (proj_size // 3) % tp == 0:
+        return tp
+    return 1
+
+
+def conv_states_to_packed(conv_states, shards: int):
+    """Plain [B, 3D, K-1] ([q | k | v]) conv states -> the packed layout over ``shards``.
+
+    Works on host (numpy) and unsharded device arrays alike.
+    """
+    if shards == 1:
+        return conv_states
+    b, d3, k1 = conv_states.shape
+    x = conv_states.reshape(b, 3, shards, d3 // (3 * shards), k1)
+    return x.swapaxes(1, 2).reshape(b, d3, k1)
+
+
+def conv_states_from_packed(packed, shards: int):
+    """Inverse of :func:`conv_states_to_packed`."""
+    if shards == 1:
+        return packed
+    b, d3, k1 = packed.shape
+    x = packed.reshape(b, shards, 3, d3 // (3 * shards), k1)
+    return x.swapaxes(1, 2).reshape(b, d3, k1)
+
+
 class KDAAttnBackend(LinearRecurrentAttnBackend):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
@@ -531,10 +569,24 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         self,
         conv_states: jax.Array,
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """Slice ``[B, proj_size, K-1]`` into per-stream Q/K/V caches."""
+        """Slice ``[B, proj_size, K-1]`` into per-stream Q/K/V caches.
+
+        Uses the packed layout of :func:`conv_state_shards`: when it interleaves over the
+        "tensor" shards, each shard splits its own slice, with no cross-chip traffic.
+        """
         D = conv_states.shape[1]
         assert D % 3 == 0, f"conv_states channel dim {D} must be divisible by 3"
-        q, k, v = jnp.split(conv_states, 3, axis=1)
+        if conv_state_shards(self.mesh, D) == 1:
+            q, k, v = jnp.split(conv_states, 3, axis=1)
+            return q, k, v
+        spec = P("data", "tensor", None)
+        q, k, v = jax.shard_map(
+            lambda x: tuple(jnp.split(x, 3, axis=1)),
+            mesh=self.mesh,
+            in_specs=spec,
+            out_specs=(spec, spec, spec),
+            check_vma=False,
+        )(conv_states)
         return q, k, v
 
     def _pack_conv_states(
@@ -544,7 +596,21 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         v_state: jax.Array,
     ) -> jax.Array:
         """Concat per-stream ``[B, D, K-1]`` caches → packed ``[B, proj_size, K-1]``."""
-        return jnp.concatenate([q_state, k_state, v_state], axis=1)
+        if conv_state_shards(self.mesh, 3 * q_state.shape[1]) == 1:
+            return jnp.concatenate([q_state, k_state, v_state], axis=1)
+        spec = P("data", "tensor", None)
+        return jax.shard_map(
+            lambda q, k, v: jnp.concatenate([q, k, v], axis=1),
+            mesh=self.mesh,
+            in_specs=(spec, spec, spec),
+            out_specs=spec,
+            check_vma=False,
+        )(q_state, k_state, v_state)
 
 
-__all__ = ["KDAAttnBackend"]
+__all__ = [
+    "KDAAttnBackend",
+    "conv_state_shards",
+    "conv_states_from_packed",
+    "conv_states_to_packed",
+]

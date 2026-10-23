@@ -9,7 +9,13 @@ from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.kda import naive_recurrent_kda
-from sgl_jax.srt.layers.attention.linear.kda_backend import KDAAttnBackend, l2_normalize
+from sgl_jax.srt.layers.attention.linear.kda_backend import (
+    KDAAttnBackend,
+    conv_state_shards,
+    conv_states_from_packed,
+    conv_states_to_packed,
+    l2_normalize,
+)
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.managers.schedule_batch import ModelWorkerBatch
 from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
@@ -233,6 +239,11 @@ def write_initial_state(
     recurrent_buffer = recurrent_buffer.at[recurrent_indices].set(
         ssm_state, out_sharding=pool.recurrent_sharding
     )
+    # The pool stores conv states in the backend's packed layout (see conv_state_shards).
+    shards = conv_state_shards(pool.conv_sharding.mesh, conv_state.shape[1])
+    conv_state = jax.device_put(
+        conv_states_to_packed(np.asarray(conv_state), shards), pool.conv_sharding
+    )
     conv_buffer = (
         conv_buffer_list[0].at[recurrent_indices].set(conv_state, out_sharding=pool.conv_sharding)
     )
@@ -244,7 +255,11 @@ def gather_ssm(pool: RecurrentStatePool, recurrent_buffer: jax.Array, indices: n
 
 
 def gather_conv(pool: RecurrentStatePool, conv_buffer: jax.Array, indices: np.ndarray):
-    return conv_buffer.at[indices].get(out_sharding=pool.conv_sharding)
+    """Conv states of ``indices`` in the plain [q | k | v] layout (host array)."""
+    packed = np.asarray(conv_buffer.at[indices].get(out_sharding=pool.conv_sharding))
+    return conv_states_from_packed(
+        packed, conv_state_shards(pool.conv_sharding.mesh, packed.shape[1])
+    )
 
 
 def create_test_data(
