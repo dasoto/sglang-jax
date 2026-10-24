@@ -118,6 +118,12 @@ from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
+# Pin the cached prefix of a request while it waits in the queue (hybrid recurrent
+# caches only): the matched node is locked from enqueue until admission or abort, so
+# its KDA snapshot is not LRU-evicted by other requests' prefills while it waits.
+_PIN_QUEUED_PREFIX = os.environ.get("SGLANG_JAX_PIN_QUEUED_PREFIX", "0").strip().lower() in (
+    "1", "true", "yes", "on")
+_PIN_QUEUED_MIN_TOKENS = int(os.environ.get("SGLANG_JAX_PIN_QUEUED_MIN_TOKENS", "4096"))
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
@@ -1669,8 +1675,39 @@ class Scheduler(
         logger.info("Cache flushed successfully!")
         return True, "", flushed_items
 
+    def _pin_queued_prefix(self, req: Req) -> None:
+        """Lock ``req``'s longest cached prefix on its DP rank until it is admitted.
+
+        Only prefixes of at least SGLANG_JAX_PIN_QUEUED_MIN_TOKENS tokens are pinned. The
+        lock is released by ``_release_queue_pin`` (admission or abort). Every host runs
+        this on the same state, so the tree stays identical across hosts.
+        """
+        tree = self.tree_cache
+        if tree is None or req.dp_rank is None or not tree.supports_recurrent():
+            return
+        ids = getattr(req, "radix_input_ids", None)
+        if not isinstance(ids, list) or not ids or not isinstance(ids[0], int):
+            ids = list(req.origin_input_ids)
+        if len(ids) - 1 < _PIN_QUEUED_MIN_TOKENS:
+            return
+        res = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(ids[: len(ids) - 1], req.extra_key, req.dp_rank))
+        )
+        node = res.last_device_node
+        if len(res.device_indices) < _PIN_QUEUED_MIN_TOKENS or node is None or node is tree.root_node:
+            return
+        req._queue_pin = (node, tree.inc_lock_ref(node).to_dec_params())
+
+    def _release_queue_pin(self, req: Req) -> None:
+        pin = getattr(req, "_queue_pin", None)
+        if pin is not None:
+            req._queue_pin = None
+            self.tree_cache.dec_lock_ref(pin[0], pin[1])
+
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
+        if _PIN_QUEUED_PREFIX:
+            self._pin_queued_prefix(req)
         self.waiting_queue.append(req)
         if req.bootstrap_room is not None:
             mark = getattr(self, "_pd_mark_time", None)
@@ -2304,6 +2341,10 @@ class Scheduler(
 
         can_run_set = set(all_can_run_reqs)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        if _PIN_QUEUED_PREFIX:
+            # Admitted requests now hold their own lock on the matched prefix.
+            for req in all_can_run_reqs:
+                self._release_queue_pin(req)
 
         # Update chunked requests for each DP rank
         for dp_rank in range(self.dp_size):
@@ -2812,6 +2853,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            self._release_queue_pin(req)
             abort_out = AbortReq(rid=req.rid)
             if self._comm_backend is not None:
                 self._comm_backend.send_pyobj(abort_out)

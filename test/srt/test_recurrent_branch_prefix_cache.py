@@ -323,5 +323,116 @@ class TestRecurrentBranchPrefixCache(unittest.TestCase):
         cache.assert_recurrent_slot_ledger(0, [])
 
 
+class _EnvOverride:
+    def __init__(self, **env):
+        self.env = env
+        self.old = {}
+
+    def __enter__(self):
+        for k, v in self.env.items():
+            self.old[k] = os.environ.get(k)
+            os.environ[k] = v
+
+    def __exit__(self, *exc):
+        for k, v in self.old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+class TestRecurrentSnapshotRetention(unittest.TestCase):
+    """Run F: decode-leaf-first eviction and queued-prefix pinning."""
+
+    def _turn(self, cache, req_pool, allocator, rid, prompt, decode):
+        return TestRecurrentBranchPrefixCache._run_turn_with_decode(
+            self, cache, req_pool, allocator, rid, prompt, decode
+        )
+
+    def _two_sessions(self, decode_first: str):
+        with _EnvOverride(SGLANG_JAX_RECURRENT_EVICT_DECODE_LEAF_FIRST=decode_first,
+                          SGLANG_JAX_RECURRENT_TAIL_CHECKPOINTS="1"):
+            cache, req_pool, allocator = _build_cache(page_size=128, interval=128)
+        prompt_a = list(range(1, 385))  # 384 tokens; prompt-end checkpoint at 384
+        self._turn(cache, req_pool, allocator, "a0", prompt_a, list(range(5000, 5128)))  # leaf 512
+        prompt_b = list(range(20001, 20385))
+        self._turn(cache, req_pool, allocator, "b0", prompt_b, list(range(6000, 6128)))
+        return cache, req_pool, allocator, prompt_a
+
+    def test_lru_evicts_prompt_end_checkpoint_first_by_default(self):
+        cache, _, _, prompt_a = self._two_sessions("0")
+        # Session A's prompt-end checkpoint is its oldest snapshot: plain LRU drops it.
+        cache.evict(EvictParams(recurrent_num=1, dp_rank=0))
+        r1 = _new_req("a1", prompt_a + list(range(7000, 7200)), cache)
+        self.assertEqual(len(r1.prefix_indices), 0)
+        cache.dec_lock_ref(r1.last_node, r1.cache_lock_params)
+
+    def test_decode_leaf_evicted_before_prompt_end_checkpoint(self):
+        cache, _, _, prompt_a = self._two_sessions("1")
+        # Both decode leaves (past the prompt ends) go before any prompt-end checkpoint.
+        res = cache.evict(EvictParams(recurrent_num=2, dp_rank=0))
+        self.assertEqual(res.recurrent_num_evicted, 2)
+        r1 = _new_req("a1", prompt_a + list(range(7000, 7200)), cache)
+        self.assertEqual(len(r1.prefix_indices), 384)
+        self.assertIsNotNone(r1.recurrent_cow_src_index)
+        cache.dec_lock_ref(r1.last_node, r1.cache_lock_params)
+        cache.assert_recurrent_slot_ledger(0, [])
+
+    def test_queued_pin_protects_prefix_until_released(self):
+        from types import SimpleNamespace
+
+        from sgl_jax.srt.managers import scheduler as sched
+
+        cache, req_pool, allocator, prompt_a = self._two_sessions("0")
+        old_min = sched._PIN_QUEUED_MIN_TOKENS
+        sched._PIN_QUEUED_MIN_TOKENS = 128
+        try:
+            fake = SimpleNamespace(tree_cache=cache)
+            queued = Req(
+                rid="a1",
+                origin_input_text="",
+                origin_input_ids=prompt_a + list(range(7000, 7200)),
+                sampling_params=SamplingParams(max_new_tokens=1),
+                dp_rank=0,
+                eos_token_ids={999999},
+                vocab_size=32000,
+            )
+            sched.Scheduler._pin_queued_prefix(fake, queued)
+            self.assertIsNotNone(getattr(queued, "_queue_pin", None))
+            # Evict everything evictable: the pinned prompt-end checkpoint survives.
+            cache.evict(EvictParams(recurrent_num=cache.recurrent_evictable_size(0), dp_rank=0))
+            r1 = _new_req("a1-admit", prompt_a + list(range(7000, 7200)), cache)
+            self.assertEqual(len(r1.prefix_indices), 384)
+            # Admission: the request holds its own lock, then the queue pin is released.
+            sched.Scheduler._release_queue_pin(fake, queued)
+            self.assertIsNone(queued._queue_pin)
+            cache.dec_lock_ref(r1.last_node, r1.cache_lock_params)
+            cache.assert_recurrent_slot_ledger(0, [])
+            self.assertGreater(cache.recurrent_evictable_size(0), 0)
+            # Releasing twice is a no-op.
+            sched.Scheduler._release_queue_pin(fake, queued)
+        finally:
+            sched._PIN_QUEUED_MIN_TOKENS = old_min
+
+    def test_short_prefix_is_not_pinned(self):
+        from types import SimpleNamespace
+
+        from sgl_jax.srt.managers import scheduler as sched
+
+        cache, _, _, prompt_a = self._two_sessions("0")
+        fake = SimpleNamespace(tree_cache=cache)
+        queued = Req(
+            rid="a1",
+            origin_input_text="",
+            origin_input_ids=prompt_a + list(range(7000, 7200)),
+            sampling_params=SamplingParams(max_new_tokens=1),
+            dp_rank=0,
+            eos_token_ids={999999},
+            vocab_size=32000,
+        )
+        sched.Scheduler._pin_queued_prefix(fake, queued)  # default minimum is 4096 tokens
+        self.assertIsNone(getattr(queued, "_queue_pin", None))
+
+
 if __name__ == "__main__":
     unittest.main()

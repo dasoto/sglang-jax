@@ -40,6 +40,9 @@ class InsertParams:
     # Length-1 int32 array (a RecurrentStatePool slot index); ownership passes
     # to the tree at commit.
     recurrent_value: Any = None
+    # The donated snapshot is a finished request's final boundary past its prompt
+    # end (a decode leaf); see RecurrentComponent.evict_decode_leaf_first.
+    recurrent_decode_leaf: bool = False
 
 
 @dataclasses.dataclass

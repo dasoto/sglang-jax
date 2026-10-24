@@ -77,6 +77,14 @@ class RecurrentComponent(TreeComponent):
         )
         interval = getattr(cache, "recurrent_track_interval", None) or 0
         self.prompt_tail_window = max(0, self.prompt_tail_checkpoints - 1) * interval
+        # Evict decode-leaf snapshots (a finished request's final boundary past its
+        # prompt end) before any other snapshot. Agent clients resend the prompt, not
+        # the generated tokens, so the next turn reuses the prompt-end checkpoint and
+        # the decode leaf is almost never hit; plain LRU evicts the older prompt-end
+        # checkpoint of the same turn first.
+        self.evict_decode_leaf_first = os.environ.get(
+            "SGLANG_JAX_RECURRENT_EVICT_DECODE_LEAF_FIRST", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
 
     # ---- matching -----------------------------------------------------------
 
@@ -184,6 +192,7 @@ class RecurrentComponent(TreeComponent):
             return
         if node.children:
             node._recurrent_branch_retained = True
+        node._recurrent_decode_leaf = bool(getattr(params, "recurrent_decode_leaf", False))
         cd.value = params.recurrent_value
         self.cache.component_evictable_size_[ct][_node_dp_rank(node)] += 1
         self.cache._update_evictable_leaf_sets(node)
@@ -224,6 +233,8 @@ class RecurrentComponent(TreeComponent):
             insert_params.recurrent_value = self.req_to_token_pool.recurrent_value_from_slot(
                 keep_slot
             )
+            origin = getattr(req, "origin_input_ids", None)
+            insert_params.recurrent_decode_leaf = origin is not None and cache_len > len(origin)
             return cache_len
 
         # Unfinished: secure a fresh REPLACEMENT track slot FIRST, then donate the
@@ -308,6 +319,7 @@ class RecurrentComponent(TreeComponent):
             self.cache.component_evictable_size_[ct][_node_dp_rank(node)] -= 1
             cd.value = None
             node._recurrent_branch_retained = False
+            node._recurrent_decode_leaf = False
             freed = 1
         return freed, 0
 
@@ -323,14 +335,21 @@ class RecurrentComponent(TreeComponent):
         candidates = self.cache.aux_evictable_device_nodes.get(
             ct, self.cache.evictable_device_leaves
         )
+        decode_first = self.evict_decode_leaf_first
+
+        def entry(node):
+            # (0, node) for decode leaves when enabled, else (1, node); ties use the
+            # node's LRU order.
+            return (0 if decode_first and getattr(node, "_recurrent_decode_leaf", False) else 1, node)
+
         heap = [
-            x
+            entry(x)
             for x in candidates
             if self.node_has_component_data(x, EvictLayer.DEVICE)
         ]
         heapq.heapify(heap)
         while tracker[ct] < request and heap:
-            x = heapq.heappop(heap)
+            _, x = heapq.heappop(heap)
             if not self.node_has_component_data(x, EvictLayer.DEVICE):
                 continue
             if x.component_data[ct].lock_ref > 0:
@@ -346,7 +365,7 @@ class RecurrentComponent(TreeComponent):
                     and parent in self.cache.evictable_device_leaves
                     and self.node_has_component_data(parent, EvictLayer.DEVICE)
                 ):
-                    heapq.heappush(heap, parent)
+                    heapq.heappush(heap, entry(parent))
             else:
                 freed, _ = self.evict_component(x, EvictLayer.DEVICE)
                 tracker[ct] += freed
