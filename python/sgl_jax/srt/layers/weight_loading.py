@@ -16,7 +16,7 @@ def _put(value, mesh, axes):
     )
 
 
-def _absorb_mla(inputs, *, mesh, rank, heads, key_dim, value_dim, dtype, block):
+def _absorb_mla(inputs, *, mesh, rank, heads, key_dim, value_dim, dtype, block, replicated=False):
     weight = _put(inputs[0], mesh, ())
     if len(inputs) == 2:
         scale = _put(inputs[1], mesh, ()).astype(jnp.float32)
@@ -31,7 +31,8 @@ def _absorb_mla(inputs, *, mesh, rank, heads, key_dim, value_dim, dtype, block):
     else:
         weight = weight.astype(dtype)
     weight = weight.T.reshape(rank, heads, key_dim + value_dim)
-    sharding = NamedSharding(mesh, P(None, "tensor", None))
+    # Replicated for the DCP replicated-absorb path (DeepseekV3Attention.replicated_absorb).
+    sharding = NamedSharding(mesh, P(None, None, None) if replicated else P(None, "tensor", None))
     return tuple(
         jax.sharding.reshard(part, sharding)
         for part in (weight[:, :, :key_dim], weight[:, :, key_dim:])
@@ -68,6 +69,7 @@ def prepare_absorbed_mla(module, loader, mappings, prefix):
             key_dim=module.qk_nope_head_dim,
             value_dim=module.v_head_dim,
             dtype=module.w_uk.value.dtype,
+            replicated=getattr(module, "replicated_absorb", False),
             block=getattr(
                 getattr(loader.model_config, "quantization_config", None),
                 "weight_block_size",

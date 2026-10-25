@@ -14,6 +14,7 @@ os.environ.setdefault("XLA_FLAGS", "--xla_force_host_platform_device_count=2")
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -96,6 +97,7 @@ class TestMLADCPCPU(unittest.TestCase):
         k_c,
         q_pe,
         k_pe,
+        absorb_weights=None,
     ):
         worker_batch = SimpleNamespace(
             dp_size=1,
@@ -120,6 +122,10 @@ class TestMLADCPCPU(unittest.TestCase):
         q_pe_dev = jax.device_put(q_pe, NamedSharding(self.mesh, P("data", "tensor", None)))
         k_c_dev = jax.device_put(k_c, NamedSharding(self.mesh, P("data", None)))
         k_pe_dev = jax.device_put(k_pe, NamedSharding(self.mesh, P("data", None)))
+        extra = {}
+        if absorb_weights is not None:
+            rep = NamedSharding(self.mesh, P(None, None, None))
+            extra["absorb_weights"] = tuple(jax.device_put(w, rep) for w in absorb_weights)
 
         with jax.set_mesh(self.mesh):
             o_latent, updated_cache = backend(
@@ -131,9 +137,75 @@ class TestMLADCPCPU(unittest.TestCase):
                 pool,
                 q_rope=q_pe_dev,
                 k_rope=k_pe_dev,
+                **extra,
             )
         pool.replace_buffer([updated_cache])
         return np.asarray(jax.device_get(o_latent))
+
+    def test_replicated_absorb_matches_latent_path(self):
+        """absorb_weights: W_UK / W_UV folded in around the DCP collectives, both combines."""
+        for rs_combine in ("0", "1"):
+            with mock.patch.dict(os.environ, {"SGLANG_JAX_MLA_DCP_RS_COMBINE": rs_combine}):
+                self._check_replicated_absorb(rs_combine)
+
+    def _check_replicated_absorb(self, rs_combine):
+        rng = np.random.default_rng(7)
+        page_size, num_heads, kv_lora_rank, d_k, d_v, rope = 16, 4, 128, 64, 64, 64
+        pool_a, alloc_a, backend_a, layer_a = self._make_setup(dcp_size=2, page_size=page_size)
+        pool_b, alloc_b, backend_b, layer_b = self._make_setup(dcp_size=2, page_size=page_size)
+        w_uk = rng.standard_normal((kv_lora_rank, num_heads, d_k), dtype=np.float32) * 0.1
+        w_uv = rng.standard_normal((kv_lora_rank, num_heads, d_v), dtype=np.float32) * 0.1
+
+        def both(mode, seq_lens, ext_lens, cache_loc, out_loc, n):
+            q_nope = rng.standard_normal((n, num_heads, d_k), dtype=np.float32) * 0.5
+            q_pe = rng.standard_normal((n, num_heads, rope), dtype=np.float32) * 0.2
+            k_c = rng.standard_normal((n, kv_lora_rank), dtype=np.float32) * 0.2
+            k_pe = rng.standard_normal((n, rope), dtype=np.float32) * 0.2
+            ql = np.einsum("thd,rhd->thr", q_nope, w_uk)
+            o_lat = self._run_step(
+                pool_a, backend_a, layer_a, mode, seq_lens, ext_lens, cache_loc, out_loc,
+                ql, k_c, q_pe, k_pe,
+            )
+            ref = np.einsum("thr,rhd->thd", o_lat, w_uv)
+            out = self._run_step(
+                pool_b, backend_b, layer_b, mode, seq_lens, ext_lens, cache_loc, out_loc,
+                q_nope, k_c, q_pe, k_pe, absorb_weights=(w_uk, w_uv),
+            )
+            self.assertEqual(out.shape, ref.shape)
+            np.testing.assert_allclose(
+                out, ref, rtol=1e-4, atol=1e-4, err_msg=f"{mode} rs_combine={rs_combine}"
+            )
+
+        seq_lens = [35, 16, 20]
+        out_loc = alloc_a.alloc_extend([0, 0, 0], seq_lens, [-1, -1, -1], sum(seq_lens))
+        self.assertTrue(
+            np.array_equal(
+                out_loc, alloc_b.alloc_extend([0, 0, 0], seq_lens, [-1, -1, -1], sum(seq_lens))
+            )
+        )
+        req_tokens, cursor = [], 0
+        for s_len in seq_lens:
+            req_tokens.append(list(out_loc[cursor : cursor + s_len]))
+            cursor += s_len
+
+        def cache_loc_of(toks_list, lens):
+            chunks = []
+            for toks, sl in zip(toks_list, lens):
+                aligned = ((sl + page_size - 1) // page_size) * page_size
+                chunks.extend(toks + [0] * (aligned - len(toks)))
+            return np.array(chunks, dtype=np.int32)
+
+        both(ForwardMode.EXTEND, seq_lens, seq_lens, cache_loc_of(req_tokens, seq_lens), out_loc,
+             sum(seq_lens))
+        for _ in range(2):
+            last = [toks[-1] for toks in req_tokens]
+            seq_lens = [s + 1 for s in seq_lens]
+            dec = alloc_a.alloc_decode(seq_lens, last)
+            self.assertTrue(np.array_equal(dec, alloc_b.alloc_decode(seq_lens, last)))
+            for i in range(len(seq_lens)):
+                req_tokens[i].append(int(dec[i]))
+            both(ForwardMode.DECODE, seq_lens, None, cache_loc_of(req_tokens, seq_lens), dec,
+                 len(seq_lens))
 
     def test_extend_and_decode_parity(self):
         rng = np.random.default_rng(20261021)

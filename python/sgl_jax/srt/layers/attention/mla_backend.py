@@ -387,6 +387,11 @@ class MLAAttentionBackend(AttentionBackend):
         del v
         q_rope = kwargs.get("q_rope")
         k_rope = kwargs.get("k_rope")
+        # Optional (w_uk, w_uv), replicated [R, n_h, D]: with DCP, q is then the un-absorbed
+        # [T, n_h, D_k] query and the result the [T, n_h, D_v] output (see _run_dcp).
+        absorb_weights = kwargs.get("absorb_weights")
+        if absorb_weights is not None and self.dcp_size <= 1:
+            raise ValueError("absorb_weights is only supported with dcp_size > 1")
         if q_rope is None or k_rope is None:
             raise ValueError(
                 "MLAAttentionBackend requires q_rope/k_rope kwargs (q_pe/k_pe) "
@@ -523,6 +528,8 @@ class MLAAttentionBackend(AttentionBackend):
             page_seq_positions_,
             global_seq_lens_,
             out_cache_loc_,
+            w_uk_=None,
+            w_uv_=None,
         ):
             dcp_rank = jax.lax.axis_index("tensor")
             lkv_dim = align_to(new_kv_c_.shape[-1], 128)
@@ -556,7 +563,15 @@ class MLAAttentionBackend(AttentionBackend):
             cache_updated = cache_.at[tuple(idx)].set(new_kv_fused, mode="drop")
 
             # Gather all query heads so every DCP rank computes attention for all heads on its local KV pages.
-            ql_nope_all = jax.lax.all_gather(ql_nope_, axis_name="tensor", axis=1, tiled=True)
+            if absorb_weights is not None:
+                # Replicated absorb: gather the [T, n_h, D_k] queries (a quarter of the latent
+                # ones for D_k = 128, R = 512) and fold W_UK in for every head locally.
+                q_nope_all = jax.lax.all_gather(ql_nope_, axis_name="tensor", axis=1, tiled=True)
+                ql_nope_all = jnp.einsum(
+                    "thd,rhd->thr", q_nope_all, w_uk_, preferred_element_type=jnp.float32
+                ).astype(ql_nope_.dtype)
+            else:
+                ql_nope_all = jax.lax.all_gather(ql_nope_, axis_name="tensor", axis=1, tiled=True)
             q_pe_all = jax.lax.all_gather(q_pe_, axis_name="tensor", axis=1, tiled=True)
 
             o_partial, cache_updated, lse_partial = mla_ragged_paged_attention(
@@ -581,6 +596,16 @@ class MLAAttentionBackend(AttentionBackend):
                 decode_batch_size=self.decode_batch_size,
                 vmem_limit_bytes=self.vmem_limit_bytes,
             )
+            if absorb_weights is not None:
+                # Fold W_UV into every head's partial output before the combine (the combine
+                # is linear in it), so the cross-rank reduction moves [T, n_h, D_v] instead of
+                # [T, n_h, R]: a quarter of the bytes for D_v = 128, R = 512.
+                o_partial = jnp.einsum(
+                    "thr,rhd->thd",
+                    o_partial[..., : w_uv_.shape[0]],
+                    w_uv_,
+                    preferred_element_type=jnp.float32,
+                )
 
             if _dcp_rs_combine_enabled():
                 # Same LSE-weighted combine as below, with a reduce-scatter over "tensor"
@@ -638,6 +663,13 @@ class MLAAttentionBackend(AttentionBackend):
             )
             return o_combined, cache_updated
 
+        absorb_args = ()
+        if absorb_weights is not None:
+            # Replicated (rank, n_h, dim) W_UK / W_UV: q is the [T, n_h, D_k] query and the
+            # result is the [T, n_h, D_v] attention output (see _run_dcp).
+            in_specs_dcp = in_specs_dcp + (P(None, None, None), P(None, None, None))
+            absorb_args = tuple(absorb_weights)
+
         o_latent, updated_cache = jax.shard_map(
             _run_dcp,
             in_specs=in_specs_dcp,
@@ -657,6 +689,7 @@ class MLAAttentionBackend(AttentionBackend):
             self.forward_metadata.page_seq_positions,
             self.forward_metadata.global_seq_lens,
             forward_batch.out_cache_loc,
+            *absorb_args,
         )
 
         return o_latent, updated_cache

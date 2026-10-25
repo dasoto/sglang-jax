@@ -9,6 +9,7 @@ reusing existing modules: RadixAttention, GateLogit, TopK, EPMoE/FusedEPMoE.
 """
 
 import logging
+import os
 import re
 
 import jax
@@ -225,11 +226,18 @@ class DeepseekV3Attention(nnx.Module):
         )
 
         self.use_absorbed = use_absorbed
+        # SGLANG_JAX_MLA_DCP_REPLICATED_ABSORB=1 (absorbed MLA with --dcp-size > 1): keep W_UK and
+        # W_UV replicated so the DCP backend gathers the [T, n_h, D_k] queries and reduces the
+        # [T, n_h, D_v] outputs instead of their [T, n_h, kv_lora_rank] latent forms (see
+        # MLAAttentionBackend: absorb_weights). Costs 2 * R * n_h * D bytes per layer and chip.
+        self.replicated_absorb = use_absorbed and os.environ.get(
+            "SGLANG_JAX_MLA_DCP_REPLICATED_ABSORB", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
         # Absorbed-MLA fused projections, populated by the loading group: w_uk[R, n_h, D_k] folds W_UK into Q, w_uv[R, n_h, D_v]
         # folds W_UV into the output. Placeholders here so nnx tracks them in
         # the model state tree; sharded on the head dim like kv_b_proj.weight.
         if use_absorbed:
-            uk_axes = (None, "tensor", None)
+            uk_axes = (None, None, None) if self.replicated_absorb else (None, "tensor", None)
             self.w_uk = nnx.Param(
                 jnp.zeros(
                     (kv_lora_rank, num_heads, qk_nope_head_dim),
@@ -327,11 +335,31 @@ class DeepseekV3Attention(nnx.Module):
         forward_batch: ForwardBatch,
         token_to_kv_pool: KVCache,
     ) -> tuple[jax.Array, jax.Array]:
-        # ql_nope[t, h, r] = sum_d q_nope[t, h, d] * w_uk[r, h, d]
-        ql_nope = jnp.einsum("thd,rhd->thr", q_nope, self.w_uk.value)
-
         # Latent K/V are a single shared head — pack into [T, 1, *] for MQA.
         c_kv_3d = compressed[:, None, :]
+
+        if self.replicated_absorb and getattr(forward_batch.attn_backend, "dcp_size", 1) > 1:
+            # The DCP backend folds the replicated W_UK / W_UV in around its collectives.
+            o_v, kv_fused = self.attn_mqa(
+                q_nope,
+                c_kv_3d,
+                c_kv_3d,
+                forward_batch=forward_batch,
+                token_to_kv_pool=token_to_kv_pool,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                absorb_weights=(self.w_uk.value, self.w_uv.value),
+            )
+            return o_v.reshape(-1, self.num_heads * self.v_head_dim), kv_fused
+
+        w_uk, w_uv = self.w_uk.value, self.w_uv.value
+        if self.replicated_absorb:
+            # Without DCP the replicated weights are used per head shard: take the local slice.
+            w_uk = jax.sharding.reshard(w_uk, P(None, "tensor", None))
+            w_uv = jax.sharding.reshard(w_uv, P(None, "tensor", None))
+
+        # ql_nope[t, h, r] = sum_d q_nope[t, h, d] * w_uk[r, h, d]
+        ql_nope = jnp.einsum("thd,rhd->thr", q_nope, w_uk)
 
         o_latent, kv_fused = self.attn_mqa(
             ql_nope,
@@ -344,7 +372,7 @@ class DeepseekV3Attention(nnx.Module):
         )
 
         # o_v[t, h, d] = sum_r o_latent[t, h, r] * w_uv[r, h, d]
-        o_v = jnp.einsum("thr,rhd->thd", o_latent, self.w_uv.value)
+        o_v = jnp.einsum("thr,rhd->thd", o_latent, w_uv)
         attn_output = o_v.reshape(-1, self.num_heads * self.v_head_dim)
         return attn_output, kv_fused
 
