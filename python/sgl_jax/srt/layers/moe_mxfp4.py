@@ -43,6 +43,18 @@ from sgl_jax.srt.utils.profiling_utils import named_scope
 MXFP4_GMM_KERNEL_ENV = "SGLANG_JAX_MXFP4_GMM_KERNEL"
 # Reduce-scatter MoE combine into the model mesh's P("data", "tensor") layout (see MXFP4EPMoE).
 MOE_RS_COMBINE_ENV = "SGLANG_JAX_MOE_RS_COMBINE"
+# Compact prefill MoE (see MXFP4EPMoE._compact_forward): comma-separated divisors d of the
+# step's padded token count T; each T // d >= SGLANG_JAX_MOE_COMPACT_MIN_TOKENS becomes a
+# static compact size. "" or "0" disables it.
+MOE_COMPACT_ENV = "SGLANG_JAX_MOE_COMPACT"
+MOE_COMPACT_MIN_TOKENS_ENV = "SGLANG_JAX_MOE_COMPACT_MIN_TOKENS"
+
+
+def _parse_compact_divisors(value: str) -> tuple[int, ...]:
+    value = value.strip().lower()
+    if value in ("", "0", "off", "false", "no"):
+        return ()
+    return tuple(sorted({int(x) for x in value.split(",") if x.strip() and int(x) > 1}))
 
 
 def mxfp4_gmm_kernel_enabled() -> bool:
@@ -106,6 +118,12 @@ class MXFP4EPMoE(EPMoE):
         # Token all-gather: one collective over both model-mesh axes for small inputs; for
         # large ones "data" then "tensor", which measured faster on v5e-256 at 29 MB.
         self.mesh_gather_two_step_bytes = 8 << 20
+        # Compact prefill (mesh mode only): with few busy DP groups most of a prefill step's
+        # tokens are padding, yet the token gather, the scatter-add and the combine all move
+        # the padded [T, H]. A switch on the real-token count runs the experts on the smallest
+        # static compact size that holds them (see _compact_forward).
+        self.compact_divisors = _parse_compact_divisors(os.environ.get(MOE_COMPACT_ENV, ""))
+        self.compact_min_tokens = int(os.environ.get(MOE_COMPACT_MIN_TOKENS_ENV, "512"))
         if self.replicate_experts:
             raise NotImplementedError("MXFP4EPMoE does not support moe_dp_size > 1")
         if self.quantized_dtype is not None or self.activation_quantized_dtype is not None:
@@ -211,6 +229,51 @@ class MXFP4EPMoE(EPMoE):
             and rows >= self.local_window_min_rows
         )
         rs_blocks = self._rs_combine_blocks(hidden_states)
+        compact_sizes = self._compact_sizes(hidden_states, topk_ids, rs_blocks) if use_mask else ()
+        if compact_sizes:
+            # Smallest static compact size >= the step's real-token count, else the full path.
+            n_real = jnp.sum(token_mask.astype(jnp.int32))
+            index = jnp.sum((n_real > jnp.asarray(compact_sizes, jnp.int32)).astype(jnp.int32))
+            branches = [
+                partial(self._compact_forward, rs_blocks=rs_blocks, c=c) for c in compact_sizes
+            ]
+            branches.append(
+                partial(
+                    self._call_full,
+                    out_sharding=out_sharding,
+                    out_specs=out_specs,
+                    scatter_on_tensor=scatter_on_tensor,
+                    use_mask=True,
+                    rs_blocks=rs_blocks,
+                )
+            )
+            return jax.lax.switch(index, branches, hidden_states, topk_weights, topk_ids, token_mask)
+        return self._call_full(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            token_mask,
+            out_sharding=out_sharding,
+            out_specs=out_specs,
+            scatter_on_tensor=scatter_on_tensor,
+            use_mask=use_mask,
+            rs_blocks=rs_blocks,
+        )
+
+    def _call_full(
+        self,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        token_mask,
+        *,
+        out_sharding,
+        out_specs,
+        scatter_on_tensor: bool,
+        use_mask: bool,
+        rs_blocks: tuple[int, int] | None,
+    ) -> jax.Array:
+        """Every (padded) token goes through the token gather, the experts and the combine."""
         if rs_blocks is not None:
             # Mesh mode emits each chip's unreduced [dp*tp, T/dp, H/tp] blocks (reduced after).
             out_specs = P(("expert", "tensor"), None, None, *([None] if self.rs_combine_mesh else []))
@@ -438,6 +501,134 @@ class MXFP4EPMoE(EPMoE):
             out_specs=(rep, rep, rep),
             check_vma=False,
         )(hidden_states, topk_weights, topk_ids)
+
+    def _compact_sizes(self, hidden_states, topk_ids, rs_blocks) -> tuple[int, ...]:
+        """Static compact token counts (ascending, each < T) for this call; () = full path only.
+
+        Needs mesh mode with a P("data", "tensor") [T, H] input, H divisible by dp * tp (the
+        combine's column blocks) and [T, k] router outputs.
+        """
+        if not self.compact_divisors or rs_blocks is None or not self.rs_combine_mesh:
+            return ()
+        if hidden_states.ndim != 2 or topk_ids.ndim != 2:
+            return ()
+        if _spec_axes(jax.typeof(hidden_states).sharding.spec, 2) != (("data",), ("tensor",)):
+            return ()
+        dp, tp = rs_blocks
+        t, h = hidden_states.shape
+        if h % (dp * tp) or topk_ids.shape[0] != t:
+            return ()
+        sizes = {
+            t // d
+            for d in self.compact_divisors
+            if t % d == 0 and t // d >= max(self.compact_min_tokens, 1)
+        }
+        return tuple(sorted(sizes))
+
+    @named_scope
+    def _compact_forward(
+        self, hidden_states, topk_weights, topk_ids, token_mask, *, rs_blocks, c: int
+    ) -> jax.Array:
+        """Prefill MoE over only the real tokens, packed into ``c`` static rows.
+
+        The caller guarantees at most ``c`` real tokens (``token_mask``). Same math as the
+        full path; the token gather, the experts' scatter-add and the combine move [c, H]
+        instead of the padded [T, H]:
+
+        1. Model mesh: each DP group writes its real tokens' [., H/tp] rows (and router
+           outputs) at their global compact positions of a zero [c, .] buffer; a psum over
+           "data" assembles the compact tokens' tensor slices and an all-gather over
+           "tensor" the full [c, H] rows. Compact slots past the real tokens route to the
+           sentinel expert, so they are neither computed nor counted.
+        2. MoE mesh: the local-window experts on the c rows. Each chip emits its unreduced
+           output as dp * tp column blocks of width H / (dp * tp); block (d, t) holds
+           sub-slice d of tensor slice t.
+        3. Model mesh: one reduce-scatter hands block (d, t) to chip (d, t), an all-gather
+           over "data" rebuilds tensor slice t for all c rows, and each chip gathers its DP
+           group's tokens back into the P("data", "tensor") [T, H] layout (padding rows 0).
+        """
+        dp, tp = rs_blocks
+        t, h = hidden_states.shape
+        k = topk_ids.shape[1]
+        hl, bw = h // tp, h // (tp * dp)
+        sentinel = self.num_experts
+
+        def to_model(x, spec):
+            return jax.sharding.reshard(x, NamedSharding(self.mesh, spec))
+
+        def gather_compact(x, wts, ids, m):  # [T/dp, H/tp], [T/dp, k] x2, [T/dp] (local)
+            m = m.astype(jnp.int32)
+            counts = jax.lax.all_gather(jnp.sum(m), "data")  # real tokens per DP group
+            group = jax.lax.axis_index("data")
+            offset = jnp.sum(jnp.where(jnp.arange(dp) < group, counts, 0))
+            pos = jnp.where(m > 0, offset + jnp.cumsum(m) - 1, -1)  # global compact row
+            dst = jnp.where(pos >= 0, pos, c)  # padding -> out of bounds, dropped
+
+            def place(v):
+                buf = jnp.zeros((c,) + v.shape[1:], v.dtype).at[dst].set(v, mode="drop")
+                return jax.lax.psum(buf, "data")  # rows are disjoint across groups: exact
+
+            xc = jax.lax.all_gather(place(x), "tensor", axis=1, tiled=True)  # [c, H]
+            idc = jnp.where((jnp.arange(c) < jnp.sum(counts))[:, None], place(ids), sentinel)
+            return xc, place(wts), idc, pos
+
+        rep = P(None, None)
+        xc, wc, idc, pos = shard_map(
+            gather_compact,
+            mesh=self.mesh,
+            in_specs=(P("data", "tensor"), P("data", None), P("data", None), P("data")),
+            out_specs=(rep, rep, rep, P("data")),
+            check_vma=False,
+        )(
+            hidden_states,
+            to_model(topk_weights, P("data", None)),
+            to_model(topk_ids, P("data", None)),
+            to_model(token_mask, P("data")),
+        )
+
+        def experts(x, wts, ids, w_gate, w_up, w_down, s_gate, s_up, s_down):
+            out = self._forward_local_window(
+                x, wts, ids, w_gate, w_up, w_down, s_gate, s_up, s_down
+            )  # [c, H] partial
+            # Column (t, d, j) -> block d * tp + t, the model-mesh chip (d, t).
+            out = out.reshape(c, tp, dp, bw).transpose(2, 1, 0, 3)
+            return out.reshape(1, dp * tp, c, bw)
+
+        with jax.sharding.use_abstract_mesh(self.updated_mesh):
+            blocks = shard_map(
+                experts,
+                mesh=self.moe_mesh,
+                in_specs=(P(None), P(None), P(None), _WI_SPEC, _WI_SPEC, _WO_SPEC, _WI_SPEC, _WI_SPEC, _WO_SPEC),
+                out_specs=P(("expert", "tensor"), None, None, None),
+                check_vma=False,
+            )(
+                jax.sharding.reshard(xc, P(None)),
+                jax.sharding.reshard(wc, P(None)),
+                jax.sharding.reshard(idc, P(None)),
+                self.w1_weight_packed.value,
+                self.w3_weight_packed.value,
+                self.w2_weight_packed.value,
+                self.w1_weight_scale.value,
+                self.w3_weight_scale.value,
+                self.w2_weight_scale.value,
+            )
+        # Same devices in the same order on both meshes: this reshard moves no data.
+        blocks = to_model(blocks, P(("data", "tensor"), None, None, None))
+
+        def combine(x, p):  # [1, dp*tp, c, bw] partial, [T/dp] compact rows (-1 = padding)
+            y = jax.lax.psum_scatter(x, ("data", "tensor"), scatter_dimension=1, tiled=True)
+            y = jax.lax.all_gather(y.reshape(c, bw), "data", axis=0)  # [dp, c, bw]
+            y = y.transpose(1, 0, 2).reshape(c, hl)  # this chip's tensor slice, all c rows
+            rows = y[jnp.clip(p, 0, c - 1)]
+            return jnp.where((p >= 0)[:, None], rows, jnp.zeros_like(rows))
+
+        return shard_map(
+            combine,
+            mesh=self.mesh,
+            in_specs=(P(("data", "tensor"), None, None, None), P("data")),
+            out_specs=P("data", "tensor"),
+            check_vma=False,
+        )(blocks, pos)
 
     def _forward(
         self,
