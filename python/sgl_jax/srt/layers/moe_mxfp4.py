@@ -102,6 +102,15 @@ class MXFP4EPMoE(EPMoE):
             os.environ.get("SGLANG_JAX_MOE_LOCAL_WINDOW_CF", "4.0")
         )
         self.local_window_capacity = None  # fixed window rows (tests); None = derive from load
+        # Per-chip accumulator of the local-window path. f32 by default; with
+        # SGLANG_JAX_MOE_BF16_ACC=1 it is the activation dtype: a token rarely gets more than
+        # one contribution from one chip's experts, the output is cast to bf16 before the
+        # cross-chip combine anyway, and the f32 [T, H] buffer's zero fill, scatter-add and
+        # cast cost ~45 ms per 4096-token prefill step on v5e-256.
+        bf16_acc = os.environ.get("SGLANG_JAX_MOE_BF16_ACC", "0").strip().lower()
+        self.local_acc_dtype = (
+            self.dtype if bf16_acc in ("1", "true", "yes", "on") else jnp.float32
+        )
         self.supports_token_mask = True
         # Reduce-scatter combine (SGLANG_JAX_MOE_RS_COMBINE=1): instead of all-reducing the full
         # [T, H] output over "tensor" and then "expert" and replicating it everywhere, one
@@ -772,10 +781,10 @@ class MXFP4EPMoE(EPMoE):
                 interpret=not is_tpu_runtime(),
             )
             contrib = jnp.where(valid[:, None], y.astype(jnp.float32) * flat_w[pos][:, None], 0.0)
-            return acc.at[tok].add(contrib)
+            return acc.at[tok].add(contrib.astype(acc.dtype))
 
         n_windows = (local_rows + cap - 1) // cap
-        acc = jnp.zeros((num_tokens, w_down.shape[-1]), jnp.float32)
+        acc = jnp.zeros((num_tokens, w_down.shape[-1]), self.local_acc_dtype)
         acc = jax.lax.fori_loop(0, n_windows, window, acc)
         return acc.astype(self.dtype)
 

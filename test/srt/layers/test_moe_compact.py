@@ -153,6 +153,30 @@ def test_compact_matches_full(per_group):
 
 
 @pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (CPU) devices")
+@pytest.mark.parametrize("compact", [False, True])
+def test_bf16_accumulator_matches_f32(compact):
+    """SGLANG_JAX_MOE_BF16_ACC: the local-window accumulator in bf16 instead of f32."""
+    T = 64
+    mesh = _mesh()
+    mask_np = _prefix_mask(T, (20, 9))
+    with jax.set_mesh(mesh):
+        f32_layer, bf16_layer = _layers(mesh, seed=37)
+        for layer in (f32_layer, bf16_layer):
+            layer.compact_divisors = (2,) if compact else ()
+        bf16_layer.local_acc_dtype = jnp.bfloat16
+        assert f32_layer.local_acc_dtype == jnp.float32
+        hs, tw, ti, mask = _inputs(mesh, T, mask_np, seed=41)
+        out_f32 = jax.jit(lambda a, b, c, m: f32_layer(a, b, c, token_mask=m))(hs, tw, ti, mask)
+        out_bf16 = jax.jit(lambda a, b, c, m: bf16_layer(a, b, c, token_mask=m))(hs, tw, ti, mask)
+        out_f32 = np.asarray(out_f32.astype(jnp.float32))
+        out_bf16 = np.asarray(out_bf16.astype(jnp.float32))
+    assert np.all(out_bf16[~mask_np] == 0)
+    scale = np.abs(out_f32).max()
+    np.testing.assert_allclose(out_bf16, out_f32, rtol=0, atol=1e-2 * scale)
+    assert np.abs(out_bf16 - out_f32).mean() < 3e-3 * np.abs(out_f32[mask_np]).mean()
+
+
+@pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (CPU) devices")
 @pytest.mark.parametrize("c", [16, 32])
 def test_compact_forward_scattered_mask(c):
     """Real tokens anywhere in a group's slots (not only a prefix), direct compact call."""
