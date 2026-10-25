@@ -775,7 +775,7 @@ class MXFP4EPMoE(EPMoE):
         scatter-adds the weighted outputs per token. The math is unchanged; only the
         f32 summation order differs.
         """
-        from sgl_jax.srt.kernels.mxfp4_gmm import mxfp4_moe_mlp
+        from sgl_jax.srt.kernels.mxfp4_gmm import mxfp4_moe_mlp, pick_row_tile
 
         num_tokens, top_k = topk_ids.shape
         rows = num_tokens * top_k
@@ -803,6 +803,17 @@ class MXFP4EPMoE(EPMoE):
         flat_w = jnp.ravel(topk_weights).astype(jnp.float32)
         cap = self._window_capacity(rows)
         no_groups = jnp.zeros((self.num_experts,), jnp.int32)
+        # Row tile of the local-window GMMs (SGLANG_JAX_MOE_LOCAL_WINDOW_TM): "auto" picks it from
+        # the window's rows per *local* expert, an integer fixes it; unset keeps the kernel's
+        # default, which divides by the global group count (896 for Kimi-K3) and always picks 16
+        # here, so a shard with hundreds of local rows runs them as 16-row matmuls.
+        tm_env = os.environ.get("SGLANG_JAX_MOE_LOCAL_WINDOW_TM", "").strip().lower()
+        tm, cache = None, None
+        if tm_env == "auto":
+            # A loaded expert spans several row tiles: keep its decoded weights in VMEM.
+            tm, cache = pick_row_tile(cap, e_l, hi=256), True
+        elif tm_env.isdigit():
+            tm, cache = int(tm_env), True
 
         def window(w, acc):
             base = w * cap
@@ -831,6 +842,8 @@ class MXFP4EPMoE(EPMoE):
                 situ_linear_beta=self.situ_linear_beta,
                 act_input_dtype=self.dtype,
                 out_dtype=self.dtype,
+                tm=tm,
+                cache=cache,
                 zero_unvisited=False,  # rows past the local groups are masked below
                 interpret=not is_tpu_runtime(),
             )

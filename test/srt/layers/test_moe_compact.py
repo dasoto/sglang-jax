@@ -177,6 +177,34 @@ def test_bf16_accumulator_matches_f32(compact):
 
 
 @pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (CPU) devices")
+@pytest.mark.parametrize("tm", ["auto", "32", "128"])
+def test_local_window_row_tile(tm):
+    """SGLANG_JAX_MOE_LOCAL_WINDOW_TM: other row tiles (with the VMEM weight cache) give the same
+    output as the default 16-row tiles, including a hot expert spanning several tiles."""
+    from unittest import mock
+
+    T = 64
+    mesh = _mesh()
+    mask_np = np.ones((T,), bool)
+    with jax.set_mesh(mesh):
+        layer, _ = _layers(mesh, seed=43)
+        layer.local_window_capacity = 128
+        hs, tw, ti, mask = _inputs(mesh, T, mask_np, seed=47)
+        ids = np.array(ti)
+        ids[:, 0] = 1  # every token picks expert 1: one expert with T rows on one shard
+        ids[:, 1:] = np.where(ids[:, 1:] == 1, 2, ids[:, 1:])
+        ti = jax.device_put(jnp.asarray(ids), ti.sharding)
+        f = jax.jit(lambda a, b, c, m: layer(a, b, c, token_mask=m))
+        with mock.patch.dict(os.environ, {"SGLANG_JAX_MOE_LOCAL_WINDOW_TM": ""}):
+            ref = np.asarray(f(hs, tw, ti, mask).astype(jnp.float32))
+        g = jax.jit(lambda a, b, c, m: layer(a, b, c, token_mask=m))  # retrace under the new env
+        with mock.patch.dict(os.environ, {"SGLANG_JAX_MOE_LOCAL_WINDOW_TM": tm}):
+            out = np.asarray(g(hs, tw, ti, mask).astype(jnp.float32))
+    np.testing.assert_allclose(out, ref, rtol=0, atol=1e-2 * np.abs(ref).max())
+    assert np.abs(out - ref).mean() < 2e-3 * np.abs(ref).mean()
+
+
+@pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (CPU) devices")
 @pytest.mark.parametrize("c", [16, 32])
 def test_compact_forward_scattered_mask(c):
     """Real tokens anywhere in a group's slots (not only a prefix), direct compact call."""

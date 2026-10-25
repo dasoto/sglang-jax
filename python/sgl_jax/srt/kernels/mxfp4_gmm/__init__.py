@@ -70,6 +70,7 @@ def mxfp4_moe_mlp(
     nl: int | None = None,
     zero_mode: str = "mul",
     zero_unvisited: bool = True,
+    cache: bool | None = None,
     interpret: bool = False,
 ) -> jax.Array:
     """Routed-expert MLP over sorted rows: ``down(SiTU(x @ gate) * 25 tanh((x @ up) / 25))``.
@@ -83,8 +84,9 @@ def mxfp4_moe_mlp(
     n_up, n_down = w_gate.shape[-1], w_down.shape[-1]
     bn_up = bn_up if n_up % bn_up == 0 else (512 if n_up % 512 == 0 else n_up)
     bn_down = bn_down if n_down % bn_down == 0 else (512 if n_down % 512 == 0 else n_down)
-    # VMEM decoded-weight cache is only useful when the input has more m-tiles than local experts.
-    use_cache = x.shape[0] > tm * w_gate.shape[0]
+    # VMEM decoded-weight cache is only useful when the input has more m-tiles than local experts
+    # (callers that know an expert can span several m-tiles pass cache=True).
+    use_cache = x.shape[0] > tm * w_gate.shape[0] if cache is None else bool(cache)
     h = mxfp4_gmm(
         x,
         w_gate,
