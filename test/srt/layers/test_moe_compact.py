@@ -190,11 +190,24 @@ def test_compact_forward_scattered_mask(c):
         hs, tw, ti, mask = _inputs(mesh, T, mask_np, seed=c)
         out_full = jax.jit(lambda a, b, d, m: full(a, b, d, token_mask=m))(hs, tw, ti, mask)
         blocks = compact._rs_combine_blocks(hs)
-        out_compact = jax.jit(
-            lambda a, b, d, m: compact._compact_forward(a, b, d, m, rs_blocks=blocks, c=c)
+
+        def direct(a, b, d, m):
+            pos = compact.compact_positions(m)
+            n_real = jnp.sum(m.astype(jnp.int32))
+            return compact._compact_forward(a, b, d, n_real, pos, rs_blocks=blocks, c=c)
+
+        out_compact = jax.jit(direct)(hs, tw, ti, mask)
+        # The model passes the step's positions once for all layers.
+        out_passed = jax.jit(
+            lambda a, b, d, m: compact(a, b, d, token_mask=m, compact_pos=compact.compact_positions(m))
         )(hs, tw, ti, mask)
         out_full = np.asarray(out_full.astype(jnp.float32))
         out_compact = np.asarray(out_compact.astype(jnp.float32))
+        out_passed = np.asarray(out_passed.astype(jnp.float32))
+        pos_np = np.asarray(compact.compact_positions(mask))
+    np.testing.assert_array_equal(pos_np[mask_np], np.arange(mask_np.sum()))
+    assert np.all(pos_np[~mask_np] == -1)
     assert np.all(out_compact[~mask_np] == 0)
     scale = np.abs(out_full).max()
     np.testing.assert_allclose(out_compact, out_full, rtol=0, atol=1e-2 * scale)
+    np.testing.assert_array_equal(out_passed, out_compact)

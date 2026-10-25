@@ -490,6 +490,7 @@ class KimiK3LatentMoE(nnx.Module):
         hidden_states: jax.Array,
         dispatch_info: ExpertLocationMetadata | None = None,
         token_mask: jax.Array | None = None,
+        compact_pos: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         router_scores = self.gate(hidden_states)
         topk_weights, topk_ids = self.topk(
@@ -500,7 +501,8 @@ class KimiK3LatentMoE(nnx.Module):
         else:
             latent = hidden_states
         if token_mask is not None and getattr(self.experts, "supports_token_mask", False):
-            routed = self.experts(latent, topk_weights, topk_ids, token_mask=token_mask)
+            extra = {"compact_pos": compact_pos} if compact_pos is not None else {}
+            routed = self.experts(latent, topk_weights, topk_ids, token_mask=token_mask, **extra)
         else:
             routed = self.experts(latent, topk_weights, topk_ids)
         if self.routed_expert_norm is not None:
@@ -608,12 +610,14 @@ class KimiK3DecoderLayer(nnx.Module):
         forward_batch: ForwardBatch,
         memory_pools,
         dispatch_info: ExpertLocationMetadata | None = None,
+        compact_pos: jax.Array | None = None,
     ):
         """One layer of HF ``KimiDecoderLayer._forward_attn_residual``.
 
         ``partial_sum`` is the running sum of sub-layer outputs since the last
         block boundary (the embedding before layer 0) and ``blocks`` the
-        completed block summaries. Returns the updated pair.
+        completed block summaries. Returns the updated pair. ``compact_pos`` is the
+        step's compact-MoE token positions (see ``MXFP4EPMoE.compact_positions``).
         """
         # No completed blocks yet (layer 0): the attention input is the embedding.
         hidden_states = self.self_attention_res(blocks, partial_sum) if blocks else partial_sum
@@ -634,7 +638,7 @@ class KimiK3DecoderLayer(nnx.Module):
                 forward_batch.out_cache_loc >= 0 if forward_batch.out_cache_loc is not None else None
             )
             ffn_output, topk_ids = self.block_sparse_moe(
-                hidden_states, dispatch_info, token_mask=token_mask
+                hidden_states, dispatch_info, token_mask=token_mask, compact_pos=compact_pos
             )
         else:
             ffn_output, topk_ids = self.mlp(hidden_states), None
@@ -690,6 +694,7 @@ class KimiK3Model(nnx.Module):
         partial_sum = self.embed_tokens(forward_batch.input_ids)
         blocks: list[jax.Array] = []
         layers_kv_fused, layers_recurrent, layers_conv, layers_topk_ids = [], [], [], []
+        compact_pos = self._compact_positions(forward_batch)
         for layer in self.layers:
             partial_sum, blocks, attn_state, topk_ids = layer(
                 forward_batch.positions,
@@ -698,6 +703,7 @@ class KimiK3Model(nnx.Module):
                 forward_batch,
                 memory_pools,
                 dispatch_info=forward_batch.expert_location_metadata,
+                compact_pos=compact_pos,
             )
             if layer.is_kda:
                 recurrent_buffer, conv_buffers = attn_state
@@ -710,6 +716,21 @@ class KimiK3Model(nnx.Module):
         hidden_states = self.output_attn_res(blocks, partial_sum)
         hidden_states = self.norm(hidden_states)
         return hidden_states, layers_kv_fused, (layers_recurrent, layers_conv), layers_topk_ids
+
+    def _compact_positions(self, forward_batch: ForwardBatch) -> jax.Array | None:
+        """The compact-MoE token positions of this step, once for all MoE layers (or None)."""
+        loc = forward_batch.out_cache_loc
+        experts = next(
+            (l.block_sparse_moe.experts for l in self.layers if l.block_sparse_moe is not None),
+            None,
+        )
+        if loc is None or experts is None or not hasattr(experts, "wants_compact_positions"):
+            return None
+        if loc.ndim != 1 or loc.shape[0] != forward_batch.input_ids.shape[0]:
+            return None
+        if not experts.wants_compact_positions(loc.shape[0], experts.num_experts_per_tok):
+            return None
+        return experts.compact_positions(loc >= 0)  # DP-padding slots have out_cache_loc -1
 
 
 class KimiK3ForConditionalGeneration(nnx.Module):

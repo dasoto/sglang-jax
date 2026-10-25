@@ -213,13 +213,16 @@ class MXFP4EPMoE(EPMoE):
         *,
         out_sharding: jax.sharding.NamedSharding | None = None,
         token_mask: jax.Array | None = None,
+        compact_pos: jax.Array | None = None,
     ) -> jax.Array:
         """``token_mask`` [tokens] marks real tokens (DP-padding slots are False).
 
         Only the local-window (prefill) path uses it: masked tokens are routed to a
         sentinel expert id, so they are neither computed nor counted. With one busy
         DP rank, 7/8 of a step's tokens are padding whose identical rows all route to
-        the same experts and would serialize a few expert shards.
+        the same experts and would serialize a few expert shards. ``compact_pos`` is
+        ``compact_positions(token_mask)`` precomputed once per step for the compact path
+        (computed here when None).
         """
         if out_sharding is None:
             out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * hidden_states.ndim)))
@@ -239,24 +242,29 @@ class MXFP4EPMoE(EPMoE):
         )
         rs_blocks = self._rs_combine_blocks(hidden_states)
         compact_sizes = self._compact_sizes(hidden_states, topk_ids, rs_blocks) if use_mask else ()
-        if compact_sizes:
+        if compact_sizes and compact_pos is None:
+            compact_pos = self.compact_positions(token_mask)
+        if compact_sizes and compact_pos is not None:
             # Smallest static compact size >= the step's real-token count, else the full path.
             n_real = jnp.sum(token_mask.astype(jnp.int32))
             index = jnp.sum((n_real > jnp.asarray(compact_sizes, jnp.int32)).astype(jnp.int32))
             branches = [
                 partial(self._compact_forward, rs_blocks=rs_blocks, c=c) for c in compact_sizes
             ]
-            branches.append(
-                partial(
-                    self._call_full,
-                    out_sharding=out_sharding,
-                    out_specs=out_specs,
-                    scatter_on_tensor=scatter_on_tensor,
-                    use_mask=True,
-                    rs_blocks=rs_blocks,
-                )
+            full = partial(
+                self._call_full,
+                out_sharding=out_sharding,
+                out_specs=out_specs,
+                scatter_on_tensor=scatter_on_tensor,
+                use_mask=True,
+                rs_blocks=rs_blocks,
             )
-            return jax.lax.switch(index, branches, hidden_states, topk_weights, topk_ids, token_mask)
+            branches.append(
+                lambda hs, tw, ti, n, p: full(hs, tw, ti, token_mask)  # noqa: ARG005
+            )
+            return jax.lax.switch(
+                index, branches, hidden_states, topk_weights, topk_ids, n_real, compact_pos
+            )
         return self._call_full(
             hidden_states,
             topk_weights,
@@ -534,19 +542,51 @@ class MXFP4EPMoE(EPMoE):
         }
         return tuple(sorted(sizes))
 
+    def wants_compact_positions(self, num_tokens: int, top_k: int) -> bool:
+        """Whether a ``num_tokens``-token step can take the compact path (static, shapes only)."""
+        return bool(
+            self.compact_divisors
+            and self.rs_combine_mesh
+            and self.gmm_kernel_weights_ready
+            and num_tokens * top_k >= self.local_window_min_rows
+        )
+
+    def compact_positions(self, token_mask: jax.Array) -> jax.Array | None:
+        """Global compact row of every token (DP-group-major order), -1 for padding.
+
+        [T] int32 with P("data"); the same for every MoE layer of a step, so the model computes
+        it once and passes it as ``compact_pos`` (each layer would otherwise all-gather the
+        per-group counts). None when the model mesh is not ("data", "tensor").
+        """
+        shape = dict(self.mesh.shape)
+        if set(shape) != {"data", "tensor"} or token_mask.shape[0] % shape["data"]:
+            return None
+        dp = shape["data"]
+
+        def local(m):  # [T/dp] bool
+            m = m.astype(jnp.int32)
+            counts = jax.lax.all_gather(jnp.sum(m), "data")  # real tokens per DP group
+            group = jax.lax.axis_index("data")
+            offset = jnp.sum(jnp.where(jnp.arange(dp) < group, counts, 0))
+            return jnp.where(m > 0, offset + jnp.cumsum(m) - 1, -1).astype(jnp.int32)
+
+        return shard_map(
+            local, mesh=self.mesh, in_specs=P("data"), out_specs=P("data"), check_vma=False
+        )(jax.sharding.reshard(token_mask, NamedSharding(self.mesh, P("data"))))
+
     @named_scope
     def _compact_forward(
-        self, hidden_states, topk_weights, topk_ids, token_mask, *, rs_blocks, c: int
+        self, hidden_states, topk_weights, topk_ids, n_real, pos, *, rs_blocks, c: int
     ) -> jax.Array:
         """Prefill MoE over only the real tokens, packed into ``c`` static rows.
 
-        The caller guarantees at most ``c`` real tokens (``token_mask``). Same math as the
-        full path; the token gather, the experts' scatter-add and the combine move [c, H]
-        instead of the padded [T, H]:
+        The caller guarantees ``n_real`` <= ``c`` real tokens; ``pos`` is
+        ``compact_positions(token_mask)``. Same math as the full path; the token gather, the
+        experts' scatter-add and the combine move [c, H] instead of the padded [T, H]:
 
-        1. Model mesh: each DP group writes its real tokens' [., H/tp] rows (and router
-           outputs) at their global compact positions of a zero [c, .] buffer; a psum over
-           "data" assembles the compact tokens' tensor slices and an all-gather over
+        1. Model mesh: each DP group writes its real tokens' [., H/tp] rows and router
+           outputs (bit-packed into one int32 buffer) at their global compact positions of
+           a zero [c, .] buffer; one psum over "data" assembles them and an all-gather over
            "tensor" the full [c, H] rows. Compact slots past the real tokens route to the
            sentinel expert, so they are neither computed nor counted.
         2. MoE mesh: the local-window experts on the c rows. Each chip emits its unreduced
@@ -561,38 +601,52 @@ class MXFP4EPMoE(EPMoE):
         k = topk_ids.shape[1]
         hl, bw = h // tp, h // (tp * dp)
         sentinel = self.num_experts
+        hdt = hidden_states.dtype
 
         def to_model(x, spec):
             return jax.sharding.reshard(x, NamedSharding(self.mesh, spec))
 
-        def gather_compact(x, wts, ids, m):  # [T/dp, H/tp], [T/dp, k] x2, [T/dp] (local)
-            m = m.astype(jnp.int32)
-            counts = jax.lax.all_gather(jnp.sum(m), "data")  # real tokens per DP group
-            group = jax.lax.axis_index("data")
-            offset = jnp.sum(jnp.where(jnp.arange(dp) < group, counts, 0))
-            pos = jnp.where(m > 0, offset + jnp.cumsum(m) - 1, -1)  # global compact row
-            dst = jnp.where(pos >= 0, pos, c)  # padding -> out of bounds, dropped
-
-            def place(v):
-                buf = jnp.zeros((c,) + v.shape[1:], v.dtype).at[dst].set(v, mode="drop")
-                return jax.lax.psum(buf, "data")  # rows are disjoint across groups: exact
-
-            xc = jax.lax.all_gather(place(x), "tensor", axis=1, tiled=True)  # [c, H]
-            idc = jnp.where((jnp.arange(c) < jnp.sum(counts))[:, None], place(ids), sentinel)
-            return xc, place(wts), idc, pos
+        def gather_compact(x, wts, ids, p, n):  # [T/dp, H/tp], [T/dp, k] x2, [T/dp], [] (local)
+            dst = jnp.where(p >= 0, p, c)  # padding -> out of bounds, dropped
+            # One int32 psum for the hidden slice and both router outputs: the rows are
+            # disjoint across groups, so integer sums of the bit patterns are exact.
+            if hdt.itemsize == 2 and hl % 2 == 0:
+                xw = jax.lax.bitcast_convert_type(x.reshape(x.shape[0], hl // 2, 2), jnp.int32)
+            else:
+                xw = jax.lax.bitcast_convert_type(x.astype(jnp.float32), jnp.int32)
+            words = jnp.concatenate(
+                [
+                    xw,
+                    jax.lax.bitcast_convert_type(wts.astype(jnp.float32), jnp.int32),
+                    ids.astype(jnp.int32),
+                ],
+                axis=1,
+            )
+            buf = jnp.zeros((c, words.shape[1]), jnp.int32).at[dst].set(words, mode="drop")
+            buf = jax.lax.psum(buf, "data")
+            nx = xw.shape[1]
+            if hdt.itemsize == 2 and hl % 2 == 0:
+                xs = jax.lax.bitcast_convert_type(buf[:, :nx], hdt).reshape(c, hl)
+            else:
+                xs = jax.lax.bitcast_convert_type(buf[:, :nx], jnp.float32).astype(hdt)
+            wc = jax.lax.bitcast_convert_type(buf[:, nx : nx + k], jnp.float32)
+            idc = jnp.where((jnp.arange(c) < n)[:, None], buf[:, nx + k :], sentinel)
+            xc = jax.lax.all_gather(xs, "tensor", axis=1, tiled=True)  # [c, H]
+            return xc, wc, idc
 
         rep = P(None, None)
-        xc, wc, idc, pos = shard_map(
+        xc, wc, idc = shard_map(
             gather_compact,
             mesh=self.mesh,
-            in_specs=(P("data", "tensor"), P("data", None), P("data", None), P("data")),
-            out_specs=(rep, rep, rep, P("data")),
+            in_specs=(P("data", "tensor"), P("data", None), P("data", None), P("data"), P()),
+            out_specs=(rep, rep, rep),
             check_vma=False,
         )(
             hidden_states,
             to_model(topk_weights, P("data", None)),
             to_model(topk_ids, P("data", None)),
-            to_model(token_mask, P("data")),
+            to_model(pos, P("data")),
+            to_model(jnp.asarray(n_real, jnp.int32), P()),
         )
 
         def experts(x, wts, ids, w_gate, w_up, w_down, s_gate, s_up, s_down):
