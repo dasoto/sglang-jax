@@ -33,6 +33,7 @@ Semantics follow Moonshot's ``modeling_kimi_linear.py`` (Kimi-K3 release):
 from __future__ import annotations
 
 import logging
+import os
 
 import jax
 import jax.numpy as jnp
@@ -130,6 +131,19 @@ class KimiK3MLP(nnx.Module):
         gate, _ = self.gate_proj(hidden_states)
         up, _ = self.up_proj(hidden_states)
         return situ_and_mul(gate, up, beta=self.situ_beta, linear_beta=self.situ_linear_beta)
+
+
+def _rms_norm_from_sumsq(x: jax.Array, sumsq: jax.Array, norm: RMSNorm) -> jax.Array:
+    """``norm(x)`` given each row's f32 sum of squares over the last axis (same math as RMSNorm)."""
+    mul = jax.lax.rsqrt(sumsq / x.shape[-1] + norm.epsilon)[:, None]
+    out_dtype = x.dtype
+    if norm.scale is not None:
+        scale = norm.scale[...]
+        mul = mul * scale.astype(jnp.float32)
+        out_dtype = jnp.result_type(x.dtype, scale.dtype)
+    if norm.dtype is not None:
+        out_dtype = norm.dtype
+    return (x.astype(jnp.float32) * mul).astype(out_dtype)
 
 
 def _row_parallel_sum(mesh, x1, w1, x2, w2) -> jax.Array:
@@ -473,6 +487,16 @@ class KimiK3LatentMoE(nnx.Module):
         )
 
         num_shared = getattr(config, "num_shared_experts", 0) or 0
+        # SGLANG_JAX_MOE_NORM_FROM_COMBINE=1: routed_expert_norm takes its row sums of squares
+        # from the experts' combine (MXFP4EPMoE.emit_sumsq) instead of all-reducing them over
+        # "tensor" itself -- one latency-bound all-reduce less per MoE layer.
+        if (
+            self.routed_expert_norm is not None
+            and os.environ.get("SGLANG_JAX_MOE_NORM_FROM_COMBINE", "0").strip().lower()
+            in ("1", "true", "yes", "on")
+            and getattr(self.experts, "rs_combine_mesh", False)
+        ):
+            self.experts.emit_sumsq = True
         if num_shared > 0:
             self.shared_experts = KimiK3MLP(
                 self.hidden_size,
@@ -505,7 +529,10 @@ class KimiK3LatentMoE(nnx.Module):
             routed = self.experts(latent, topk_weights, topk_ids, token_mask=token_mask, **extra)
         else:
             routed = self.experts(latent, topk_weights, topk_ids)
-        if self.routed_expert_norm is not None:
+        if isinstance(routed, tuple):  # (output, row sums of squares) from the combine
+            routed, sumsq = routed
+            routed = _rms_norm_from_sumsq(routed, sumsq, self.routed_expert_norm)
+        elif self.routed_expert_norm is not None:
             routed = self.routed_expert_norm(routed)
         if self._fuse_output_allreduce(routed):
             # The RS combine left `routed` P("data", "tensor"): sum the row-parallel

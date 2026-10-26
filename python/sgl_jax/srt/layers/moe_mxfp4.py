@@ -50,6 +50,19 @@ MOE_COMPACT_ENV = "SGLANG_JAX_MOE_COMPACT"
 MOE_COMPACT_MIN_TOKENS_ENV = "SGLANG_JAX_MOE_COMPACT_MIN_TOKENS"
 
 
+# Local-window combine of the weighted expert rows into the per-chip [T, H] accumulator (see
+# MXFP4EPMoE._forward_local_window): "scatter" (scatter-add, default), "onehot" (a [T, cap] one-hot
+# matmul on the MXU with f32 accumulation, for T <= SGLANG_JAX_MOE_ONEHOT_MAX_TOKENS, else scatter)
+# or "sorted" (rows sorted by token, masked rows dropped, sorted-index scatter-add).
+MOE_LOCAL_COMBINE_ENV = "SGLANG_JAX_MOE_LOCAL_COMBINE"
+MOE_ONEHOT_MAX_TOKENS_ENV = "SGLANG_JAX_MOE_ONEHOT_MAX_TOKENS"
+
+
+def _local_combine_mode() -> str:
+    mode = os.environ.get(MOE_LOCAL_COMBINE_ENV, "scatter").strip().lower()
+    return mode if mode in ("scatter", "onehot", "sorted") else "scatter"
+
+
 def _parse_compact_divisors(value: str) -> tuple[int, ...]:
     value = value.strip().lower()
     if value in ("", "0", "off", "false", "no"):
@@ -133,6 +146,15 @@ class MXFP4EPMoE(EPMoE):
         # static compact size that holds them (see _compact_forward).
         self.compact_divisors = _parse_compact_divisors(os.environ.get(MOE_COMPACT_ENV, ""))
         self.compact_min_tokens = int(os.environ.get(MOE_COMPACT_MIN_TOKENS_ENV, "512"))
+        # Row sums of squares from the combine (mesh mode; set by the model when an RMSNorm
+        # follows the experts, e.g. Kimi-K3's routed_expert_norm): XLA runs the combine as an
+        # all-reduce of every chip's whole [dp*tp, ., H/(dp*tp) or H/tp] block array, so each chip
+        # already holds its DP group's full output rows; their f32 sums of squares come out next
+        # to the output ([T] P("data")) and the norm needs no all-reduce of its own. The compact
+        # path also takes its tensor slice from that all-reduce instead of an extra all-gather.
+        self.emit_sumsq = False
+        self.local_combine = _local_combine_mode()
+        self.onehot_max_tokens = int(os.environ.get(MOE_ONEHOT_MAX_TOKENS_ENV, "2048"))
         if self.replicate_experts:
             raise NotImplementedError("MXFP4EPMoE does not support moe_dp_size > 1")
         if self.quantized_dtype is not None or self.activation_quantized_dtype is not None:
@@ -223,6 +245,9 @@ class MXFP4EPMoE(EPMoE):
         the same experts and would serialize a few expert shards. ``compact_pos`` is
         ``compact_positions(token_mask)`` precomputed once per step for the compact path
         (computed here when None).
+
+        With ``emit_sumsq`` the result is ``(output, sumsq)``: ``sumsq`` [tokens] f32 holds
+        each output row's sum of squares over H (P("data") in mesh mode).
         """
         if out_sharding is None:
             out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * hidden_states.ndim)))
@@ -346,7 +371,11 @@ class MXFP4EPMoE(EPMoE):
             )
         if rs_blocks is not None:
             return self._rs_combine_output(result, hidden_states.shape, rs_blocks)
-        return jax.sharding.reshard(result, out_sharding)
+        result = jax.sharding.reshard(result, out_sharding)
+        if self.emit_sumsq:  # no combine to piggyback on: a plain reduction
+            r32 = result.astype(jnp.float32)
+            return result, jnp.sum(r32 * r32, axis=-1)
+        return result
 
     def _rs_combine_blocks(self, hidden_states) -> tuple[int, int] | None:
         """(dp, tp) of the model mesh when the reduce-scatter combine applies, else None.
@@ -413,6 +442,26 @@ class MXFP4EPMoE(EPMoE):
                 y = jax.lax.psum_scatter(x, ("data", "tensor"), scatter_dimension=1, tiled=True)
                 return y.reshape(t // dp, h // tp)
 
+            def reduce_blocks_sumsq(x):  # -> (this chip's block, its DP group's row sums of squares)
+                # XLA lowers the reduce-scatter above as this all-reduce plus a slice anyway
+                # (v5e-256, AOT and profiles); keeping the whole result exposes the DP group's
+                # full rows (blocks d*tp .. d*tp+tp-1) for the sums of squares.
+                y = jax.lax.psum(x[0], ("data", "tensor"))  # [dp*tp, T/dp, H/tp]
+                d = jax.lax.axis_index("data")
+                mine = jax.lax.dynamic_index_in_dim(
+                    y, d * tp + jax.lax.axis_index("tensor"), 0, keepdims=False
+                )
+                g = jax.lax.dynamic_slice_in_dim(y, d * tp, tp, 0).astype(jnp.float32)
+                return mine, jnp.sum(g * g, axis=(0, 2))
+
+            if self.emit_sumsq:
+                return shard_map(
+                    reduce_blocks_sumsq,
+                    mesh=self.mesh,
+                    in_specs=P(("data", "tensor"), None, None, None),
+                    out_specs=(P("data", "tensor"), P("data")),
+                    check_vma=False,
+                )(stacked)
             return shard_map(
                 reduce_blocks,
                 mesh=self.mesh,
@@ -427,7 +476,11 @@ class MXFP4EPMoE(EPMoE):
             blocks, (dp, tp, t // dp, h // tp), out_sharding=P("data", "tensor", None, None)
         )
         out = jnp.transpose(blocks, (0, 2, 1, 3))
-        return jnp.reshape(out, (t, h), out_sharding=P("data", "tensor"))
+        out = jnp.reshape(out, (t, h), out_sharding=P("data", "tensor"))
+        if self.emit_sumsq:  # not mesh mode: a plain (all-reduced) reduction
+            o32 = out.astype(jnp.float32)
+            return out, jnp.sum(o32 * o32, axis=-1)
+        return out
 
     def _mesh_gather_tokens(self, hidden_states, rs_blocks, topk_weights=None, topk_ids=None):
         """[T, H] with P("data", "tensor") -> replicated, by explicit model-mesh all-gathers.
@@ -685,6 +738,32 @@ class MXFP4EPMoE(EPMoE):
             rows = y[jnp.clip(p, 0, c - 1)]
             return jnp.where((p >= 0)[:, None], rows, jnp.zeros_like(rows))
 
+        def combine_sumsq(x, p):  # -> (as combine, row sums of squares [T/dp])
+            # The all-reduce XLA runs for the reduce-scatter above leaves every block on every
+            # chip: take this chip's tensor slice (blocks (d, t), all d) without the all-gather,
+            # and the full rows' sums of squares.
+            y_all = jax.lax.psum(x[0], ("data", "tensor"))  # [dp*tp, c, bw]
+            mine = jax.lax.dynamic_index_in_dim(
+                y_all.reshape(dp, tp, c, bw), jax.lax.axis_index("tensor"), 1, keepdims=False
+            )  # [dp, c, bw]
+            y = mine.transpose(1, 0, 2).reshape(c, hl)
+            y32 = y_all.astype(jnp.float32)
+            ss = jnp.sum(y32 * y32, axis=(0, 2))  # [c]
+            q = jnp.clip(p, 0, c - 1)
+            real = p >= 0
+            return (
+                jnp.where(real[:, None], y[q], jnp.zeros((), y.dtype)),
+                jnp.where(real, ss[q], 0.0),
+            )
+
+        if self.emit_sumsq:
+            return shard_map(
+                combine_sumsq,
+                mesh=self.mesh,
+                in_specs=(P(("data", "tensor"), None, None, None), P("data")),
+                out_specs=(P("data", "tensor"), P("data")),
+                check_vma=False,
+            )(blocks, pos)
         return shard_map(
             combine,
             mesh=self.mesh,
@@ -815,6 +894,10 @@ class MXFP4EPMoE(EPMoE):
         elif tm_env.isdigit():
             tm, cache = int(tm_env), True
 
+        combine = self.local_combine
+        if combine == "onehot" and num_tokens > self.onehot_max_tokens:
+            combine = "scatter"
+
         def window(w, acc):
             base = w * cap
             rel = base + jnp.arange(cap, dtype=jnp.int32)
@@ -848,6 +931,25 @@ class MXFP4EPMoE(EPMoE):
                 interpret=not is_tpu_runtime(),
             )
             contrib = jnp.where(valid[:, None], y.astype(jnp.float32) * flat_w[pos][:, None], 0.0)
+            if combine == "onehot":
+                # [T, cap] 0/1 matrix (masked rows are zero columns) on the MXU: no scatter.
+                onehot = (
+                    (tok[None, :] == jnp.arange(num_tokens, dtype=tok.dtype)[:, None])
+                    & valid[None, :]
+                ).astype(acc.dtype)
+                add = jnp.dot(
+                    onehot,
+                    contrib.astype(acc.dtype),
+                    preferred_element_type=jnp.float32,
+                    precision=jax.lax.Precision.HIGHEST if acc.dtype == jnp.float32 else None,
+                )
+                return acc + add.astype(acc.dtype)
+            if combine == "sorted":
+                key = jnp.where(valid, tok, num_tokens)  # masked rows sort last, then drop
+                key_s, order = jax.lax.sort_key_val(key, jnp.arange(cap, dtype=jnp.int32))
+                return acc.at[key_s].add(
+                    contrib[order].astype(acc.dtype), indices_are_sorted=True, mode="drop"
+                )
             return acc.at[tok].add(contrib.astype(acc.dtype))
 
         n_windows = (local_rows + cap - 1) // cap
