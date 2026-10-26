@@ -59,10 +59,13 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         # --dcp-size 32: every chip scores all 96 query heads (gathered) against 1/32 of the
         # KV pages; mnt = per-group query tokens. Swept with scripts/mla_tune.sh at 32K/96K/192K
         # global context (local 1K/3K/6K); fallback was (1, 16).
+        # (4, 32) for every mnt: within 2% of the best (8, 32) at 32K-192K, and a short context
+        # (1-2 local pages) pads a 4-page block instead of an 8-page one (8-group 8K-prompt
+        # prefill: MLA kernel 19 ms per step with (8, 32) vs 5 ms with the fallback).
         ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 64): (4, 32),
         ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 128): (4, 32),
-        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 256): (8, 32),
-        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 512): (8, 32),
+        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 256): (4, 32),
+        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 512): (4, 32),
     },
     "TPU v6e": {
         # ===== DeepSeek-V3 (kv_lora_rank=512, qk_rope_head_dim=64) =====
