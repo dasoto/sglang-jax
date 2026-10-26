@@ -53,7 +53,9 @@ MOE_COMPACT_MIN_TOKENS_ENV = "SGLANG_JAX_MOE_COMPACT_MIN_TOKENS"
 # Local-window combine of the weighted expert rows into the per-chip [T, H] accumulator (see
 # MXFP4EPMoE._forward_local_window): "scatter" (scatter-add, default), "onehot" (a [T, cap] one-hot
 # matmul on the MXU with f32 accumulation, for T <= SGLANG_JAX_MOE_ONEHOT_MAX_TOKENS, else scatter)
-# or "sorted" (rows sorted by token, masked rows dropped, sorted-index scatter-add).
+# or "sorted" (rows sorted by token, masked rows dropped, sorted-index scatter-add), or "gather"
+# (rows sorted by token; each token gathers its first few rows, the rare extra rows go through a
+# small scatter; see _segment_gather_sum).
 # Above the one-hot limit, "onehot" falls back to SGLANG_JAX_MOE_LOCAL_COMBINE_LARGE ("scatter" or
 # "sorted", default "scatter").
 MOE_LOCAL_COMBINE_ENV = "SGLANG_JAX_MOE_LOCAL_COMBINE"
@@ -61,9 +63,61 @@ MOE_LOCAL_COMBINE_LARGE_ENV = "SGLANG_JAX_MOE_LOCAL_COMBINE_LARGE"
 MOE_ONEHOT_MAX_TOKENS_ENV = "SGLANG_JAX_MOE_ONEHOT_MAX_TOKENS"
 
 
-def _local_combine_mode(env: str = MOE_LOCAL_COMBINE_ENV, allowed=("scatter", "onehot", "sorted")) -> str:
+def _local_combine_mode(
+    env: str = MOE_LOCAL_COMBINE_ENV, allowed=("scatter", "onehot", "sorted", "gather")
+) -> str:
     mode = os.environ.get(env, "scatter").strip().lower()
     return mode if mode in allowed else "scatter"
+
+
+# Rows per token that the gather combine sums directly; tokens with more local rows send the
+# extra ones through a scatter of at most _GATHER_OVERFLOW_ROWS rows (a full scatter beyond). A
+# scatter costs ~0.13 us per update row on v5e whether or not the row is masked, so the small one
+# is kept small; with 3 rows per token the overflow is a handful of rows per chip and layer.
+_GATHER_ROWS_PER_TOKEN = 3
+_GATHER_OVERFLOW_ROWS = 64
+
+
+def _segment_gather_sum(rows, tok, valid, num_tokens):
+    """``zeros([num_tokens, H]).at[tok[valid]].add(rows[valid])`` without a large scatter.
+
+    TPU scatter-adds serialize on their update rows (~0.13 us per 3,584-wide bf16 row on v5e,
+    with or without unique indices), while row gathers run ~10x faster. Rows are sorted by
+    token; each token gathers its first ``_GATHER_ROWS_PER_TOKEN`` rows (searchsorted gives its
+    segment) and sums them in f32. Rows beyond that (a token routed to several local experts)
+    are compacted and scatter-added: a small scatter, or the full one when there are more
+    than ``_GATHER_OVERFLOW_ROWS``. Exact up to f32 summation order.
+    """
+    cap, h = rows.shape
+    key = jnp.where(valid, tok, num_tokens).astype(jnp.int32)  # masked rows sort last
+    key_s, order = jax.lax.sort_key_val(key, jnp.arange(cap, dtype=jnp.int32))
+    rows_s = rows[order]
+    tokens = jnp.arange(num_tokens, dtype=jnp.int32)
+    first = jnp.searchsorted(key_s, tokens, side="left", method="scan_unrolled").astype(jnp.int32)
+    last = jnp.searchsorted(key_s, tokens, side="right", method="scan_unrolled").astype(jnp.int32)
+    count = last - first
+    out = jnp.zeros((num_tokens, h), jnp.float32)
+    for j in range(_GATHER_ROWS_PER_TOKEN):
+        g = rows_s[jnp.clip(first + j, 0, cap - 1)].astype(jnp.float32)
+        out = out + jnp.where((count > j)[:, None], g, 0.0)
+    # Rows ranked >= _GATHER_ROWS_PER_TOKEN within their token's segment.
+    seg_first = first[jnp.clip(key_s, 0, num_tokens - 1)]
+    rank = jnp.arange(cap, dtype=jnp.int32) - seg_first
+    extra = (key_s < num_tokens) & (rank >= _GATHER_ROWS_PER_TOKEN)
+    n_extra = jnp.sum(extra.astype(jnp.int32))
+    ob = min(_GATHER_OVERFLOW_ROWS, cap)
+
+    def small(out):
+        (pos,) = jnp.nonzero(extra, size=ob, fill_value=cap - 1)
+        ok = jnp.arange(ob) < n_extra
+        upd = jnp.where(ok[:, None], rows_s[pos].astype(jnp.float32), 0.0)
+        return out.at[jnp.where(ok, key_s[pos], 0)].add(upd)
+
+    def full(out):
+        upd = jnp.where(extra[:, None], rows_s.astype(jnp.float32), 0.0)
+        return out.at[jnp.clip(key_s, 0, num_tokens - 1)].add(upd)
+
+    return jax.lax.cond(n_extra > ob, full, small, out)
 
 
 def _parse_compact_divisors(value: str) -> tuple[int, ...]:
@@ -157,7 +211,9 @@ class MXFP4EPMoE(EPMoE):
         # path also takes its tensor slice from that all-reduce instead of an extra all-gather.
         self.emit_sumsq = False
         self.local_combine = _local_combine_mode()
-        self.local_combine_large = _local_combine_mode(MOE_LOCAL_COMBINE_LARGE_ENV, ("scatter", "sorted"))
+        self.local_combine_large = _local_combine_mode(
+            MOE_LOCAL_COMBINE_LARGE_ENV, ("scatter", "sorted", "gather")
+        )
         self.onehot_max_tokens = int(os.environ.get(MOE_ONEHOT_MAX_TOKENS_ENV, "2048"))
         if self.replicate_experts:
             raise NotImplementedError("MXFP4EPMoE does not support moe_dp_size > 1")
@@ -959,6 +1015,10 @@ class MXFP4EPMoE(EPMoE):
                     precision=jax.lax.Precision.HIGHEST if acc.dtype == jnp.float32 else None,
                 )
                 return acc + add.astype(acc.dtype)
+            if combine == "gather":
+                return acc + _segment_gather_sum(
+                    contrib.astype(acc.dtype), tok, valid, num_tokens
+                ).astype(acc.dtype)
             if combine == "sorted":
                 key = jnp.where(valid, tok, num_tokens)  # masked rows sort last, then drop
                 key_s, order = jax.lax.sort_key_val(key, jnp.arange(cap, dtype=jnp.int32))

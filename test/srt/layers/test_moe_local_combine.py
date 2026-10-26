@@ -95,7 +95,7 @@ def _prefix_mask(T, per_group):
 
 
 @pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (CPU) devices")
-@pytest.mark.parametrize("mode", ["onehot", "sorted"])
+@pytest.mark.parametrize("mode", ["onehot", "sorted", "gather"])
 @pytest.mark.parametrize(
     "per_group,compact,capacity,bf16_acc",
     [
@@ -136,6 +136,8 @@ def test_mode_parsing(monkeypatch):
     assert _local_combine_mode("SGLANG_JAX_MOE_LOCAL_COMBINE_LARGE", ("scatter", "sorted")) == "sorted"
     monkeypatch.setenv("SGLANG_JAX_MOE_LOCAL_COMBINE_LARGE", "onehot")
     assert _local_combine_mode("SGLANG_JAX_MOE_LOCAL_COMBINE_LARGE", ("scatter", "sorted")) == "scatter"
+    monkeypatch.setenv("SGLANG_JAX_MOE_LOCAL_COMBINE", "gather")
+    assert _local_combine_mode() == "gather"
 
 
 @pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (CPU) devices")
@@ -155,3 +157,28 @@ def test_onehot_falls_back_above_limit():
         out_new = np.asarray(out_new.astype(jnp.float32))
     scale = np.abs(out_ref).max()
     np.testing.assert_allclose(out_new, out_ref, rtol=0, atol=1e-2 * scale)
+
+
+@pytest.mark.parametrize("overflow_rows", [256, 4])
+@pytest.mark.parametrize("dup", ["none", "heavy"])
+def test_segment_gather_sum_exact(monkeypatch, overflow_rows, dup):
+    """_segment_gather_sum == f32 scatter-add, incl. tokens with many rows (small/full overflow)."""
+    import sgl_jax.srt.layers.moe_mxfp4 as M
+
+    monkeypatch.setattr(M, "_GATHER_OVERFLOW_ROWS", overflow_rows)
+    rng = np.random.default_rng(5)
+    cap, T, Hh = 96, 40, 32
+    if dup == "heavy":  # a few tokens own most rows: ranks up to ~20 per token
+        tok = rng.choice([3, 7, 7, 7, 11, 11, 39], size=cap).astype(np.int32)
+    else:
+        tok = rng.integers(0, T, size=cap).astype(np.int32)
+    valid = rng.random(cap) < 0.8
+    rows = rng.standard_normal((cap, Hh)).astype(np.float32)
+    ref = np.zeros((T, Hh), np.float64)
+    for r in range(cap):
+        if valid[r]:
+            ref[tok[r]] += rows[r]
+    out = jax.jit(lambda a, b, c: M._segment_gather_sum(a, b, c, T))(
+        jnp.asarray(rows), jnp.asarray(tok), jnp.asarray(valid)
+    )
+    np.testing.assert_allclose(np.asarray(out), ref, rtol=1e-5, atol=1e-5)
