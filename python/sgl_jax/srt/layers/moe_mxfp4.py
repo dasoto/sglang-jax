@@ -1131,6 +1131,7 @@ def create_mxfp4_moe_weights_mapping(
     moe_path: str = "experts",
     expert_type_names: tuple[str, str, str] = ("w1", "w3", "w2"),
     source_expert_pattern: str = "experts.{i}",
+    expert_order=None,
 ) -> dict:
     """Map per-expert compressed-tensors MXFP4 tensors onto ``MXFP4EPMoE``.
 
@@ -1139,9 +1140,17 @@ def create_mxfp4_moe_weights_mapping(
     (and ``.weight_scale``) are transposed to k-major and stacked into
     ``{target_prefix}.{moe_path}.{w1|w3|w2}_weight_packed`` (``_weight_scale``).
     The loader reads only each host's addressable expert / intermediate slices.
+
+    ``expert_order`` (EPLB): the logical expert stored in each physical slot, i.e. this
+    layer's row of ``ExpertLocationMetadata.physical_to_logical_map``. Slot ``p`` then
+    holds checkpoint expert ``expert_order[p]`` (a logical expert may fill several slots
+    when there are redundant experts). None keeps the checkpoint order.
     """
     gate, up, down = expert_type_names
     layouts = {gate: ("w1", _WI_SPEC), up: ("w3", _WI_SPEC), down: ("w2", _WO_SPEC)}
+    order = list(range(num_experts)) if expert_order is None else [int(i) for i in expert_order]
+    if any(not 0 <= i < num_experts for i in order):
+        raise ValueError(f"expert_order entries must be in [0, {num_experts})")
     mappings = {}
     for source_name, (target_name, spec) in layouts.items():
         for suffix in ("weight_packed", "weight_scale"):
@@ -1150,7 +1159,7 @@ def create_mxfp4_moe_weights_mapping(
                 target_path=target,
                 sources=tuple(
                     f"{prefix}.{source_expert_pattern.format(i=i)}.{source_name}.{suffix}"
-                    for i in range(num_experts)
+                    for i in order
                 ),
                 sharding=tuple(spec),
                 transpose=True,

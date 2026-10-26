@@ -566,6 +566,12 @@ class _ExpertDistributionRecorder:
         )
         self._steps_accumulated = 0
         self._lock = threading.Lock()
+        # SGLANG_JAX_EPLB_COUNT_ALL_ROWS=1: count every non-negative id of every row. For models
+        # that mark DP-padding rows with -1 themselves (Kimi-K3 with SGLANG_JAX_EPLB_RECORD=1);
+        # the per-DP request slicing below only matches decode batches (one row per request),
+        # not prefill batches, whose rows are tokens.
+        flag = os.environ.get("SGLANG_JAX_EPLB_COUNT_ALL_ROWS", "0").strip().lower()
+        self.count_all_rows = flag in ("1", "true", "yes", "on")
 
     def add_topk_ids(
         self,
@@ -579,6 +585,14 @@ class _ExpertDistributionRecorder:
         with self._lock:
             for layer_idx, ids_cpu in enumerate(topk_ids_cpu):
                 if ids_cpu is None:
+                    continue
+                if self.count_all_rows:
+                    flat = np.asarray(ids_cpu).reshape(-1)
+                    valid_ids = flat[(flat >= 0) & (flat < self.physical_expert_counts)]
+                    if valid_ids.size > 0:
+                        self._physical_counts[layer_idx] += np.bincount(
+                            valid_ids, minlength=self.physical_expert_counts
+                        )[: self.physical_expert_counts]
                     continue
                 for dp_rank, real_bs in enumerate(real_bs_per_dp):
                     if real_bs <= 0:
@@ -626,7 +640,7 @@ class _ExpertDistributionRecorder:
 
         # Only process 0 saves to file
         # if jax.process_index() == 0:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         base_path = self.output_file
         if base_path.endswith(".npy"):
             filename = base_path.replace(".npy", f"_{timestamp}.npy")

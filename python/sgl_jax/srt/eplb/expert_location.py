@@ -6,6 +6,8 @@ from typing import Literal
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.sharding import NamedSharding
+from jax.sharding import PartitionSpec as P
 from jax.tree_util import register_pytree_node_class
 
 from sgl_jax.srt.configs.model_config import ModelConfig
@@ -90,6 +92,31 @@ class ExpertLocationMetadata:
         obj.ep_dispatch_algorithm = aux_data["ep_dispatch_algorithm"]
         obj.num_physical_experts = aux_data["num_physical_experts"]
         return obj
+
+    def replicate_on(self, mesh) -> "ExpertLocationMetadata":
+        """Re-place the maps as arrays replicated on ``mesh`` (in place; returns self).
+
+        The constructor puts them on the default device, which a jitted step sharded over
+        a (multi-host) mesh cannot combine with its P("data", ...) top-k ids. Every process
+        computes the same maps (same input file, deterministic EPLB), so each provides its
+        copy of the replicated array.
+        """
+        rep = NamedSharding(mesh, P())
+
+        def put(x):
+            if x is None:
+                return None
+            arr = np.asarray(jax.device_get(x))
+            return jax.make_array_from_callback(arr.shape, rep, lambda idx, a=arr: a[idx])
+
+        for name in (
+            "logical_to_rank_dispatch_physical_map",
+            "logical_to_all_physical_map",
+            "logical_to_all_physical_map_num_valid",
+            "physical_to_logical_map",
+        ):
+            setattr(self, name, put(getattr(self, name)))
+        return self
 
     @staticmethod
     def init_trivial(server_args: ServerArgs, model_config: ModelConfig):
@@ -321,12 +348,14 @@ def expert_location_config(model_config: ModelConfig) -> dict:
     }
 
 
-def init_expert_location_metadata(server_args, model_config):
+def init_expert_location_metadata(server_args, model_config, mesh=None):
     """
-    Initializes the global expert mapping.
+    Initializes the global expert mapping (replicated on ``mesh`` when given).
     """
     metadata = compute_initial_expert_location_metadata(server_args, model_config)
     if metadata is not None:
+        if mesh is not None:
+            metadata.replicate_on(mesh)
         set_global_expert_location_metadata(metadata)
 
 
@@ -381,7 +410,13 @@ def _topk_ids_logical_to_physical_static(
     info: ExpertLocationMetadata,
     layer_id: int = 0,
 ) -> jax.Array:
-    return info.logical_to_rank_dispatch_physical_map[layer_id, topk_ids]
+    table = info.logical_to_rank_dispatch_physical_map[layer_id]
+    # Explicit-sharding meshes: the gather takes the ids' sharding (e.g. P("data", None)).
+    sharding = getattr(jax.typeof(topk_ids), "sharding", None)
+    mesh = getattr(sharding, "mesh", None)
+    if mesh is not None and not mesh.empty:
+        return table.at[topk_ids].get(out_sharding=sharding).astype(topk_ids.dtype)
+    return table[topk_ids].astype(topk_ids.dtype)
 
 
 def _topk_ids_logical_to_physical_dynamic(

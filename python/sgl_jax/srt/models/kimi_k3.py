@@ -45,7 +45,10 @@ from jax.sharding import PartitionSpec as P
 from sgl_jax.srt.configs.kimi_k3 import get_kimi_k3_text_config
 from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, ModelConfig
-from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
+from sgl_jax.srt.eplb.expert_location import (
+    ExpertLocationMetadata,
+    get_global_expert_location_metadata,
+)
 from sgl_jax.srt.layers.activation import situ_and_mul
 from sgl_jax.srt.layers.attention.fla.gated_rmsnorm import GatedRMSNorm
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
@@ -64,6 +67,14 @@ logger = logging.getLogger(__name__)
 
 # KimiRMSNorm default eps, used by the MLA q_a / kv_a layernorms in the HF code.
 _MLA_LORA_NORM_EPS = 1e-6
+
+# Host copy of the EPLB physical_to_logical_map, read once per metadata object at load.
+_PHY2LOG_CACHE: dict = {}
+
+# SGLANG_JAX_EPLB_RECORD=1 (EPLB calibration, with --enable-expert-distribution-recorder):
+# the per-layer top-k ids the model returns get -1 on DP-padding rows and are replicated, so
+# the recorder can fetch them on every host and count only real tokens (prefill and decode).
+_EPLB_RECORD_ENV = "SGLANG_JAX_EPLB_RECORD"
 
 
 def _situ_params(config) -> tuple[float, float | None]:
@@ -686,6 +697,13 @@ class KimiK3Model(nnx.Module):
         if getattr(config, "attn_res_block_size", None) is None:
             raise ValueError("Kimi-K3 expects attn_res_block_size (Attention Residuals)")
         self.config = config
+        self.mesh = mesh
+        self.eplb_record = os.environ.get(_EPLB_RECORD_ENV, "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         self.embed_tokens = Embed(
             num_embeddings=config.vocab_size,
             features=config.hidden_size,
@@ -738,11 +756,22 @@ class KimiK3Model(nnx.Module):
                 layers_conv.append(conv_buffers)
             else:
                 layers_kv_fused.append(attn_state)
+            if self.eplb_record and topk_ids is not None:
+                topk_ids = self._recorded_topk_ids(topk_ids, forward_batch.out_cache_loc)
             layers_topk_ids.append(topk_ids)
 
         hidden_states = self.output_attn_res(blocks, partial_sum)
         hidden_states = self.norm(hidden_states)
         return hidden_states, layers_kv_fused, (layers_recurrent, layers_conv), layers_topk_ids
+
+    def _recorded_topk_ids(self, topk_ids: jax.Array, loc: jax.Array | None) -> jax.Array:
+        """[T, k] top-k ids for the expert-distribution recorder: replicated, -1 on padding."""
+        rep = NamedSharding(self.mesh, P())
+        ids = jax.sharding.reshard(topk_ids, rep)
+        if loc is not None and loc.ndim == 1 and loc.shape[0] == ids.shape[0]:
+            valid = jax.sharding.reshard(loc, rep) >= 0  # DP-padding slots have out_cache_loc -1
+            ids = jnp.where(valid[:, None], ids, jnp.asarray(-1, ids.dtype))
+        return ids
 
     def _compact_positions(self, forward_batch: ForwardBatch) -> jax.Array | None:
         """The compact-MoE token positions of this step, once for all MoE layers (or None)."""
@@ -814,6 +843,18 @@ class KimiK3ForConditionalGeneration(nnx.Module):
             mesh=mesh,
             enable_dp_lm_head=enable_dp_lm_head,
         )
+
+    @classmethod
+    def get_expert_location_config(cls, hf_config) -> dict:
+        """EPLB fields (see ``expert_location_config``): the MoE config is the text config."""
+        text = get_kimi_k3_text_config(hf_config)
+        if text is None:
+            return {"num_experts": 0, "num_layers": 0, "num_groups": 1}
+        return {
+            "num_experts": int(getattr(text, "num_experts", 0) or 0),
+            "num_layers": int(text.num_hidden_layers),
+            "num_groups": int(getattr(text, "num_expert_group", None) or 1),
+        }
 
     def __call__(
         self,
@@ -1017,6 +1058,7 @@ class KimiK3ForConditionalGeneration(nnx.Module):
                     target_prefix=moe_dst,
                     num_experts=cfg.num_experts,
                     moe_path="experts",
+                    expert_order=self._expert_order(layer_idx),
                 )
             )
         else:
@@ -1033,6 +1075,26 @@ class KimiK3ForConditionalGeneration(nnx.Module):
                 spec.target_path = spec.target_path.replace(f"{moe_dst}.", f"{moe_dst}.experts.", 1)
                 mappings[spec.target_path] = spec
         return mappings
+
+    def _expert_order(self, layer_idx: int):
+        """EPLB placement of this layer's routed experts: the logical expert in each physical
+        slot (``physical_to_logical_map[layer_idx]``), or None for the checkpoint order.
+
+        Set when the server runs with ``--ep-dispatch-algorithm`` (``--init-expert-location``
+        a placement or recorded per-layer counts); the router then maps its logical top-k ids
+        through the same metadata (``TopK`` ``dispatch_info``).
+        """
+        metadata = get_global_expert_location_metadata()
+        if metadata is None or metadata.physical_to_logical_map is None:
+            return None
+        key = id(metadata)
+        if _PHY2LOG_CACHE.get("key") != key:
+            _PHY2LOG_CACHE["key"] = key
+            _PHY2LOG_CACHE["map"] = np.asarray(jax.device_get(metadata.physical_to_logical_map))
+        order = _PHY2LOG_CACHE["map"][layer_idx]
+        if np.array_equal(order, np.arange(order.shape[0])):
+            return None
+        return order.tolist()
 
     def _a_log_value(self, a_log: np.ndarray, num_heads: int) -> jax.Array:
         values = np.asarray(a_log, dtype=np.float32).reshape(-1)

@@ -98,5 +98,31 @@ class TestEPLB(unittest.TestCase):
         self.assertEqual(len(res), 3)
 
 
+class TestExpertDistributionRecorderCountAllRows(unittest.TestCase):
+    """SGLANG_JAX_EPLB_COUNT_ALL_ROWS=1: every non-negative id of every row is counted (prefill
+    rows are tokens, padding rows carry -1), instead of the first real_bs rows per DP rank."""
+
+    def test_counts_all_non_negative_ids(self):
+        import tempfile
+        from unittest import mock
+
+        from sgl_jax.srt.layers.routed_experts_capturer import _ExpertDistributionRecorder
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(
+            os.environ, {"SGLANG_JAX_EPLB_COUNT_ALL_ROWS": "1"}
+        ):
+            rec = _ExpertDistributionRecorder(
+                num_layers=2,
+                buffer_size=1000,
+                output_file=os.path.join(tmp, "counts.npy"),
+                physical_expert_counts=4,
+            )
+            # 2 DP ranks x 3 padded token rows, top-2; rank 1 has one padding row (-1).
+            ids = np.array([[0, 1], [1, 2], [3, 3], [2, 0], [0, 0], [-1, -1]], dtype=np.int32)
+            rec.add_topk_ids([None, ids], real_bs_per_dp=[1, 1], per_dp_bs_size=3)
+            np.testing.assert_array_equal(rec._physical_counts[0], [0, 0, 0, 0])
+            np.testing.assert_array_equal(rec._physical_counts[1], [4, 2, 2, 2])
+
+
 if __name__ == "__main__":
     unittest.main()

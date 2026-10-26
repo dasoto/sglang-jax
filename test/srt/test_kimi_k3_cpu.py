@@ -107,7 +107,9 @@ def _make_mesh(tp: int):
     )
 
 
-def _make_runner(fixture: str, *, dtype: str, tp: int, ep: int, trust_remote_code: bool):
+def _make_runner(
+    fixture: str, *, dtype: str, tp: int, ep: int, trust_remote_code: bool, **extra_args
+):
     from sgl_jax.srt.configs.model_config import ModelConfig
     from sgl_jax.srt.model_executor.model_runner import ModelRunner
     from sgl_jax.srt.server_args import ServerArgs
@@ -131,6 +133,7 @@ def _make_runner(fixture: str, *, dtype: str, tp: int, ep: int, trust_remote_cod
         disable_precompile=True,
         enable_topk_kernel=False,
         random_seed=0,
+        **extra_args,
     )
     model_config = ModelConfig.from_server_args(server_args)
     runner = ModelRunner(
@@ -217,12 +220,17 @@ class TestKimiK3CPU(unittest.TestCase):
         with np.load(os.path.join(cls.fixture, "golden.npz")) as data:
             cls.golden = {k: data[k] for k in data.files}
 
-    def _run(self, *, dtype, tp, ep, trust_remote_code):
+    def _run(self, *, dtype, tp, ep, trust_remote_code, env=None, **extra_args):
         if len(jax.devices()) < tp:
             self.skipTest(f"needs {tp} devices (set JAX_NUM_CPU_DEVICES)")
-        with mock.patch.dict(os.environ, _case_env(dtype)):
+        with mock.patch.dict(os.environ, {**_case_env(dtype), **(env or {})}):
             runner = _make_runner(
-                self.fixture, dtype=dtype, tp=tp, ep=ep, trust_remote_code=trust_remote_code
+                self.fixture,
+                dtype=dtype,
+                tp=tp,
+                ep=ep,
+                trust_remote_code=trust_remote_code,
+                **extra_args,
             )
             return _run_sglang(runner, self.golden)
 
@@ -249,6 +257,45 @@ class TestKimiK3CPU(unittest.TestCase):
         # KDA/MLA heads over tensor=4; experts over expert=2 x expert-TP 2.
         prefill, decode = self._run(dtype="float32", tp=4, ep=2, trust_remote_code=True)
         self._check_exact(prefill, decode, "f32 tp=4 ep=2 mla=mha")
+
+    def test_f32_tp4_ep2_eplb_permuted_placement(self):
+        # EPLB: every MoE layer stores its experts in a random physical order (the loader
+        # permutes the stacked MXFP4 weights) and the router maps its logical top-k ids
+        # through the same placement, so the logits must not change. The recorder mode
+        # (SGLANG_JAX_EPLB_RECORD=1: replicated top-k ids, -1 on padding) rides along.
+        import json
+
+        from sgl_jax.srt.eplb.expert_location import (
+            get_global_expert_location_metadata,
+            set_global_expert_location_metadata,
+        )
+
+        with open(os.path.join(self.fixture, "config.json")) as f:
+            cfg = json.load(f)
+        text = cfg.get("text_config", cfg)
+        rng = np.random.default_rng(1234)
+        phy2log = [
+            rng.permutation(text["num_experts"]).tolist()
+            for _ in range(text["num_hidden_layers"])
+        ]
+        try:
+            prefill, decode = self._run(
+                dtype="float32",
+                tp=4,
+                ep=2,
+                trust_remote_code=True,
+                env={"SGLANG_JAX_EPLB_RECORD": "1"},
+                ep_dispatch_algorithm="static",
+                init_expert_location=json.dumps({"physical_to_logical_map": phy2log}),
+            )
+            metadata = get_global_expert_location_metadata()
+            self.assertIsNotNone(metadata)
+            np.testing.assert_array_equal(
+                np.asarray(jax.device_get(metadata.physical_to_logical_map)), np.asarray(phy2log)
+            )
+        finally:
+            set_global_expert_location_metadata(None)
+        self._check_exact(prefill, decode, "f32 tp=4 ep=2 eplb permuted")
 
     def test_bf16_mega_kda_noise_parity(self):
         prefill, decode = self._run(dtype="bfloat16", tp=1, ep=1, trust_remote_code=False)
