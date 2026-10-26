@@ -49,6 +49,14 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
 logger = logging.getLogger(__name__)
 
 
+def _dcp_size(attn_backend) -> int:
+    """DCP size of the backend serving MLA layers (hybrid models wrap it as full_attn_backend)."""
+    size = getattr(attn_backend, "dcp_size", None)
+    if size is None:
+        size = getattr(getattr(attn_backend, "full_attn_backend", None), "dcp_size", None)
+    return int(size or 1)
+
+
 class DeepseekV3MLP(nnx.Module):
     """SwiGLU MLP used for dense layers and shared experts."""
 
@@ -338,7 +346,7 @@ class DeepseekV3Attention(nnx.Module):
         # Latent K/V are a single shared head — pack into [T, 1, *] for MQA.
         c_kv_3d = compressed[:, None, :]
 
-        if self.replicated_absorb and getattr(forward_batch.attn_backend, "dcp_size", 1) > 1:
+        if self.replicated_absorb and _dcp_size(forward_batch.attn_backend) > 1:
             # The DCP backend folds the replicated W_UK / W_UV in around its collectives.
             o_v, kv_fused = self.attn_mqa(
                 q_nope,

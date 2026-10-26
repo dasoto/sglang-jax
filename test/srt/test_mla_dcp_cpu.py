@@ -142,6 +142,16 @@ class TestMLADCPCPU(unittest.TestCase):
         pool.replace_buffer([updated_cache])
         return np.asarray(jax.device_get(o_latent))
 
+    def test_dcp_size_through_hybrid_wrapper(self):
+        """Hybrid (KDA + MLA) models wrap the MLA backend; the absorb path must still see its DCP size."""
+        from sgl_jax.srt.models.deepseek_v3 import _dcp_size
+
+        mla = SimpleNamespace(dcp_size=32)
+        self.assertEqual(_dcp_size(mla), 32)
+        self.assertEqual(_dcp_size(SimpleNamespace(full_attn_backend=mla)), 32)
+        self.assertEqual(_dcp_size(SimpleNamespace()), 1)
+        self.assertEqual(_dcp_size(lambda *a, **k: None), 1)
+
     def test_replicated_absorb_matches_latent_path(self):
         """absorb_weights: W_UK / W_UV folded in around the DCP collectives, both combines."""
         for rs_combine in ("0", "1"):
