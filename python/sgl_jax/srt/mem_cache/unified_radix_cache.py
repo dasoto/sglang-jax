@@ -705,7 +705,13 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> tuple[list[np.ndarray], UnifiedTreeNode, int, UnifiedTreeNode, int]:
         node = self.root_node
         node.last_access_time = get_and_increase_time_counter()
-        child_key = self.get_child_key_fn(key)
+        # Walk with an offset into one token list: slicing the RadixKey at every node copied the
+        # rest of the key each time, O(len * depth) -- ~31 ms per walk for a 100K-token prefix
+        # built from 512-token chunks (one node per chunk), twice per cache_unfinished_req.
+        ids = key.token_ids
+        n_ids = len(ids)
+        off = 0
+        child_key = self._child_key_at(key, ids, 0)
 
         value: list[np.ndarray] = []
         best_device_node = node
@@ -751,7 +757,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 best_host_node = candidate
                 best_host_tokens = cur_tokens
 
-        while len(key) > 0 and child_key in node.children:
+        while off < n_ids and child_key in node.children:
             child = node.children[child_key]
 
             # Dead node (evicted and not backed up) ends the walk.
@@ -760,7 +766,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
             child.last_access_time = get_and_increase_time_counter()
             self._refresh_component_lru(child, LRURefreshPhase.WALKDOWN)
-            prefix_len = self.key_match_fn(child.key, key)
+            prefix_len = self._key_match_at(child.key, key, ids, off)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
                 cur_tokens += prefix_len
@@ -775,9 +781,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 value.append(child.component_data[BASE_COMPONENT_TYPE].value)
             node = child
             _update_best_if_valid(node)
-            key = key[prefix_len:]
-            if len(key):
-                child_key = self.get_child_key_fn(key)
+            off += prefix_len
+            if off < n_ids:
+                child_key = self._child_key_at(key, ids, off)
 
         host_hit_length = best_host_tokens - best_device_tokens
         return value, best_device_node, best_value_len, best_host_node, host_hit_length
@@ -822,6 +828,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 best_value_len=best_value_len,
             )
         return result
+
+    def _child_key_at(self, key: RadixKey, ids, off: int):
+        """get_child_key_fn(key[off:]) from a one-page window (no copy of the rest of the key)."""
+        return self.get_child_key_fn(RadixKey(ids[off : off + self.page_size], key.extra_key, key.dp_rank))
+
+    def _key_match_at(self, node_key: RadixKey, key: RadixKey, ids, off: int) -> int:
+        """key_match_fn(node_key, key[off:]), comparing against a window of the rest of the key one
+        page longer than node_key: enough for the same result, since the paged match compares at most
+        min(len) tokens plus a partial last page."""
+        end = off + len(node_key) + self.page_size
+        return self.key_match_fn(node_key, RadixKey(ids[off:end], key.extra_key, key.dp_rank))
 
     def _split_node(self, key: RadixKey, child: UnifiedTreeNode, split_len: int) -> UnifiedTreeNode:
         new_node = UnifiedTreeNode(self.tree_components)
@@ -889,13 +906,17 @@ class UnifiedRadixCache(BasePrefixCache):
         if len(key) == 0:
             return InsertResult(prefix_len=0)
 
-        child_key = self.get_child_key_fn(key)
+        # Offset walk, as in _match_prefix_helper; the key is sliced once, for the new leaf.
+        ids = key.token_ids
+        n_ids = len(ids)
+        off = 0
+        child_key = self._child_key_at(key, ids, 0)
         total_prefix_length = 0
-        while len(key) > 0 and child_key in node.children:
+        while off < n_ids and child_key in node.children:
             node = node.children[child_key]
             node.last_access_time = get_and_increase_time_counter()
             self._refresh_component_lru(node, LRURefreshPhase.WALKDOWN)
-            prefix_len = self.key_match_fn(node.key, key)
+            prefix_len = self._key_match_at(node.key, key, ids, off)
             if prefix_len < len(node.key):
                 node = self._split_node(node.key, node, prefix_len)
 
@@ -947,11 +968,12 @@ class UnifiedRadixCache(BasePrefixCache):
             if self.hicache_enabled:
                 self._inc_hit_count(node)
 
-            key = key[prefix_len:]
+            off += prefix_len
             value = value[prefix_len:]
-            if len(key):
-                child_key = self.get_child_key_fn(key)
+            if off < n_ids:
+                child_key = self._child_key_at(key, ids, off)
 
+        key = key[off:]
         is_new_leaf = False
         target_node = node
         if len(key):
