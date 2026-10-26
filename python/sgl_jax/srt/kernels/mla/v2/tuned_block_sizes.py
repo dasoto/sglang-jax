@@ -54,6 +54,16 @@ _WARNED_MISSES: set[tuple] = set()
 # Schema: see module docstring.
 TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
     "TPU v5": {},
+    "TPU v5e": {
+        # ===== Kimi-K3 on v5e-256 (kv_lora_rank=512, qk_rope_head_dim=64) =====
+        # --dcp-size 32: every chip scores all 96 query heads (gathered) against 1/32 of the
+        # KV pages; mnt = per-group query tokens. Swept with scripts/mla_tune.sh at 32K/96K/192K
+        # global context (local 1K/3K/6K); fallback was (1, 16).
+        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 64): (4, 32),
+        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 128): (4, 32),
+        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 256): (8, 32),
+        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 512): (8, 32),
+    },
     "TPU v6e": {
         # ===== DeepSeek-V3 (kv_lora_rank=512, qk_rope_head_dim=64) =====
         # Deploy: --tp-size 64 --dp-size 8 --page-size 128
