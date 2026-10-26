@@ -54,13 +54,16 @@ MOE_COMPACT_MIN_TOKENS_ENV = "SGLANG_JAX_MOE_COMPACT_MIN_TOKENS"
 # MXFP4EPMoE._forward_local_window): "scatter" (scatter-add, default), "onehot" (a [T, cap] one-hot
 # matmul on the MXU with f32 accumulation, for T <= SGLANG_JAX_MOE_ONEHOT_MAX_TOKENS, else scatter)
 # or "sorted" (rows sorted by token, masked rows dropped, sorted-index scatter-add).
+# Above the one-hot limit, "onehot" falls back to SGLANG_JAX_MOE_LOCAL_COMBINE_LARGE ("scatter" or
+# "sorted", default "scatter").
 MOE_LOCAL_COMBINE_ENV = "SGLANG_JAX_MOE_LOCAL_COMBINE"
+MOE_LOCAL_COMBINE_LARGE_ENV = "SGLANG_JAX_MOE_LOCAL_COMBINE_LARGE"
 MOE_ONEHOT_MAX_TOKENS_ENV = "SGLANG_JAX_MOE_ONEHOT_MAX_TOKENS"
 
 
-def _local_combine_mode() -> str:
-    mode = os.environ.get(MOE_LOCAL_COMBINE_ENV, "scatter").strip().lower()
-    return mode if mode in ("scatter", "onehot", "sorted") else "scatter"
+def _local_combine_mode(env: str = MOE_LOCAL_COMBINE_ENV, allowed=("scatter", "onehot", "sorted")) -> str:
+    mode = os.environ.get(env, "scatter").strip().lower()
+    return mode if mode in allowed else "scatter"
 
 
 def _parse_compact_divisors(value: str) -> tuple[int, ...]:
@@ -154,6 +157,7 @@ class MXFP4EPMoE(EPMoE):
         # path also takes its tensor slice from that all-reduce instead of an extra all-gather.
         self.emit_sumsq = False
         self.local_combine = _local_combine_mode()
+        self.local_combine_large = _local_combine_mode(MOE_LOCAL_COMBINE_LARGE_ENV, ("scatter", "sorted"))
         self.onehot_max_tokens = int(os.environ.get(MOE_ONEHOT_MAX_TOKENS_ENV, "2048"))
         if self.replicate_experts:
             raise NotImplementedError("MXFP4EPMoE does not support moe_dp_size > 1")
@@ -896,7 +900,7 @@ class MXFP4EPMoE(EPMoE):
 
         combine = self.local_combine
         if combine == "onehot" and num_tokens > self.onehot_max_tokens:
-            combine = "scatter"
+            combine = self.local_combine_large
 
         def window(w, acc):
             base = w * cap

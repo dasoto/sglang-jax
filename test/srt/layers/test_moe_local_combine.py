@@ -132,3 +132,26 @@ def test_mode_parsing(monkeypatch):
     assert _local_combine_mode() == "scatter"
     monkeypatch.delenv("SGLANG_JAX_MOE_LOCAL_COMBINE")
     assert _local_combine_mode() == "scatter"
+    monkeypatch.setenv("SGLANG_JAX_MOE_LOCAL_COMBINE_LARGE", "sorted")
+    assert _local_combine_mode("SGLANG_JAX_MOE_LOCAL_COMBINE_LARGE", ("scatter", "sorted")) == "sorted"
+    monkeypatch.setenv("SGLANG_JAX_MOE_LOCAL_COMBINE_LARGE", "onehot")
+    assert _local_combine_mode("SGLANG_JAX_MOE_LOCAL_COMBINE_LARGE", ("scatter", "sorted")) == "scatter"
+
+
+@pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (CPU) devices")
+def test_onehot_falls_back_above_limit():
+    """T above the one-hot limit uses the large-T mode (sorted here) and still matches."""
+    T = 64
+    mesh = _mesh()
+    mask_np = _prefix_mask(T, (32, 32))
+    with jax.set_mesh(mesh):
+        ref, new = _layers(mesh, "onehot", False, 16, True, seed=21)
+        new.onehot_max_tokens = 16  # below T: the fallback runs
+        new.local_combine_large = "sorted"
+        hs, tw, ti, mask = _inputs(mesh, T, mask_np, seed=22)
+        out_ref = jax.jit(lambda a, b, c, m: ref(a, b, c, token_mask=m))(hs, tw, ti, mask)
+        out_new = jax.jit(lambda a, b, c, m: new(a, b, c, token_mask=m))(hs, tw, ti, mask)
+        out_ref = np.asarray(out_ref.astype(jnp.float32))
+        out_new = np.asarray(out_new.astype(jnp.float32))
+    scale = np.abs(out_ref).max()
+    np.testing.assert_allclose(out_new, out_ref, rtol=0, atol=1e-2 * scale)
