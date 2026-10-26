@@ -136,6 +136,64 @@ def _extend_conv(
     bias: jax.Array | None,
     activation_fn: Callable[[jax.Array], jax.Array] | None,
 ) -> tuple[jax.Array, jax.Array]:
+    """Packed varlen causal conv as K row gathers from ``[cache rows; x]``.
+
+    Same result as ``_extend_conv_window`` (the per-token ``[T, D, K]`` window): the K-wide axis
+    there is the minor dimension, which TPU tiles pad to 128 lanes, so its gathers and the
+    reduction over it moved ~32x more data than the values. Here every tap is a ``[T, D]`` row
+    gather from one source array that holds each sequence's ``K-1`` cached rows followed by
+    ``x``; the taps accumulate in f32.
+    """
+    T, D = x.shape
+    B = cache.shape[0]
+    K = conv_kernel.shape[-1]
+    W = K - 1  # cache width
+    idx_dtype = cu_seqlens.dtype
+    dt = jnp.promote_types(x.dtype, cache.dtype)  # what the window path's jnp.where produced
+
+    # Source rows: [B * W cached rows (sequence-major, oldest first); T rows of x].
+    src = jnp.concatenate([jnp.swapaxes(cache, 1, 2).reshape(B * W, D).astype(dt), x.astype(dt)], axis=0)
+
+    token_idx = jnp.arange(T, dtype=idx_dtype)
+    seq_ids = jnp.searchsorted(cu_seqlens[1:], token_idx, side="right")
+    starts = cu_seqlens[:-1][jnp.clip(seq_ids, 0, B - 1)]
+    seq_ids = jnp.clip(seq_ids, 0, B - 1)
+
+    def src_row(pos, seq, start):
+        """Source row of packed position ``pos`` (may precede its sequence start)."""
+        in_x = pos >= start
+        cache_row = seq * W + jnp.clip(W + pos - start, 0, W - 1)
+        return jnp.where(in_x, jnp.clip(pos, 0, T - 1) + B * W, cache_row)
+
+    w = conv_kernel.astype(jnp.float32)
+    y = jnp.zeros((T, D), jnp.float32)
+    for k in range(K):  # tap k reads position t - (K - 1) + k
+        rows = src_row(token_idx - (W - k), seq_ids, starts)
+        y = y + src[rows].astype(jnp.float32) * w[None, :, k]
+    y = y.astype(dt)
+    if bias is not None:
+        y = y + bias.astype(y.dtype)
+    y = _apply_activation(y, activation_fn)
+
+    # New per-sequence cache: the last W input rows of each sequence (older rows from the
+    # prior cache when the sequence is shorter than W).
+    seq = jnp.arange(B, dtype=idx_dtype)
+    ends, begins = cu_seqlens[1:], cu_seqlens[:-1]
+    final_pos = ends[:, None] - W + jnp.arange(W, dtype=idx_dtype)[None, :]  # [B, W]
+    final_rows = src_row(final_pos, seq[:, None], begins[:, None])
+    new_cache = jnp.swapaxes(src[final_rows], 1, 2)  # [B, D, W]
+    return y, new_cache
+
+
+@named_scope("short_conv_extend_window")
+def _extend_conv_window(
+    x: jax.Array,  # [T, D]
+    conv_kernel: jax.Array,  # [D, K]
+    cache: jax.Array,  # [B, D, K-1]
+    cu_seqlens: jax.Array,
+    bias: jax.Array | None,
+    activation_fn: Callable[[jax.Array], jax.Array] | None,
+) -> tuple[jax.Array, jax.Array]:
     T = x.shape[0]
     K = conv_kernel.shape[-1]
     W = K - 1  # cache width

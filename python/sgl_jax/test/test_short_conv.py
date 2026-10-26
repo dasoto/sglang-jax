@@ -453,3 +453,48 @@ class ShortConvolutionBF16Test(ShortConvolutionTest):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestExtendRowGatherMatchesWindow(CustomTestCase):
+    """``_extend_conv`` (K row gathers) against the per-token window formulation."""
+
+    def _check(self, lens, total, x_dtype, cache_dtype, kernel=4, seed=0):
+        from sgl_jax.srt.layers.attention.linear.short_convolution import (
+            _extend_conv,
+            _extend_conv_window,
+        )
+
+        rng = np.random.default_rng(seed)
+        hidden = 256
+        cu = np.concatenate([[0], np.cumsum(lens)]).astype(np.int32)
+        x = jnp.asarray(rng.standard_normal((total, hidden)), x_dtype)
+        cache = jnp.asarray(rng.standard_normal((len(lens), hidden, kernel - 1)), cache_dtype)
+        w = _make_weight(rng, hidden, kernel, jnp.float32)
+        bias = jnp.asarray(rng.standard_normal((hidden,)) * 0.1, jnp.float32)
+        for b, act in ((None, jax.nn.silu), (bias, None)):
+            y0, c0 = _extend_conv_window(x, w, cache, jnp.asarray(cu), b, act)
+            y1, c1 = _extend_conv(x, w, cache, jnp.asarray(cu), b, act)
+            self.assertEqual(y0.dtype, y1.dtype)
+            self.assertEqual(c0.dtype, c1.dtype)
+            self.assertEqual(c0.shape, c1.shape)
+            n = int(cu[-1])  # padding tokens past the last sequence are don't-care
+            tol = 1e-5 if y0.dtype == jnp.float32 else 2e-2
+            np.testing.assert_allclose(
+                np.asarray(y1[:n], np.float32), np.asarray(y0[:n], np.float32), atol=tol, rtol=tol
+            )
+            np.testing.assert_array_equal(np.asarray(c1, np.float32), np.asarray(c0, np.float32))
+
+    def test_ragged_f32(self):
+        self._check([5, 1, 2, 9, 3], 20, jnp.float32, jnp.float32)
+
+    def test_ragged_with_padding_bf16(self):
+        self._check([7, 2, 1, 4], 24, jnp.bfloat16, jnp.bfloat16, seed=1)
+
+    def test_mixed_dtypes(self):
+        self._check([3, 6, 2], 11, jnp.bfloat16, jnp.float32, seed=2)
+
+    def test_single_long_sequence(self):
+        self._check([512], 512, jnp.bfloat16, jnp.float32, seed=3)
+
+    def test_kernel_size_2(self):
+        self._check([1, 4, 3], 8, jnp.float32, jnp.float32, kernel=2, seed=4)
