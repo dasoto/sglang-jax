@@ -178,8 +178,23 @@ class SchedulerMetricsMixin:
             f += f"#prefill per DP: {per_dp_prefill}, #running per DP: {per_dp_running}, "
 
         f += f"#queue-req: {len(self.waiting_queue)}, "
+        f += self._recurrent_pool_msg()
 
         logger.info(f)
+
+    def _recurrent_pool_msg(self: Scheduler) -> str:
+        """Free and evictable recurrent-state slots per DP rank (hybrid linear-attention models), for
+        telling cache misses from evicted recurrent snapshots apart from KV pressure. Logging only."""
+        try:
+            tc = self.tree_cache
+            if tc is None or not tc.supports_recurrent():
+                return ""
+            n = max(1, self.dp_size)
+            free = [self.req_to_token_pool.recurrent_available_size(i) for i in range(n)]
+            evict = [tc.recurrent_evictable_size(i) for i in range(n)]
+            return f"#recurrent free per DP: {free}, #recurrent evictable per DP: {evict}, "
+        except Exception:  # noqa: BLE001 - never let a log line break scheduling
+            return ""
 
     def log_decode_stats(self: Scheduler, running_batch: ScheduleBatch = None):
         batch = running_batch or self.running_batch
@@ -240,6 +255,7 @@ class SchedulerMetricsMixin:
             f"gen throughput (token/s): {self.last_gen_throughput:.2f}, "
             f"#queue-req: {len(self.waiting_queue)}, "
         )
+        msg += self._recurrent_pool_msg()
 
         if batch.cache_miss_count > 0:
             msg += f"#cache_miss: {batch.cache_miss_count}"
