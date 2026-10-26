@@ -48,6 +48,17 @@ def _dcp_rs_combine_enabled() -> bool:
     return os.environ.get(MLA_DCP_RS_COMBINE_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
 
 
+# Reduce-scatter the DCP combine's weighted partial outputs in bf16 instead of f32
+# (SGLANG_JAX_MLA_DCP_RS_BF16=1): every term is a partial output times exp(lse - max) <= 1, the
+# combined output is cast to bf16 right after, and the f32 scatter moved 25 MB per MLA layer
+# per 512-token prefill chunk on v5e-256 (~0.28 ms). The weight sums stay f32.
+MLA_DCP_RS_BF16_ENV = "SGLANG_JAX_MLA_DCP_RS_BF16"
+
+
+def _dcp_rs_bf16_enabled() -> bool:
+    return os.environ.get(MLA_DCP_RS_BF16_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
+
+
 @register_pytree_node_class
 @dataclass
 class MLAAttentionMetadata:
@@ -620,7 +631,10 @@ class MLAAttentionBackend(AttentionBackend):
                 num = jnp.where(
                     w[..., None] > 0.0, o_partial.astype(jnp.float32) * w[..., None], 0.0
                 )
+                if _dcp_rs_bf16_enabled():
+                    num = num.astype(jnp.bfloat16)
                 num = jax.lax.psum_scatter(num, "tensor", scatter_dimension=1, tiled=True)
+                num = num.astype(jnp.float32)
                 den = jax.lax.psum_scatter(w, "tensor", scatter_dimension=1, tiled=True)
                 o_combined = num / jnp.where(den > 0.0, den, 1.0)[..., None]
                 return o_combined.astype(ql_nope_.dtype), cache_updated

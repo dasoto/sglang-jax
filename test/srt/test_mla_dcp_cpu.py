@@ -158,6 +158,41 @@ class TestMLADCPCPU(unittest.TestCase):
             with mock.patch.dict(os.environ, {"SGLANG_JAX_MLA_DCP_RS_COMBINE": rs_combine}):
                 self._check_replicated_absorb(rs_combine)
 
+    def test_rs_combine_bf16_close_to_f32(self):
+        """SGLANG_JAX_MLA_DCP_RS_BF16: the weighted partial outputs reduce-scatter in bf16."""
+        page_size, num_heads, kv_lora_rank, d_k, d_v, rope = 16, 4, 128, 64, 64, 64
+        seq_lens = [35, 16, 20]
+        outs = {}
+        for bf16 in ("0", "1"):
+            env = {"SGLANG_JAX_MLA_DCP_RS_COMBINE": "1", "SGLANG_JAX_MLA_DCP_RS_BF16": bf16}
+            with mock.patch.dict(os.environ, env):
+                rng = np.random.default_rng(11)
+                pool, alloc, backend, layer = self._make_setup(dcp_size=2, page_size=page_size)
+                w_uk = rng.standard_normal((kv_lora_rank, num_heads, d_k), dtype=np.float32) * 0.1
+                w_uv = rng.standard_normal((kv_lora_rank, num_heads, d_v), dtype=np.float32) * 0.1
+                n = sum(seq_lens)
+                q_nope = rng.standard_normal((n, num_heads, d_k), dtype=np.float32) * 0.5
+                q_pe = rng.standard_normal((n, num_heads, rope), dtype=np.float32) * 0.2
+                k_c = rng.standard_normal((n, kv_lora_rank), dtype=np.float32) * 0.2
+                k_pe = rng.standard_normal((n, rope), dtype=np.float32) * 0.2
+                out_loc = alloc.alloc_extend([0, 0, 0], seq_lens, [-1, -1, -1], n)
+                toks, cur = [], 0
+                for sl in seq_lens:
+                    t = list(out_loc[cur : cur + sl])
+                    aligned = ((sl + page_size - 1) // page_size) * page_size
+                    toks.extend(t + [0] * (aligned - sl))
+                    cur += sl
+                cache_loc = np.array(toks, dtype=np.int32)
+                outs[bf16] = self._run_step(
+                    pool, backend, layer, ForwardMode.EXTEND, seq_lens, seq_lens, cache_loc,
+                    out_loc, q_nope, k_c, q_pe, k_pe, absorb_weights=(w_uk, w_uv),
+                )
+        ref, out = outs["0"], outs["1"]
+        scale = float(np.abs(ref).max())
+        self.assertGreater(scale, 0.0)
+        np.testing.assert_allclose(out, ref, rtol=0, atol=1e-2 * scale)
+        self.assertLess(float(np.abs(out - ref).mean()), 3e-3 * float(np.abs(ref).mean()))
+
     def _check_replicated_absorb(self, rs_combine):
         rng = np.random.default_rng(7)
         page_size, num_heads, kv_lora_rank, d_k, d_v, rope = 16, 4, 128, 64, 64, 64
