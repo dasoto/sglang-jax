@@ -322,7 +322,10 @@ class MXFP4EPMoE(EPMoE):
         """Every (padded) token goes through the token gather, the experts and the combine."""
         if rs_blocks is not None:
             # Mesh mode emits each chip's unreduced [dp*tp, T/dp, H/tp] blocks (reduced after).
-            out_specs = P(("expert", "tensor"), None, None, *([None] if self.rs_combine_mesh else []))
+            if self.rs_combine_mesh and self.emit_sumsq:
+                out_specs = P(("expert", "tensor"), None, None)  # unreduced [1, T, H] per chip
+            else:
+                out_specs = P(("expert", "tensor"), None, None, *([None] if self.rs_combine_mesh else []))
             if self.rs_combine_mesh:
                 hidden_states, topk_weights, topk_ids = self._mesh_gather_tokens(
                     hidden_states, rs_blocks, topk_weights, topk_ids
@@ -410,6 +413,10 @@ class MXFP4EPMoE(EPMoE):
         """
         dp, tp = rs_blocks
         t, h = output.shape
+        if self.rs_combine_mesh and self.emit_sumsq:
+            # Unreduced, as computed: _rs_combine_output all-reduces it and slices this chip's
+            # block (no [T, H] -> block-order transpose, ~0.13 ms per layer at T = 4096).
+            return output[None]
         blocks = output.reshape(dp, t // dp, tp, h // tp).transpose(0, 2, 1, 3)
         if self.rs_combine_mesh:
             # Unreduced; _rs_combine_output reduce-scatters it over the model mesh.
@@ -430,14 +437,16 @@ class MXFP4EPMoE(EPMoE):
         """MoE-mesh shard_map output -> [T, H] with P("data", "tensor").
 
         ``result`` is [dp*tp, T/dp, H/tp] reduced blocks, or in mesh mode every chip's
-        unreduced [1, dp*tp, T/dp, H/tp] blocks stacked to [dp*tp, dp*tp, T/dp, H/tp].
+        unreduced [1, dp*tp, T/dp, H/tp] blocks stacked to [dp*tp, dp*tp, T/dp, H/tp] (with
+        ``emit_sumsq``, every chip's unreduced [1, T, H] stacked to [dp*tp, T, H]).
         """
         dp, tp = rs_blocks
         t, h = shape
         if self.rs_combine_mesh:
             # Same devices in the same order on both meshes: this reshard moves no data.
+            spec = (None, None) if self.emit_sumsq else (None, None, None)
             stacked = jax.sharding.reshard(
-                result, NamedSharding(self.mesh, P(("data", "tensor"), None, None, None))
+                result, NamedSharding(self.mesh, P(("data", "tensor"), *spec))
             )
 
             def reduce_blocks(x):  # [1, dp*tp, T/dp, H/tp] partial -> [T/dp, H/tp] reduced
@@ -446,23 +455,24 @@ class MXFP4EPMoE(EPMoE):
                 y = jax.lax.psum_scatter(x, ("data", "tensor"), scatter_dimension=1, tiled=True)
                 return y.reshape(t // dp, h // tp)
 
-            def reduce_blocks_sumsq(x):  # -> (this chip's block, its DP group's row sums of squares)
-                # XLA lowers the reduce-scatter above as this all-reduce plus a slice anyway
-                # (v5e-256, AOT and profiles); keeping the whole result exposes the DP group's
-                # full rows (blocks d*tp .. d*tp+tp-1) for the sums of squares.
-                y = jax.lax.psum(x[0], ("data", "tensor"))  # [dp*tp, T/dp, H/tp]
-                d = jax.lax.axis_index("data")
-                mine = jax.lax.dynamic_index_in_dim(
-                    y, d * tp + jax.lax.axis_index("tensor"), 0, keepdims=False
+            def reduce_rows_sumsq(x):  # [1, T, H] partial -> (this chip's block, row sums of squares)
+                # XLA lowers the reduce-scatter above as an all-reduce plus a slice anyway
+                # (v5e-256, AOT and profiles); the explicit all-reduce of the [T, H] partials
+                # needs no block-order transpose and leaves this DP group's full rows for the
+                # sums of squares.
+                y = jax.lax.psum(x[0], ("data", "tensor"))  # [T, H]
+                rows = jax.lax.dynamic_slice_in_dim(y, jax.lax.axis_index("data") * (t // dp), t // dp, 0)
+                mine = jax.lax.dynamic_slice_in_dim(
+                    rows, jax.lax.axis_index("tensor") * (h // tp), h // tp, 1
                 )
-                g = jax.lax.dynamic_slice_in_dim(y, d * tp, tp, 0).astype(jnp.float32)
-                return mine, jnp.sum(g * g, axis=(0, 2))
+                r32 = rows.astype(jnp.float32)
+                return mine, jnp.sum(r32 * r32, axis=1)
 
             if self.emit_sumsq:
                 return shard_map(
-                    reduce_blocks_sumsq,
+                    reduce_rows_sumsq,
                     mesh=self.mesh,
-                    in_specs=P(("data", "tensor"), None, None, None),
+                    in_specs=P(("data", "tensor"), None, None),
                     out_specs=(P("data", "tensor"), P("data")),
                     check_vma=False,
                 )(stacked)
@@ -706,10 +716,14 @@ class MXFP4EPMoE(EPMoE):
             to_model(jnp.asarray(n_real, jnp.int32), P()),
         )
 
+        natural = self.emit_sumsq  # all-reduce the [c, H] partials as computed (no transpose)
+
         def experts(x, wts, ids, w_gate, w_up, w_down, s_gate, s_up, s_down):
             out = self._forward_local_window(
                 x, wts, ids, w_gate, w_up, w_down, s_gate, s_up, s_down
             )  # [c, H] partial
+            if natural:
+                return out[None]
             # Column (t, d, j) -> block d * tp + t, the model-mesh chip (d, t).
             out = out.reshape(c, tp, dp, bw).transpose(2, 1, 0, 3)
             return out.reshape(1, dp * tp, c, bw)
@@ -719,7 +733,7 @@ class MXFP4EPMoE(EPMoE):
                 experts,
                 mesh=self.moe_mesh,
                 in_specs=(P(None), P(None), P(None), _WI_SPEC, _WI_SPEC, _WO_SPEC, _WI_SPEC, _WI_SPEC, _WO_SPEC),
-                out_specs=P(("expert", "tensor"), None, None, None),
+                out_specs=P(("expert", "tensor"), None, None, *([] if natural else [None])),
                 check_vma=False,
             )(
                 jax.sharding.reshard(xc, P(None)),
@@ -733,7 +747,7 @@ class MXFP4EPMoE(EPMoE):
                 self.w2_weight_scale.value,
             )
         # Same devices in the same order on both meshes: this reshard moves no data.
-        blocks = to_model(blocks, P(("data", "tensor"), None, None, None))
+        blocks = to_model(blocks, P(("data", "tensor"), None, None, *([] if natural else [None])))
 
         def combine(x, p):  # [1, dp*tp, c, bw] partial, [T/dp] compact rows (-1 = padding)
             y = jax.lax.psum_scatter(x, ("data", "tensor"), scatter_dimension=1, tiled=True)
@@ -742,17 +756,14 @@ class MXFP4EPMoE(EPMoE):
             rows = y[jnp.clip(p, 0, c - 1)]
             return jnp.where((p >= 0)[:, None], rows, jnp.zeros_like(rows))
 
-        def combine_sumsq(x, p):  # -> (as combine, row sums of squares [T/dp])
-            # The all-reduce XLA runs for the reduce-scatter above leaves every block on every
-            # chip: take this chip's tensor slice (blocks (d, t), all d) without the all-gather,
-            # and the full rows' sums of squares.
-            y_all = jax.lax.psum(x[0], ("data", "tensor"))  # [dp*tp, c, bw]
-            mine = jax.lax.dynamic_index_in_dim(
-                y_all.reshape(dp, tp, c, bw), jax.lax.axis_index("tensor"), 1, keepdims=False
-            )  # [dp, c, bw]
-            y = mine.transpose(1, 0, 2).reshape(c, hl)
+        def combine_sumsq(x, p):  # [1, c, H] partial -> (as combine, row sums of squares [T/dp])
+            # The all-reduce XLA runs for the reduce-scatter above anyway, on the [c, H] partials
+            # as computed: this chip's tensor slice is a column slice (no transpose, no
+            # all-gather), and the full rows give the sums of squares.
+            y_all = jax.lax.psum(x[0], ("data", "tensor"))  # [c, H]
+            y = jax.lax.dynamic_slice_in_dim(y_all, jax.lax.axis_index("tensor") * hl, hl, 1)
             y32 = y_all.astype(jnp.float32)
-            ss = jnp.sum(y32 * y32, axis=(0, 2))  # [c]
+            ss = jnp.sum(y32 * y32, axis=1)  # [c]
             q = jnp.clip(p, 0, c - 1)
             real = p >= 0
             return (
@@ -764,7 +775,7 @@ class MXFP4EPMoE(EPMoE):
             return shard_map(
                 combine_sumsq,
                 mesh=self.mesh,
-                in_specs=(P(("data", "tensor"), None, None, None), P("data")),
+                in_specs=(P(("data", "tensor"), None, None), P("data")),
                 out_specs=(P("data", "tensor"), P("data")),
                 check_vma=False,
             )(blocks, pos)
