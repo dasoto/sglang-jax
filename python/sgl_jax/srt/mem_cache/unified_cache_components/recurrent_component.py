@@ -85,6 +85,19 @@ class RecurrentComponent(TreeComponent):
         self.evict_decode_leaf_first = os.environ.get(
             "SGLANG_JAX_RECURRENT_EVICT_DECODE_LEAF_FIRST", "0"
         ).strip().lower() in ("1", "true", "yes", "on")
+        # Evict superseded prompt-tail checkpoints first. Every turn of a multi-turn
+        # session retains the checkpoints at its prompt tail; the next turn extends that
+        # prompt, so the older checkpoints become unary interior nodes on the session's
+        # own path, more than prompt_tail_window tokens above its newest prompt end. They
+        # are refreshed by every later match along the path, so plain LRU keeps all of
+        # them (4 per turn) and evicts idle sessions' newest snapshots instead: at 64
+        # AgentX sessions the slot pool filled with such checkpoints and the prefill cache
+        # hit fell to ~48%. With this on, finishing a request marks its path's older
+        # unary checkpoints superseded and the evictor takes them before anything else.
+        # Branch points (>= 2 children) are never marked.
+        self.evict_superseded_first = os.environ.get(
+            "SGLANG_JAX_RECURRENT_EVICT_SUPERSEDED_FIRST", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
 
     # ---- matching -----------------------------------------------------------
 
@@ -142,6 +155,8 @@ class RecurrentComponent(TreeComponent):
         last_node = getattr(req, "last_node", None)
         if is_finished:
             self._retain_checkpoint(last_node)
+            if self.evict_superseded_first:
+                self._mark_superseded_ancestors(last_node)
             return
         if self.prompt_tail_window <= 0 or last_node is None:
             return
@@ -152,6 +167,29 @@ class RecurrentComponent(TreeComponent):
         target_len = len(origin_input_ids) + len(getattr(req, "output_ids", None) or ())
         if target_len - len(fill_ids) < self.prompt_tail_window:
             self._retain_checkpoint(last_node)
+
+    def _mark_superseded_ancestors(self, node: UnifiedTreeNode | None) -> None:
+        """Mark retained unary checkpoints above ``node`` (a request's prompt-end
+        checkpoint) that lie more than ``prompt_tail_window`` tokens above it as
+        superseded: earlier turns' prompt-tail checkpoints on this session's path.
+        They stay matchable until evicted; drive_eviction takes them first."""
+        if node is None or node is self.cache.root_node:
+            return
+        ct = self.component_type
+        dist = 0
+        child, cur = node, node.parent
+        while cur is not None and cur is not self.cache.root_node:
+            dist += len(child.key) if child.key is not None else 0
+            cd = cur.component_data[ct]
+            if (
+                dist > self.prompt_tail_window
+                and cd.value is not None
+                and cd.lock_ref == 0
+                and len(cur.children) == 1
+                and getattr(cur, "_recurrent_branch_retained", False)
+            ):
+                cur._recurrent_superseded = True
+            child, cur = cur, cur.parent
 
     def redistribute_on_node_split(self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode):
         ct = self.component_type
@@ -167,6 +205,8 @@ class RecurrentComponent(TreeComponent):
         cd = node.component_data[self.component_type]
         if len(node.children) >= 2 or getattr(node, "_recurrent_branch_retained", False):
             node._recurrent_branch_retained = True
+            if len(node.children) >= 2:
+                node._recurrent_superseded = False
             return
         if cd.value is None or cd.lock_ref > 0:
             return
@@ -320,6 +360,7 @@ class RecurrentComponent(TreeComponent):
             cd.value = None
             node._recurrent_branch_retained = False
             node._recurrent_decode_leaf = False
+            node._recurrent_superseded = False
             freed = 1
         return freed, 0
 
@@ -336,11 +377,15 @@ class RecurrentComponent(TreeComponent):
             ct, self.cache.evictable_device_leaves
         )
         decode_first = self.evict_decode_leaf_first
+        superseded_first = self.evict_superseded_first
 
         def entry(node):
-            # (0, node) for decode leaves when enabled, else (1, node); ties use the
-            # node's LRU order.
-            return (0 if decode_first and getattr(node, "_recurrent_decode_leaf", False) else 1, node)
+            # (0, node) for superseded checkpoints and (when enabled) decode leaves,
+            # else (1, node); ties use the node's LRU order.
+            first = (decode_first and getattr(node, "_recurrent_decode_leaf", False)) or (
+                superseded_first and getattr(node, "_recurrent_superseded", False)
+            )
+            return (0 if first else 1, node)
 
         heap = [
             entry(x)
