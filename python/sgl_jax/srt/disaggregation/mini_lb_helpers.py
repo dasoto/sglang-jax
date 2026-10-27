@@ -16,7 +16,9 @@ def maybe_wrap_ipv6_address(address: str) -> str:
 
 
 def generate_bootstrap_room() -> int:
-    return random.randint(0, 2**63 - 1)
+    # Keep within 31-bit signed int32 range so JAX collectives with x64 disabled
+    # never truncate or flip the sign bit of bootstrap_room.
+    return random.randint(0, 2**31 - 1)
 
 
 def get_request_batch_size(request: dict[str, Any]) -> int | None:
