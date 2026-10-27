@@ -237,11 +237,13 @@ class JaxTransferKVManager(CommonKVManager):
         receiver = self.create_receiver(context.req_id)
         try:
             peer = context.peer_info
+            raw_specs = context.spec_factory()
+            specs = raw_specs if isinstance(raw_specs, dict) else {"kv": raw_specs}
             receiver.init(
                 PMetadata(
                     remote_addr=f"{peer['host']}:{peer['transfer_port']}",
                     uuid=context.transfer_id,
-                    specs={"kv": context.spec_factory()},
+                    specs=specs,
                     p_side_channel_host=str(peer["host"]),
                     p_side_channel_port=int(peer["side_channel_port"]),
                 )
@@ -592,7 +594,11 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
     def commit(self, install: Callable[[object], None]) -> None:
         if self.state != KVPoll.SUCCESS or self._results is None:
             raise RuntimeError("cannot commit an incomplete JAX transfer")
-        install(self._results["kv"])
+        install(
+            self._results["kv"]
+            if tuple(self._results.keys()) == ("kv",)
+            else self._results
+        )
 
     def abort(self) -> None:
         self.fail(reason="abort")

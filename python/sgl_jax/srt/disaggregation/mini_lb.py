@@ -60,6 +60,8 @@ class MiniLoadBalancer:
         self.prefill_dp_size = None
         self.decode_dp_size = None
         self.max_concurrent_requests = getattr(router_args, "max_concurrent_requests", None)
+        self._sticky_dp_map: dict[str, int] = {}
+        self._rr_counter: int = 0
 
     def _validate_router_args(self, router_args) -> None:
         if getattr(router_args, "policy", "random") != "random":
@@ -145,6 +147,32 @@ class MiniLoadBalancer:
             if not 0 <= forced < p_size:
                 raise ValueError(f"SGLANG_JAX_PD_FORCE_DP_RANK={forced} is outside [0, {p_size})")
             dp_rank = forced
+        elif os.getenv("SGLANG_JAX_PD_STICKY_DP", "0") == "1" and not isinstance(
+            request.get("bootstrap_room"), list
+        ):
+            msgs = request.get("messages")
+            sticky_key = None
+            if isinstance(msgs, list) and msgs:
+                head = msgs[:2] if len(msgs) >= 2 else msgs[:1]
+                sticky_key = repr(
+                    [
+                        (m.get("role"), m.get("content"))
+                        for m in head
+                        if isinstance(m, dict)
+                    ]
+                )
+            if sticky_key is not None and sticky_key in self._sticky_dp_map:
+                dp_rank = self._sticky_dp_map[sticky_key]
+            else:
+                dp_rank = self._rr_counter % p_size
+                self._rr_counter += 1
+                if sticky_key is not None:
+                    if len(self._sticky_dp_map) >= 4096:
+                        self._sticky_dp_map.pop(next(iter(self._sticky_dp_map)))
+                    self._sticky_dp_map[sticky_key] = dp_rank
+            room = int(request["bootstrap_room"])
+            request = request.copy()
+            request["bootstrap_room"] = (room // p_size) * p_size + dp_rank
         else:
             dp_rank = self._room_rank(request["bootstrap_room"], p_size)
 
@@ -342,6 +370,9 @@ try:
     async def flush_cache():
         import aiohttp
 
+        if lb is not None:
+            lb._sticky_dp_map.clear()
+            lb._rr_counter = 0
         async with aiohttp.ClientSession() as session:
             tasks = []
             for server in chain(lb.prefill_urls, lb.decode_urls):

@@ -249,8 +249,12 @@ class HybridReqToTokenPool(ReqToTokenPool):
         # dp_rank from reqs[0]: callers (prepare_for_extend/decode) iterate per-DP,
         # so all reqs in a single alloc() call share the same dp_rank.
         dp_rank = reqs[0].dp_rank if reqs and reqs[0].dp_rank is not None else 0
-        per_req = self.request_owned_slots
-        needed = per_req * sum(1 for r in reqs if r.recurrent_pool_idx is None)
+        needed = 0
+        for r in reqs:
+            if r.recurrent_pool_idx is None:
+                needed += self.request_owned_slots
+            elif self.enable_recurrent_extra_buffer and r.recurrent_ping_pong_track_buffer is None:
+                needed += self.ping_pong_slots
         if needed > len(self.recurrent_free_slots[dp_rank]):
             return None
 
@@ -262,9 +266,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
             if r.recurrent_pool_idx is None:
                 slot = self.alloc_recurrent_slot(dp_rank)
                 r.recurrent_pool_idx = slot
-                self.req_index_to_recurrent_index_mapping[r.req_pool_idx] = slot
-                if self.enable_recurrent_extra_buffer:
-                    self._alloc_ping_pong_buffer(r, dp_rank)
+            self.req_index_to_recurrent_index_mapping[r.req_pool_idx] = r.recurrent_pool_idx
+            if self.enable_recurrent_extra_buffer and r.recurrent_ping_pong_track_buffer is None:
+                self._alloc_ping_pong_buffer(r, dp_rank)
 
         return result
 
@@ -360,7 +364,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         dp_rank = req.dp_rank if req.dp_rank is not None else 0
         if recurrent_idx is not None:
             self.free_recurrent_slot(recurrent_idx, dp_rank)
-            self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = 0
+            if req.req_pool_idx is not None:
+                self.req_index_to_recurrent_index_mapping[req.req_pool_idx] = 0
             req.recurrent_pool_idx = None
         # Return every request-owned track slot (slot 0/None are never owned).
         track = getattr(req, "recurrent_ping_pong_track_buffer", None)
@@ -368,7 +373,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
             for slot in track:
                 if slot:
                     self.free_recurrent_slot(slot, dp_rank)
-            self.req_index_to_recurrent_ping_pong_track_buffer_mapping[req.req_pool_idx] = 0
+            if req.req_pool_idx is not None:
+                self.req_index_to_recurrent_ping_pong_track_buffer_mapping[req.req_pool_idx] = 0
             req.recurrent_ping_pong_track_buffer = None
             req.recurrent_next_track_idx = None
             req.recurrent_last_track_seqlen = None
@@ -1402,6 +1408,19 @@ def write_kv_layer(
     )
 
 
+@partial(jax.jit, donate_argnames=("kv_cache",))
+def write_mla_kv_layer(
+    layer_kv: jax.Array,
+    dst_global_page_indices: jax.Array,
+    kv_cache: jax.Array,
+) -> jax.Array:
+    """In-place page-level scatter into a single layer's MLA KV cache buffer.
+
+    Out-of-bounds indices (e.g. ``total_pages`` padding) are ignored via ``mode='drop'``.
+    """
+    return kv_cache.at[dst_global_page_indices].set(layer_kv, mode="drop")
+
+
 def update_fused_kv_cache(
     fused_kv: jax.Array,  # [tokens, 1, heads*2//packing, packing, head_dim]
     loc: jax.Array,  # [total_tokens], -1 for padding
@@ -2001,6 +2020,14 @@ class HybridLinearKVPool(KVCache):
         self.kv_sharding = self.full_kv_pool.kv_sharding
         self.dp_size = getattr(self.full_kv_pool, "dp_size", 1)
         self.dcp_size = getattr(self.full_kv_pool, "dcp_size", 1)
+        self.kv_partition_axis = getattr(self.full_kv_pool, "kv_partition_axis", "tensor")
+        self.attention_data_partition_axis = getattr(
+            self.full_kv_pool, "attention_data_partition_axis", "data"
+        )
+
+    @property
+    def kv_buffer(self):
+        return self.full_kv_pool.kv_buffer
 
     def _to_physical(self, layer_id: int) -> int:
         if layer_id not in self.full_attention_layer_id_mapping:

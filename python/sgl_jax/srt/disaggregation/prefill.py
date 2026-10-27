@@ -62,14 +62,46 @@ def _batch_reqs(batch) -> tuple[Req, ...]:
 _KV_GATHER_PAGE_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
 
 
-def _pad_to_page_bucket(num_pages: int) -> int:
+def _pad_to_page_bucket(num_pages: int, *, min_pages: int = 1) -> int:
+    target = max(int(num_pages), int(min_pages))
     for b in _KV_GATHER_PAGE_BUCKETS:
-        if b >= num_pages:
+        if b >= target and (min_pages <= 1 or b % min_pages == 0):
             return b
     # Beyond the largest predefined bucket: round up to a multiple of it so we
     # never truncate KV, while keeping the set of compiled shapes bounded.
     largest = _KV_GATHER_PAGE_BUCKETS[-1]
-    return ((num_pages + largest - 1) // largest) * largest
+    step = max(largest, int(min_pages))
+    return ((target + step - 1) // step) * step
+
+
+def _is_mla_kv_pool(kv_pool) -> bool:
+    from sgl_jax.srt.mem_cache.memory_pool import MLATokenToKVPool
+
+    inner = getattr(kv_pool, "full_kv_pool", kv_pool)
+    return isinstance(inner, MLATokenToKVPool)
+
+
+def _mla_kv_transfer_shardings(
+    kv_pool, padded_pages: int
+) -> tuple[jax.sharding.NamedSharding, jax.sharding.NamedSharding]:
+    from jax.sharding import NamedSharding as _NamedSharding
+    from jax.sharding import PartitionSpec as _P
+
+    mesh = kv_pool.mesh
+    dp_size = mesh.shape.get("data", 1)
+    tp_size = mesh.shape.get("tensor", 1)
+    per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
+    page_axis = "data" if (dp_size > 1 and padded_pages % dp_size == 0) else None
+    s1_axis = None
+    s3_axis = None
+    if tp_size > 1:
+        if len(per_layer_tail) >= 1 and per_layer_tail[0] % tp_size == 0:
+            s1_axis = "tensor"
+        elif len(per_layer_tail) >= 3 and per_layer_tail[2] % tp_size == 0:
+            s3_axis = "tensor"
+    layer_pspec = _P(page_axis, s1_axis, None, s3_axis)
+    stacked_pspec = _P(None, page_axis, s1_axis, None, s3_axis)
+    return _NamedSharding(mesh, layer_pspec), _NamedSharding(mesh, stacked_pspec)
 
 
 def _globalize_rank_local_page_ids(
@@ -78,29 +110,45 @@ def _globalize_rank_local_page_ids(
     dp_rank: int,
     dp_size: int,
     total_pages: int,
+    dcp_size: int = 1,
 ):
-    """Preserve each DP shard's padding page when indexing the global page axis."""
+    """Preserve each DP (and DCP) shard's padding page when indexing the global page axis."""
 
     import numpy as np
 
     ids = np.asarray(page_ids)
     dp_rank = int(dp_rank)
     dp_size = int(dp_size)
+    dcp_size = int(dcp_size)
     total_pages = int(total_pages)
     if dp_size <= 0:
         raise ValueError(f"dp_size must be positive, got {dp_size}")
+    if dcp_size <= 0:
+        raise ValueError(f"dcp_size must be positive, got {dcp_size}")
     if not 0 <= dp_rank < dp_size:
         raise ValueError(f"dp_rank={dp_rank} is outside [0, {dp_size})")
-    if total_pages <= 0 or total_pages % dp_size:
+    if total_pages <= 0 or total_pages % (dp_size * dcp_size):
         raise ValueError(
             f"global KV page count {total_pages} is not divisible by dp_size={dp_size}"
+            + (f" * dcp_size={dcp_size}" if dcp_size > 1 else "")
         )
-    pages_per_rank = total_pages // dp_size
-    if np.any(ids < 0) or np.any(ids >= pages_per_rank):
+    if dcp_size == 1:
+        pages_per_rank = total_pages // dp_size
+        if np.any(ids < 0) or np.any(ids >= pages_per_rank):
+            raise ValueError(
+                f"rank-local KV page IDs must be in [0, {pages_per_rank}); got {ids.tolist()}"
+            )
+        return ids + dp_rank * pages_per_rank
+
+    local_num_pages = total_pages // (dp_size * dcp_size)
+    max_logical_page = (local_num_pages - 1) * dcp_size + 1
+    if np.any(ids < 0) or np.any(ids >= max_logical_page):
         raise ValueError(
-            f"rank-local KV page IDs must be in [0, {pages_per_rank}); got {ids.tolist()}"
+            f"rank-local DCP KV page IDs must be in [0, {max_logical_page}); got {ids.tolist()}"
         )
-    return ids + dp_rank * pages_per_rank
+    owner_dcp = np.where(ids > 0, (ids - 1) % dcp_size, 0)
+    local_page = np.where(ids > 0, ((ids - 1) // dcp_size) + 1, 0)
+    return (dp_rank * dcp_size + owner_dcp) * local_num_pages + local_page
 
 
 @partial(jax.jit, static_argnames=("out_sharding",))
@@ -110,6 +158,10 @@ def _jit_gather_one_layer(buf, page_indices, out_sharding):
     Gathered per layer to cap the XLA compile-time HBM footprint (~1.2 GB
     per layer regardless of layer count).
     """
+    if out_sharding is not None and any(
+        t == jax.sharding.AxisType.Auto for t in out_sharding.mesh.axis_types
+    ):
+        return jax.lax.with_sharding_constraint(buf.at[page_indices].get(), out_sharding)
     return buf.at[page_indices].get(out_sharding=out_sharding)
 
 
@@ -121,10 +173,57 @@ def _jit_gather_all_layers(buffers, page_indices, out_sharding):
     return [_jit_gather_one_layer(buf, page_indices, out_sharding) for buf in buffers]
 
 
+def _shard_shape_for_global(
+    gshape: tuple[int, ...], gsharding: jax.sharding.NamedSharding
+) -> tuple[int, ...]:
+    import math as _math
+
+    mesh = gsharding.mesh
+    gspec = gsharding.spec
+    out = []
+    for i, dim in enumerate(gshape):
+        axis = gspec[i] if i < len(gspec) else None
+        if axis is None:
+            factor = 1
+        elif isinstance(axis, tuple):
+            factor = _math.prod(mesh.shape[a] for a in axis)
+        else:
+            factor = mesh.shape[axis]
+        out.append(dim // factor)
+    return tuple(out)
+
+
+def local_spec_for_global(
+    gshape: tuple[int, ...],
+    dtype,
+    gsharding: jax.sharding.NamedSharding,
+) -> jax.ShapeDtypeStruct:
+    """Build the local-mesh ShapeDtypeStruct for a globally-sharded array."""
+    import numpy as _np
+    from jax.sharding import Mesh as _Mesh
+    from jax.sharding import NamedSharding as _NamedSharding
+    from jax.sharding import PartitionSpec as _P
+
+    gspec = gsharding.spec
+    sharded_dims = [i for i, s in enumerate(gspec) if s is not None]
+    ldev = jax.local_devices()
+    lmesh = _Mesh(_np.asarray(ldev), ("_local",))
+    if len(sharded_dims) == 1 and not isinstance(gspec[sharded_dims[0]], tuple):
+        sd = sharded_dims[0]
+        nproc = jax.process_count()
+        lshape = tuple(gshape[i] // nproc if i == sd else gshape[i] for i in range(len(gshape)))
+        lspec = _P(*("_local" if i == sd else None for i in range(len(gshape))))
+        return jax.ShapeDtypeStruct(lshape, dtype, sharding=_NamedSharding(lmesh, lspec))
+
+    shard_shape = _shard_shape_for_global(gshape, gsharding)
+    lshape = (len(ldev), *shard_shape)
+    lspec = _P("_local", *(None for _ in shard_shape))
+    return jax.ShapeDtypeStruct(lshape, dtype, sharding=_NamedSharding(lmesh, lspec))
+
+
 def _global_to_local_shard(arr: jax.Array) -> jax.Array:
     """View this host's addressable shards of a globally-sharded ``arr`` as a
-    fully-addressable array on a 1-D local mesh. Assumes ``arr`` is sharded
-    along exactly one dimension (the KV head axis). Zero-copy.
+    fully-addressable array on a 1-D local mesh.
     """
     import numpy as _np
     from jax.sharding import Mesh as _Mesh
@@ -133,42 +232,87 @@ def _global_to_local_shard(arr: jax.Array) -> jax.Array:
 
     spec = arr.sharding.spec
     sharded_dims = [i for i, s in enumerate(spec) if s is not None]
-    if len(sharded_dims) != 1:
-        raise ValueError(f"_global_to_local_shard expects exactly one sharded dim, got spec={spec}")
-    sd = sharded_dims[0]
     ldev = jax.local_devices()
-    shards = [s.data for s in arr.addressable_shards]
-    lshape = tuple(
-        shards[0].shape[i] * len(ldev) if i == sd else shards[0].shape[i] for i in range(arr.ndim)
-    )
     lmesh = _Mesh(_np.asarray(ldev), ("_local",))
-    lspec = _P(*("_local" if i == sd else None for i in range(arr.ndim)))
-    return jax.make_array_from_single_device_arrays(lshape, _NamedSharding(lmesh, lspec), shards)
+    if len(sharded_dims) == 1 and not isinstance(spec[sharded_dims[0]], tuple):
+        sd = sharded_dims[0]
+        shards = [s.data for s in arr.addressable_shards]
+        lshape = tuple(
+            shards[0].shape[i] * len(ldev) if i == sd else shards[0].shape[i]
+            for i in range(arr.ndim)
+        )
+        lspec = _P(*("_local" if i == sd else None for i in range(arr.ndim)))
+        return jax.make_array_from_single_device_arrays(
+            lshape, _NamedSharding(lmesh, lspec), shards
+        )
+
+    packed_shards = [jnp.expand_dims(s.data, axis=0) for s in arr.addressable_shards]
+    shard_shape = arr.addressable_shards[0].data.shape
+    lshape = (len(ldev), *shard_shape)
+    lspec = _P("_local", *(None for _ in shard_shape))
+    return jax.make_array_from_single_device_arrays(
+        lshape, _NamedSharding(lmesh, lspec), packed_shards
+    )
+
+
+def _local_to_global_shard(
+    local_arr: jax.Array,
+    gshape: tuple[int, ...],
+    gsharding: jax.sharding.NamedSharding,
+) -> jax.Array:
+    """Assemble a local-mesh pulled array into ``gsharding`` on the global mesh."""
+    gspec = gsharding.spec
+    sharded_dims = [i for i, s in enumerate(gspec) if s is not None]
+    if len(sharded_dims) == 1 and not isinstance(gspec[sharded_dims[0]], tuple):
+        shards = [s.data for s in local_arr.addressable_shards]
+    else:
+        shards = [jnp.squeeze(s.data, axis=0) for s in local_arr.addressable_shards]
+    return jax.make_array_from_single_device_arrays(gshape, gsharding, shards)
+
+
+def _make_local_scalar_int32(val: int) -> jax.Array:
+    import numpy as _np
+    from jax.sharding import Mesh as _Mesh
+    from jax.sharding import NamedSharding as _NamedSharding
+    from jax.sharding import PartitionSpec as _P
+
+    ldev = jax.local_devices()
+    lmesh = _Mesh(_np.asarray(ldev), ("_local",))
+    host_val = jnp.asarray([int(val)], dtype=jnp.int32)
+    shards = [jax.device_put(host_val, d) for d in ldev]
+    return jax.make_array_from_single_device_arrays(
+        (len(ldev),), _NamedSharding(lmesh, _P("_local")), shards
+    )
+
+
+def _local_scalar_int32_spec() -> jax.ShapeDtypeStruct:
+    import numpy as _np
+    from jax.sharding import Mesh as _Mesh
+    from jax.sharding import NamedSharding as _NamedSharding
+    from jax.sharding import PartitionSpec as _P
+
+    ldev = jax.local_devices()
+    lmesh = _Mesh(_np.asarray(ldev), ("_local",))
+    return jax.ShapeDtypeStruct((len(ldev),), jnp.int32, sharding=_NamedSharding(lmesh, _P("_local")))
 
 
 def local_kv_spec_for_pool(kv_pool, layer_num: int, padded_pages: int) -> jax.ShapeDtypeStruct:
     """Build the ShapeDtypeStruct that D should pull on a multi-host process:
     this host's 1/nproc slice of the stacked KV, on a 1-D local mesh.
     """
-    import numpy as _np
-    from jax.sharding import Mesh as _Mesh
     from jax.sharding import NamedSharding as _NamedSharding
     from jax.sharding import PartitionSpec as _P
 
-    pool_pspec = kv_pool.kv_sharding.spec
     per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
     gshape = (layer_num, padded_pages) + per_layer_tail
-    gspec = (None, None) + tuple(pool_pspec[1:])
-    sharded_dims = [i for i, s in enumerate(gspec) if s is not None]
-    if len(sharded_dims) != 1:
-        raise ValueError(f"expected one sharded dim in KV spec, got {gspec}")
-    sd = sharded_dims[0]
-    ldev = jax.local_devices()
-    nproc = jax.process_count()
-    lshape = tuple(gshape[i] // nproc if i == sd else gshape[i] for i in range(len(gshape)))
-    lmesh = _Mesh(_np.asarray(ldev), ("_local",))
-    lspec = _P(*("_local" if i == sd else None for i in range(len(gshape))))
-    return jax.ShapeDtypeStruct(lshape, kv_pool.dtype, sharding=_NamedSharding(lmesh, lspec))
+    if _is_mla_kv_pool(kv_pool):
+        _, stacked_sharding = _mla_kv_transfer_shardings(kv_pool, padded_pages)
+        return local_spec_for_global(gshape, kv_pool.dtype, stacked_sharding)
+    pool_pspec = kv_pool.kv_sharding.spec
+    gspec = _P(None, None, *pool_pspec[1:])
+    return local_spec_for_global(
+        gshape, kv_pool.dtype, _NamedSharding(kv_pool.mesh, gspec)
+    )
 
 
 @dataclass
@@ -439,6 +583,17 @@ class SchedulerDisaggregationPrefillMixin:
         for req in pd_reqs:
             self._pd_mark_time(req, "forward_done")
 
+        for info in getattr(batch, "reqs_info", None) or ():
+            if info.reqs and getattr(info, "output_ids", None) is not None:
+                for r_obj, tok_id in zip(info.reqs, info.output_ids):
+                    r_obj._pd_first_token_id = int(tok_id)
+        if (
+            getattr(batch, "reqs_info", None) is None
+            and getattr(result, "next_token_ids", None) is not None
+        ):
+            for r_obj, tok_id in zip(batch_reqs, result.next_token_ids):
+                r_obj._pd_first_token_id = int(tok_id)
+
         self.set_next_batch_sampling_info_done(batch)
 
         chunked_now = tuple(r for r in getattr(self, "chunked_reqs", ()) if r is not None)
@@ -533,7 +688,7 @@ class SchedulerDisaggregationPrefillMixin:
                         bootstrap_room=req.bootstrap_room,
                         dp_rank=int(req.dp_rank),
                         buffer_id=req.disagg_host_buffer_id,
-                        payload_factory=lambda req_obj=req: {"kv": self._extract_req_kv(req_obj)},
+                        payload_factory=lambda req_obj=req: self._build_prefill_payload(req_obj),
                         block_ids_factory=lambda req_obj=req, snap=snapshot: (
                             list(snap.block_ids) if snap else self._extract_req_block_ids(req_obj)
                         ),
@@ -778,6 +933,35 @@ class SchedulerDisaggregationPrefillMixin:
         if pending is not None and pending[dp_rank] is req:
             pending[dp_rank] = None
 
+    def _build_prefill_payload(self: Scheduler, req: Req) -> dict[str, object]:
+        from jax.sharding import NamedSharding as _NamedSharding
+        from jax.sharding import PartitionSpec as _P
+        from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
+
+        payload: dict[str, object] = {"kv": self._extract_req_kv(req)}
+        rpool = getattr(getattr(self, "req_to_token_pool", None), "recurrent_state_pool", None)
+        if (
+            isinstance(rpool, RecurrentStatePool)
+            and getattr(req, "recurrent_pool_idx", None) is not None
+        ):
+            dp_rank = int(getattr(req, "dp_rank", 0) or 0)
+            kda_temporal, kda_conv = rpool.extract_slot(dp_rank, int(req.recurrent_pool_idx))
+            first_tok_id = int(getattr(req, "_pd_first_token_id", 0) or 0)
+            if jax.process_count() > 1:
+                kda_temporal.block_until_ready()
+                kda_conv.block_until_ready()
+                payload["kda_temporal"] = _global_to_local_shard(kda_temporal)
+                payload["kda_conv"] = _global_to_local_shard(kda_conv)
+                payload["first_token"] = _make_local_scalar_int32(first_tok_id)
+            else:
+                payload["kda_temporal"] = kda_temporal
+                payload["kda_conv"] = kda_conv
+                payload["first_token"] = jax.device_put(
+                    jnp.asarray([first_tok_id], dtype=jnp.int32),
+                    _NamedSharding(rpool.mesh, _P(None)),
+                )
+        return payload
+
     def _extract_req_kv(self: Scheduler, req: Req):
         """Gather prefilled KV from the paged pool for ``req``.
 
@@ -796,7 +980,9 @@ class SchedulerDisaggregationPrefillMixin:
         page_size = kv_pool.page_size
         seqlen = len(req.origin_input_ids)
         num_pages = (seqlen + page_size - 1) // page_size
-        padded_pages = _pad_to_page_bucket(num_pages)
+        is_mla = _is_mla_kv_pool(kv_pool)
+        min_pages = int(getattr(kv_pool, "dp_size", 1)) if is_mla else 1
+        padded_pages = _pad_to_page_bucket(num_pages, min_pages=min_pages)
         # Only the first num_pages slots of req_to_token are written for this
         # req; the bucket-padding region holds whatever the previous occupant
         # left. Slice the real pages and zero-pad so device_put's cross-process
@@ -814,13 +1000,16 @@ class SchedulerDisaggregationPrefillMixin:
             page_ids = _np.concatenate(
                 [page_ids, _np.zeros(padded_pages - num_pages, dtype=page_ids.dtype)]
             )
-        layer_buffers = [
-            kv_pool.get_kv_buffer(layer_id)
-            for layer_id in range(
-                kv_pool.start_layer,
-                kv_pool.start_layer + kv_pool.layer_num,
-            )
-        ]
+        if is_mla:
+            layer_buffers = list(kv_pool.kv_buffer)
+        else:
+            layer_buffers = [
+                kv_pool.get_kv_buffer(layer_id)
+                for layer_id in range(
+                    kv_pool.start_layer,
+                    kv_pool.start_layer + kv_pool.layer_num,
+                )
+            ]
         if not layer_buffers:
             raise ValueError("cannot gather debug KV from an empty layer range")
         page_ids = _globalize_rank_local_page_ids(
@@ -828,13 +1017,17 @@ class SchedulerDisaggregationPrefillMixin:
             dp_rank=int(getattr(req, "dp_rank", 0) or 0),
             dp_size=int(getattr(kv_pool, "dp_size", 1)),
             total_pages=int(layer_buffers[0].shape[0]),
+            dcp_size=int(getattr(kv_pool, "dcp_size", 1)) if is_mla else 1,
         )
         idx_sharding = _NamedSharding(kv_pool.mesh, _P(None))
         page_indices = jax.device_put(page_ids, idx_sharding)
-        # Page indices are replicated; preserve pool sharding on the remaining axes.
-        pool_pspec = kv_pool.kv_sharding.spec
-        gather_pspec = _P(None, *pool_pspec[1:])
-        gather_out_sharding = _NamedSharding(kv_pool.mesh, gather_pspec)
+        if is_mla:
+            gather_out_sharding, _ = _mla_kv_transfer_shardings(kv_pool, padded_pages)
+        else:
+            # Page indices are replicated; preserve pool sharding on the remaining axes.
+            pool_pspec = kv_pool.kv_sharding.spec
+            gather_pspec = _P(None, *pool_pspec[1:])
+            gather_out_sharding = _NamedSharding(kv_pool.mesh, gather_pspec)
         layer_kvs = _jit_gather_all_layers(layer_buffers, page_indices, gather_out_sharding)
         if jax.process_count() > 1:
             # Multi-host: expose only this host's TP shard as a fully-addressable
