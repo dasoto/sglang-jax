@@ -33,6 +33,24 @@ def _get_recurrent_zero_allocator(shape, dtype, sharding):
     return _RECURRENT_ZERO_ALLOCATOR_CACHE[key]
 
 
+@partial(jax.jit, static_argnames=("out_sharding",))
+def _jit_gather_recurrent_slot(
+    buf: jax.Array, global_slot: jax.Array, out_sharding: NamedSharding
+) -> jax.Array:
+    if out_sharding is not None and any(
+        t == jax.sharding.AxisType.Auto for t in out_sharding.mesh.axis_types
+    ):
+        return jax.lax.with_sharding_constraint(buf.at[global_slot].get(), out_sharding)
+    return buf.at[global_slot].get(out_sharding=out_sharding)
+
+
+@partial(jax.jit, donate_argnames=("buf",))
+def _jit_write_recurrent_slot(
+    buf: jax.Array, global_slot: jax.Array, val: jax.Array
+) -> jax.Array:
+    return buf.at[global_slot].set(val)
+
+
 _DTYPE_MAP = {
     "float32": jnp.float32,
     "bfloat16": jnp.bfloat16,
@@ -241,6 +259,88 @@ class RecurrentStatePool:
             self.recurrent_buffers[layer] = jnp.zeros_like(self.recurrent_buffers[layer])
             for inner in range(len(self.conv_buffers[layer])):
                 self.conv_buffers[layer][inner] = jnp.zeros_like(self.conv_buffers[layer][inner])
+
+    def global_slot_index(self, dp_rank: int, local_slot: int) -> int:
+        slots_per_rank = self.total_slots // self.dp_size
+        return int(dp_rank) * slots_per_rank + int(local_slot)
+
+    def _slot_transfer_specs_and_layer_shardings(
+        self,
+    ) -> tuple[jax.ShapeDtypeStruct, jax.ShapeDtypeStruct, NamedSharding, NamedSharding]:
+        tp_size = self.mesh.shape.get(self.recurrent_partition_axis, 1)
+        conv_tp_size = self.mesh.shape.get(self.conv_partition_axis, 1)
+        dp_size = (
+            self.mesh.shape.get(self.data_partition_axis, 1) if self.data_partition_axis else 1
+        )
+        if dp_size > 1 and self.data_partition_axis and self.head_dim % dp_size == 0:
+            t_layer_pspec = P(self.recurrent_partition_axis, self.data_partition_axis, None)
+            t_stacked_pspec = P(None, self.recurrent_partition_axis, self.data_partition_axis, None)
+        else:
+            t_layer_pspec = P(self.recurrent_partition_axis, None, None)
+            t_stacked_pspec = P(None, self.recurrent_partition_axis, None, None)
+
+        if dp_size > 1 and self.data_partition_axis and self.proj_size % (dp_size * conv_tp_size) == 0:
+            c_layer_pspec = P((self.data_partition_axis, self.conv_partition_axis), None)
+            c_stacked_pspec = P(None, (self.data_partition_axis, self.conv_partition_axis), None)
+        else:
+            c_layer_pspec = P(self.conv_partition_axis, None)
+            c_stacked_pspec = P(None, self.conv_partition_axis, None)
+
+        t_spec = jax.ShapeDtypeStruct(
+            (self.num_linear_recurrent_layers, self.num_heads, self.head_dim, self.head_dim),
+            self.temporal_dtype,
+            sharding=NamedSharding(self.mesh, t_stacked_pspec),
+        )
+        c_spec = jax.ShapeDtypeStruct(
+            (self.num_linear_recurrent_layers, self.proj_size, self.conv_kernel_size - 1),
+            self.conv_dtype,
+            sharding=NamedSharding(self.mesh, c_stacked_pspec),
+        )
+        return (
+            t_spec,
+            c_spec,
+            NamedSharding(self.mesh, t_layer_pspec),
+            NamedSharding(self.mesh, c_layer_pspec),
+        )
+
+    def slot_transfer_specs(self) -> tuple[jax.ShapeDtypeStruct, jax.ShapeDtypeStruct]:
+        t_spec, c_spec, _, _ = self._slot_transfer_specs_and_layer_shardings()
+        return t_spec, c_spec
+
+    def extract_slot(self, dp_rank: int, local_slot: int) -> tuple[jax.Array, jax.Array]:
+        gslot = jax.device_put(
+            jnp.asarray(self.global_slot_index(dp_rank, local_slot), dtype=jnp.int32),
+            NamedSharding(self.mesh, P()),
+        )
+        _, _, t_layer_sharding, c_layer_sharding = self._slot_transfer_specs_and_layer_shardings()
+        t_layers = [
+            _jit_gather_recurrent_slot(self.recurrent_buffers[l], gslot, t_layer_sharding)
+            for l in range(self.num_linear_recurrent_layers)
+        ]
+        c_layers = [
+            _jit_gather_recurrent_slot(self.conv_buffers[l][0], gslot, c_layer_sharding)
+            for l in range(self.num_linear_recurrent_layers)
+        ]
+        return jnp.stack(t_layers, axis=0), jnp.stack(c_layers, axis=0)
+
+    def install_slot(
+        self,
+        dp_rank: int,
+        local_slot: int,
+        temporal_stacked: jax.Array,
+        conv_stacked: jax.Array,
+    ) -> None:
+        gslot = jax.device_put(
+            jnp.asarray(self.global_slot_index(dp_rank, local_slot), dtype=jnp.int32),
+            NamedSharding(self.mesh, P()),
+        )
+        for l in range(self.num_linear_recurrent_layers):
+            self.recurrent_buffers[l] = _jit_write_recurrent_slot(
+                self.recurrent_buffers[l], gslot, temporal_stacked[l]
+            )
+            self.conv_buffers[l][0] = _jit_write_recurrent_slot(
+                self.conv_buffers[l][0], gslot, conv_stacked[l]
+            )
 
     def copy_slots(self, src_indices, dst_indices):
         """Clone src->dst slots across all layers; rows with src==0 keep dst.

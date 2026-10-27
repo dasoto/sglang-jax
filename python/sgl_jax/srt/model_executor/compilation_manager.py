@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from collections import deque
@@ -428,17 +429,21 @@ class CompilationManager:
         prepare_lora_fn: Callable | None = None,
         future_token_ids_map=None,
     ):
+        skip_unused = os.environ.get("SGLANG_JAX_PD_SKIP_UNUSED_PRECOMPILE", "0") == "1"
+        disagg_mode = getattr(model_runner.server_args, "disaggregation_mode", "null")
         self._precompile_encode(model_runner)
-        self._precompile_extend(
-            forward_fn,
-            model_runner,
-            mesh,
-            prepare_lora_fn,
-            future_token_ids_map,
-        )
-        self._precompile_decode(
-            forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
-        )
+        if not (skip_unused and disagg_mode == "decode" and self.has_recurrent_state):
+            self._precompile_extend(
+                forward_fn,
+                model_runner,
+                mesh,
+                prepare_lora_fn,
+                future_token_ids_map,
+            )
+        if not (skip_unused and disagg_mode == "prefill"):
+            self._precompile_decode(
+                forward_fn, model_runner, mesh, prepare_lora_fn, future_token_ids_map
+            )
 
     def _precompile_encode(self, model_runner) -> None:
         if not self.precompile_in_model_multimodal:

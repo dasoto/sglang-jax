@@ -21,11 +21,6 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
     mode = server_args.disaggregation_mode
     if mode == "null":
         return
-    if server_args.dp_size > 1 and not server_args.disaggregation_use_raiden:
-        raise RuntimeError(
-            "PD disaggregation with dp_size>1 requires the Raiden transfer "
-            f"engine (got dp_size={server_args.dp_size})."
-        )
     if server_args.disaggregation_bootstrap_url is None:
         raise RuntimeError("disaggregation_mode != null requires bootstrap_url")
 
@@ -65,13 +60,14 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
 
     if os.environ.get("DISAGG_LAUNCH_BOOTSTRAP", "") == "1":
         scheduler.disagg_bootstrap_server = BootstrapServer(
-            host=local_host,
+            host="0.0.0.0",
             port=server_args.disaggregation_bootstrap_port,
             shared_secret=shared_secret,
         )
         scheduler.disagg_bootstrap_server.start()
         logger.info(
-            "embedded BootstrapServer started at %s:%d",
+            "embedded BootstrapServer started at 0.0.0.0:%d (advertised %s:%d)",
+            server_args.disaggregation_bootstrap_port,
             local_host,
             server_args.disaggregation_bootstrap_port,
         )
@@ -118,9 +114,10 @@ def install_disaggregation_wiring(scheduler: Scheduler, server_args: ServerArgs)
                 chunk_prefill_transfer=bool(
                     server_args.disaggregation_enable_chunk_prefill_transfer
                 ),
-                transport_metadata=(
-                    scheduler.disagg_kv_manager.prefill_transport_metadata(dp_rank)
-                ),
+                transport_metadata={
+                    **(scheduler.disagg_kv_manager.prefill_transport_metadata(dp_rank) or {}),
+                    "dp_size": int(server_args.dp_size),
+                },
             )
             bootstrap_keys.append(bootstrap_key)
         scheduler.disagg_heartbeat = HeartbeatDaemon(
