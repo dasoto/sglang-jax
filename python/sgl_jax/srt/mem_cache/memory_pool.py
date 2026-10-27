@@ -1418,6 +1418,16 @@ def write_mla_kv_layer(
 
     Out-of-bounds indices (e.g. ``total_pages`` padding) are ignored via ``mode='drop'``.
     """
+    sharding = jax.typeof(kv_cache).sharding
+    if sharding is not None and any(
+        t == jax.sharding.AxisType.Explicit for t in sharding.mesh.axis_types
+    ):
+
+        @partial(jax.sharding.auto_axes, out_sharding=sharding)
+        def _impl(lkv, idx, cache):
+            return cache.at[idx].set(lkv, mode="drop")
+
+        return _impl(layer_kv, dst_global_page_indices, kv_cache)
     return kv_cache.at[dst_global_page_indices].set(layer_kv, mode="drop")
 
 

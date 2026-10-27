@@ -41,13 +41,28 @@ def _jit_gather_recurrent_slot(
         t == jax.sharding.AxisType.Auto for t in out_sharding.mesh.axis_types
     ):
         return jax.lax.with_sharding_constraint(buf.at[global_slot].get(), out_sharding)
-    return buf.at[global_slot].get(out_sharding=out_sharding)
+
+    @partial(jax.sharding.auto_axes, out_sharding=out_sharding)
+    def _impl(b, idx):
+        return b.at[idx].get()
+
+    return _impl(buf, global_slot)
 
 
 @partial(jax.jit, donate_argnames=("buf",))
 def _jit_write_recurrent_slot(
     buf: jax.Array, global_slot: jax.Array, val: jax.Array
 ) -> jax.Array:
+    sharding = jax.typeof(buf).sharding
+    if sharding is not None and any(
+        t == jax.sharding.AxisType.Explicit for t in sharding.mesh.axis_types
+    ):
+
+        @partial(jax.sharding.auto_axes, out_sharding=sharding)
+        def _impl(b, idx, v):
+            return b.at[idx].set(v)
+
+        return _impl(buf, global_slot, val)
     return buf.at[global_slot].set(val)
 
 

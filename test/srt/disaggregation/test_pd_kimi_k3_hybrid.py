@@ -37,9 +37,10 @@ from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 from sgl_jax.srt.sampling.sampling_params import SamplingParams
 
 
-def _make_mesh() -> Mesh:
+def _make_mesh(*, explicit: bool = True) -> Mesh:
     devices = np.array(jax.devices()[:4]).reshape(2, 2)
-    return Mesh(devices, ("data", "tensor"))
+    axis_type = jax.sharding.AxisType.Explicit if explicit else jax.sharding.AxisType.Auto
+    return Mesh(devices, ("data", "tensor"), axis_types=(axis_type, axis_type))
 
 
 def _make_hybrid_pools(mesh: Mesh, *, page_size: int = 8):
