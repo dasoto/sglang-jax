@@ -71,7 +71,8 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         # ===== Kimi-K3 on v6e-128 (kv_lora_rank=512, qk_rope_head_dim=64) =====
         # --dcp-size 32: every chip scores all 96 query heads (gathered, normalized to 128)
         # against 1/32 of the group's KV pages; mnt = per-group query tokens. Swept on
-        # dsm-tpu-v6e with bench/mla_tune_v6e.py at local KV 1K/3K/6K (32K/96K/192K global):
+        # dsm-tpu-v6e in the server's DCP call (page positions, global KV lengths, LSE)
+        # with bench/mla_tune_dcp_v6e.py at local KV 1K/3K/6K (32K/96K/192K global):
         # decode at 4..64 and mixed at 64..2048 tokens are measured picks; decode 128..512 and
         # mixed 4..32 are slots the server looks up but does not run, filled to stop the misses.
         ("decode", "bfloat16", "bfloat16", 128, 512, 64, 128, 4): (8, 1, 2),
@@ -86,12 +87,12 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 8): (1, 16),
         ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 16): (1, 16),
         ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 32): (1, 16),
-        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 64): (8, 64),
-        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 128): (8, 64),
-        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 256): (8, 64),
-        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 512): (8, 64),
-        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 1024): (8, 64),
-        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 2048): (8, 64),
+        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 64): (8, 32),
+        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 128): (8, 32),
+        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 256): (8, 32),
+        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 512): (8, 32),
+        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 1024): (8, 32),
+        ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 2048): (8, 32),
         # ===== DeepSeek-V3 (kv_lora_rank=512, qk_rope_head_dim=64) =====
         # Deploy: --tp-size 64 --dp-size 8 --page-size 128
         # → attention_tp = 8 → per-shard num_q_heads = 128/8 = 16.
