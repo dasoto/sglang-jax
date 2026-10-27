@@ -32,28 +32,34 @@ def synced_terminal_rooms(
 
     from jax.experimental import multihost_utils
 
-    local = np.full((_SYNC_MAX_INFLIGHT, 2), -1, dtype=np.int64)
+    # Split 63-bit room IDs into two int32 columns (room_hi, room_lo) so
+    # process_allgather never truncates np.int64 when jax_enable_x64 is False.
+    local = np.full((_SYNC_MAX_INFLIGHT, 3), -1, dtype=np.int32)
     for i, e in enumerate(entries):
         if i >= _SYNC_MAX_INFLIGHT:
             break
         room = room_fn(e)
-        if room is None:
+        if room is None or int(room) < 0:
             continue
         try:
             st = poll_fn(e)
         except Exception:
             st = KVPoll.FAILED
-        local[i, 0] = int(room)
-        local[i, 1] = 1 if st == KVPoll.SUCCESS else (-2 if st == KVPoll.FAILED else 0)
-    gathered = multihost_utils.process_allgather(local)
+        room_int = int(room)
+        local[i, 0] = int((room_int >> 32) & 0x7FFFFFFF)
+        local[i, 1] = np.uint32(room_int & 0xFFFFFFFF).view(np.int32)
+        local[i, 2] = 1 if st == KVPoll.SUCCESS else (-2 if st == KVPoll.FAILED else 0)
+    gathered = np.asarray(multihost_utils.process_allgather(local))
     nproc = int(gathered.shape[0])
     per_room: dict[int, list[int]] = {}
     for p in range(nproc):
         for i in range(_SYNC_MAX_INFLIGHT):
-            room = int(gathered[p, i, 0])
-            if room < 0:
+            room_hi = int(gathered[p, i, 0])
+            if room_hi < 0:
                 continue
-            per_room.setdefault(room, []).append(int(gathered[p, i, 1]))
+            room_lo = int(np.int32(gathered[p, i, 1]).view(np.uint32))
+            room = (room_hi << 32) | room_lo
+            per_room.setdefault(room, []).append(int(gathered[p, i, 2]))
     success: set[int] = set()
     failed: set[int] = set()
     for room, sts in per_room.items():

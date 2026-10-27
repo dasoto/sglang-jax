@@ -241,6 +241,10 @@ def test_mla_dcp_and_kda_roundtrip_and_pure_decode_admission():
         d_c = np.asarray(jax.device_get(decode_sched.rec_pool.conv_buffers[l_idx][0]))[d_gslot]
         np.testing.assert_array_equal(d_c, p_c)
 
+    # Verify initially empty running_batch does NOT have vacuous True flags from all([])
+    assert not decode_sched.running_batch.is_prefill_only
+    assert not decode_sched.running_batch.return_output_logprob_only
+
     # Enqueue and drain pure decode into running_batch
     decode_sched._enqueue_hybrid_pure_decode(d_req, d_kv_indices, d_req._pd_first_token_id)
     assert decode_sched.streamed == [("req-k3-1", [777])]
@@ -248,6 +252,8 @@ def test_mla_dcp_and_kda_roundtrip_and_pure_decode_admission():
     decode_sched._drain_ready_pure_decode()
     assert len(decode_sched._pd_ready_pure_decode_queue) == 0
     assert len(decode_sched.running_batch.reqs_info[0].reqs) == 1
+    assert not decode_sched.running_batch.is_prefill_only
+    assert not decode_sched.running_batch.return_output_logprob_only
 
     # Run prepare_for_decode and verify invariants for next decode step
     decode_sched.running_batch.prepare_for_decode()
@@ -257,3 +263,29 @@ def test_mla_dcp_and_kda_roundtrip_and_pure_decode_admission():
     assert info0.seq_lens.tolist() == [21]
     assert info0.recurrent_indices.tolist() == [d_req.recurrent_pool_idx]
     assert info0.out_cache_loc.tolist() == [int(d_kv_indices[20])]
+
+
+def test_multihost_sync_63bit_bootstrap_room_without_x64():
+    """Verify synced_terminal_rooms preserves 63-bit rooms when jax_enable_x64 is False."""
+    from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
+    from sgl_jax.srt.disaggregation.common.multihost_sync import synced_terminal_rooms
+    from sgl_jax.srt.disaggregation.mini_lb_helpers import generate_bootstrap_room
+
+    for _ in range(100):
+        r = generate_bootstrap_room()
+        assert 0 <= r < 2**31
+
+    big_room_ok = (1 << 62) | 0xDEADBEEF
+    big_room_fail = (1 << 61) | 0xCAFEBABE
+    entries = [
+        SimpleNamespace(room=big_room_ok, state=KVPoll.SUCCESS),
+        SimpleNamespace(room=big_room_fail, state=KVPoll.FAILED),
+    ]
+    success, failed = synced_terminal_rooms(
+        entries,
+        poll_fn=lambda e: e.state,
+        room_fn=lambda e: e.room,
+    )
+    assert success == {big_room_ok}
+    assert failed == {big_room_fail}
+

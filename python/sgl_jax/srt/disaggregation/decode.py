@@ -1190,7 +1190,10 @@ class SchedulerDisaggregationDecodeMixin:
                 self.model_config.vocab_size,
                 batch=admit_batch,
             )
-            self.running_batch.merge_batch(admit_batch)
+            if self.running_batch.is_empty():
+                self.running_batch = admit_batch
+            else:
+                self.running_batch.merge_batch(admit_batch)
         self._pd_ready_pure_decode_queue = remaining
 
     def _release_decode_req_resources(self: Scheduler, req: Req) -> None:

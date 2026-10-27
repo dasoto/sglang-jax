@@ -1052,7 +1052,9 @@ class ScheduleBatch:
         all_reqs = [req for dp_reqs in reqs for req in dp_reqs]
 
         return_logprob = any(req.return_logprob for req in all_reqs)
-        return_output_logprob_only = all(req.return_output_logprob_only for req in all_reqs)
+        return_output_logprob_only = bool(all_reqs) and all(
+            req.return_output_logprob_only for req in all_reqs
+        )
         is_hybrid = False
         if isinstance(token_to_kv_pool_allocator, SWATokenToKVPoolAllocator):
             assert tree_cache is None or isinstance(
@@ -1089,7 +1091,8 @@ class ScheduleBatch:
             has_grammar=any(req.grammar for req in all_reqs),
             mesh=mesh,
             spec_algorithm=spec_algorithm,
-            is_prefill_only=all(req.sampling_params.max_new_tokens == 0 for req in all_reqs),
+            is_prefill_only=bool(all_reqs)
+            and all(req.sampling_params.max_new_tokens == 0 for req in all_reqs),
             return_routed_experts=any(req.return_routed_experts for req in all_reqs),
             dp_size=dp_size,
         )
@@ -2052,12 +2055,16 @@ class ScheduleBatch:
             )
             self.has_stream = any(req.stream for req in all_reqs)
             self.has_grammar = any(req.grammar for req in all_reqs)
+            self.is_prefill_only = all(
+                req.sampling_params.max_new_tokens == 0 for req in all_reqs
+            )
         else:
             self.return_logprob = False
             self.return_hidden_states = False
             self.return_output_logprob_only = False
             self.has_stream = False
             self.has_grammar = False
+            self.is_prefill_only = False
 
     def merge_batch(self, other: ScheduleBatch):
         """Merge another batch into this batch (unified for all dp_size >= 1).
@@ -2152,11 +2159,18 @@ class ScheduleBatch:
                 self_info.spec_info.merge_batch(other_info.spec_info)
 
         # Update global flags
+        all_reqs = [req for info in self.reqs_info for req in (info.reqs if info.reqs else [])]
         self.return_logprob |= other.return_logprob
-        self.return_output_logprob_only |= other.return_output_logprob_only
+        self.return_output_logprob_only = bool(all_reqs) and all(
+            req.return_output_logprob_only for req in all_reqs
+        )
         self.has_stream |= other.has_stream
         self.has_grammar |= other.has_grammar
         self.return_hidden_states |= other.return_hidden_states
+        self.return_routed_experts |= other.return_routed_experts
+        self.is_prefill_only = bool(all_reqs) and all(
+            req.sampling_params.max_new_tokens == 0 for req in all_reqs
+        )
 
     def _compute_global_padding_sizes(
         self,
