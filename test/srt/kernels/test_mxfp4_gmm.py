@@ -205,3 +205,44 @@ def test_moe_mlp_matches_bf16_epmoe_reference():
     out, ref = np.asarray(out), np.asarray(ref)
     np.testing.assert_allclose(out, ref, rtol=2e-2, atol=2e-3 * np.abs(ref).max())
     assert np.isclose(out, ref, rtol=1e-5, atol=1e-5 * np.abs(ref).max()).mean() > 0.98
+
+
+def test_default_moe_mlp_tiling():
+    from sgl_jax.srt.kernels.mxfp4_gmm import default_moe_mlp_tiling
+
+    v5e = dict(bn_up=512, bn_down=896, kc_up=256, kc_down=256, nl=None)
+    # Kimi-K3 per expert-TP-2 shard: gate/up 3584 -> 1536, down 1536 -> 3584.
+    assert default_moe_mlp_tiling(3584, 1536, 1536, 3584, "TPU v6e") == dict(
+        bn_up=1536, bn_down=3584, kc_up=3584, kc_down=1536, nl=256
+    )
+    for name in ("TPU v5e", "TPU v7", None):
+        assert default_moe_mlp_tiling(3584, 1536, 1536, 3584, name) == v5e
+    assert default_moe_mlp_tiling(3584, 1536, 1536, 3584 + 64, "TPU v6e") == v5e  # not 256-aligned
+
+
+def test_moe_mlp_v6e_tiling_matches_bf16_epmoe_reference():
+    """The v6e tiling (whole-width column tiles, whole-K chunks, 256-lane sub-tiles) is exact."""
+    from sgl_jax.srt.kernels.mxfp4_gmm import default_moe_mlp_tiling, mxfp4_moe_mlp, prepare_l24
+
+    H, I, G, E_l, goff = 512, 256, 6, 3, 2
+    sizes = [5, 3, 17, 0, 9, 4]
+    tiling = default_moe_mlp_tiling(H, I, I, H, "TPU v6e")
+    assert tiling == dict(bn_up=I, bn_down=H, kc_up=H, kc_down=I, nl=256)
+    rng = np.random.default_rng(12)
+    pg, sg = F.random_mxfp4((H, I), E_l, seed=31, zero_frac=0.1)
+    pu, su = F.random_mxfp4((H, I), E_l, seed=32, zero_frac=0.1)
+    pd, sd = F.random_mxfp4((I, H), E_l, seed=33, zero_frac=0.1)
+    x = jnp.asarray(rng.standard_normal((sum(sizes), H)), jnp.bfloat16)
+    gs = jnp.asarray(sizes, jnp.int32)
+    enc = jax.jit(prepare_l24)
+    out = mxfp4_moe_mlp(
+        x, gs, jnp.int32(goff), enc(jnp.asarray(pg)), jnp.asarray(sg), enc(jnp.asarray(pu)), jnp.asarray(su),
+        enc(jnp.asarray(pd)), jnp.asarray(sd), tm=16, out_dtype=jnp.float32, interpret=True, **tiling,
+    )
+    deq = lambda p, s: jnp.asarray(F.dequant_reference(p, s))
+    h = mxfp4_gmm_reference(x, deq(pg, sg), gs, goff, w_up_deq=deq(pu, su), activation="situ_glu",
+                            act_input_dtype=jnp.bfloat16).astype(jnp.bfloat16)
+    ref = mxfp4_gmm_reference(h, deq(pd, sd), gs, goff)
+    out, ref = np.asarray(out), np.asarray(ref)
+    np.testing.assert_allclose(out, ref, rtol=2e-2, atol=2e-3 * np.abs(ref).max())
+    assert np.isclose(out, ref, rtol=1e-5, atol=1e-5 * np.abs(ref).max()).mean() > 0.98
