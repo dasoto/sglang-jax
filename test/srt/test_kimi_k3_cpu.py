@@ -297,6 +297,75 @@ class TestKimiK3CPU(unittest.TestCase):
             set_global_expert_location_metadata(None)
         self._check_exact(prefill, decode, "f32 tp=4 ep=2 eplb permuted")
 
+    def test_f32_tp4_ep2_eplb_prepermuted_gate(self):
+        # 1-to-1 static EPLB with recorder off: gate.weight and gate.bias are permuted at load
+        # time (gate_prepermuted=True), so TopK emits physical ids directly with no gather.
+        import json
+
+        from sgl_jax.srt.eplb.expert_location import set_global_expert_location_metadata
+
+        with open(os.path.join(self.fixture, "config.json")) as f:
+            cfg = json.load(f)
+        text = cfg.get("text_config", cfg)
+        rng = np.random.default_rng(5678)
+        phy2log = [
+            rng.permutation(text["num_experts"]).tolist()
+            for _ in range(text["num_hidden_layers"])
+        ]
+        try:
+            prefill, decode = self._run(
+                dtype="float32",
+                tp=4,
+                ep=2,
+                trust_remote_code=True,
+                env={"SGLANG_JAX_EPLB_RECORD": "0", "SGLANG_JAX_EPLB_PREPERMUTE_GATE": "1"},
+                ep_dispatch_algorithm="static",
+                init_expert_location=json.dumps({"physical_to_logical_map": phy2log}),
+            )
+        finally:
+            set_global_expert_location_metadata(None)
+        self._check_exact(prefill, decode, "f32 tp=4 ep=2 eplb prepermuted gate")
+
+    def test_f32_tp4_ep2_eplb_redundant_experts_dynamic(self):
+        # Redundant experts (ep_num_redundant_experts=2 -> 10 physical experts across ep=2,
+        # 5 per EP rank) + dynamic replica dispatch via the 16-slot choice table, initialized
+        # from recorded counts with an all-zero dense layer-0 row.
+        import json
+
+        from sgl_jax.srt.eplb.expert_location import (
+            get_global_expert_location_metadata,
+            set_global_expert_location_metadata,
+        )
+
+        with open(os.path.join(self.fixture, "config.json")) as f:
+            cfg = json.load(f)
+        text = cfg.get("text_config", cfg)
+        num_layers = text["num_hidden_layers"]
+        num_experts = text["num_experts"]
+        rng = np.random.default_rng(9012)
+        counts = rng.integers(10, 500, size=(num_layers, num_experts)).tolist()
+        counts[0] = [0] * num_experts  # dense layer 0 has all-zero recorded counts
+        try:
+            prefill, decode = self._run(
+                dtype="float32",
+                tp=4,
+                ep=2,
+                trust_remote_code=True,
+                env={"SGLANG_JAX_EPLB_RECORD": "0", "SGLANG_JAX_MOE_LOCAL_WINDOW_CF": "2.0"},
+                ep_num_redundant_experts=2,
+                ep_dispatch_algorithm="dynamic",
+                init_expert_location=json.dumps({"logical_count": counts}),
+            )
+            metadata = get_global_expert_location_metadata()
+            self.assertIsNotNone(metadata)
+            self.assertEqual(metadata.num_physical_experts, num_experts + 2)
+            self.assertEqual(
+                metadata.logical_to_choice_physical_map.shape, (num_layers, num_experts * 16)
+            )
+        finally:
+            set_global_expert_location_metadata(None)
+        self._check_exact(prefill, decode, "f32 tp=4 ep=2 eplb redundant dynamic")
+
     def test_bf16_mega_kda_noise_parity(self):
         prefill, decode = self._run(dtype="bfloat16", tp=1, ep=1, trust_remote_code=False)
         golden = self.golden

@@ -53,6 +53,7 @@ class ExpertLocationMetadata:
         logical_to_all_physical_map: np.ndarray | None = None,
         logical_to_all_physical_map_num_valid: np.ndarray | None = None,
         physical_to_logical_map: np.ndarray | None = None,
+        logical_to_choice_physical_map: np.ndarray | None = None,
         num_physical_experts: int = 0,
     ):
         self.ep_dispatch_algorithm = ep_dispatch_algorithm
@@ -66,6 +67,11 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map_num_valid, sharding=(None)
         )
         self.physical_to_logical_map = device_array(physical_to_logical_map, sharding=(None))
+        self.logical_to_choice_physical_map = (
+            device_array(logical_to_choice_physical_map, sharding=(None))
+            if logical_to_choice_physical_map is not None
+            else None
+        )
         self.num_physical_experts = num_physical_experts
 
     def tree_flatten(self):
@@ -74,6 +80,7 @@ class ExpertLocationMetadata:
             self.logical_to_all_physical_map,
             self.logical_to_all_physical_map_num_valid,
             self.physical_to_logical_map,
+            self.logical_to_choice_physical_map,
         )
         aux_data = {
             "ep_dispatch_algorithm": self.ep_dispatch_algorithm,
@@ -89,6 +96,7 @@ class ExpertLocationMetadata:
         obj.logical_to_all_physical_map = children[1]
         obj.logical_to_all_physical_map_num_valid = children[2]
         obj.physical_to_logical_map = children[3]
+        obj.logical_to_choice_physical_map = children[4] if len(children) > 4 else None
         obj.ep_dispatch_algorithm = aux_data["ep_dispatch_algorithm"]
         obj.num_physical_experts = aux_data["num_physical_experts"]
         return obj
@@ -114,8 +122,9 @@ class ExpertLocationMetadata:
             "logical_to_all_physical_map",
             "logical_to_all_physical_map_num_valid",
             "physical_to_logical_map",
+            "logical_to_choice_physical_map",
         ):
-            setattr(self, name, put(getattr(self, name)))
+            setattr(self, name, put(getattr(self, name, None)))
         return self
 
     @staticmethod
@@ -173,6 +182,12 @@ class ExpertLocationMetadata:
             logical_count = np.array(logical_count)
         if len(logical_count.shape) == 1:
             logical_count = logical_count[None, :]
+        # Dense layers (e.g. Kimi-K3 layer 0) have all-zero recorded counts; replace
+        # all-zero rows with ones so replicate_experts does not assign all redundant
+        # replicas to logical expert 0 and bloat logical_to_all_physical_map's width.
+        zero_rows = np.all(logical_count == 0, axis=-1, keepdims=True)
+        if np.any(zero_rows):
+            logical_count = np.where(zero_rows, 1, logical_count)
 
         common = ExpertLocationMetadata._init_common(server_args, model_config)
 
@@ -256,8 +271,23 @@ class ExpertLocationMetadata:
         # physical_to_logical_map = np.array(p2l_synced)
         # logical_to_all_physical_map = np.array(l2p_synced)
 
-        logical_to_all_physical_map_num_valid = np.sum(logical_to_all_physical_map != -1, axis=2)
+        logical_to_all_physical_map = np.asarray(logical_to_all_physical_map, dtype=np.int32)
+        physical_to_logical_map = np.asarray(physical_to_logical_map, dtype=np.int32)
+        logical_to_all_physical_map_num_valid = np.sum(
+            logical_to_all_physical_map != -1, axis=2, dtype=np.int32
+        )
         logical_to_rank_dispatch_physical_map = logical_to_all_physical_map[:, :, 0]
+        # Precomputed 16-slot int32 replica choice table [num_layers, num_logical_experts * 16]
+        # where entry (e * 16 + s) holds physical replica (s % num_valid[l, e]). Allows dynamic
+        # replica dispatch to use a single 1-D int32 gather without RNG or integer modulo.
+        slots = np.arange(16, dtype=np.int32)[None, None, :]
+        n_val = np.maximum(1, logical_to_all_physical_map_num_valid[:, :, None])
+        choice_map = np.take_along_axis(
+            logical_to_all_physical_map, slots % n_val, axis=2
+        ).astype(np.int32)
+        logical_to_choice_physical_map = choice_map.reshape(
+            logical_to_all_physical_map.shape[0], -1
+        )
 
         return ExpertLocationMetadata(
             ep_dispatch_algorithm=server_args.ep_dispatch_algorithm or "static",
@@ -265,6 +295,7 @@ class ExpertLocationMetadata:
             logical_to_all_physical_map=logical_to_all_physical_map,
             logical_to_all_physical_map_num_valid=logical_to_all_physical_map_num_valid,
             physical_to_logical_map=physical_to_logical_map,
+            logical_to_choice_physical_map=logical_to_choice_physical_map,
             num_physical_experts=physical_to_logical_map.shape[1],
         )
 
@@ -424,10 +455,30 @@ def _topk_ids_logical_to_physical_dynamic(
     info: ExpertLocationMetadata,
     layer_id: int = 0,
 ) -> jax.Array:
-    num_valid, selected_expert_replicas = (
-        info.logical_to_all_physical_map_num_valid[layer_id, topk_ids],
-        info.logical_to_all_physical_map[layer_id, topk_ids],
-    )
+    sharding = getattr(jax.typeof(topk_ids), "sharding", None)
+    mesh = getattr(sharding, "mesh", None)
+    if getattr(info, "logical_to_choice_physical_map", None) is not None:
+        table = info.logical_to_choice_physical_map[layer_id]
+        if topk_ids.ndim == 2:
+            t_idx = jax.lax.broadcasted_iota(jnp.int32, topk_ids.shape, 0)
+            k_idx = jax.lax.broadcasted_iota(jnp.int32, topk_ids.shape, 1)
+            slot = (t_idx + k_idx) & jnp.int32(15)
+        else:
+            slot = jax.lax.broadcasted_iota(jnp.int32, topk_ids.shape, 0) & jnp.int32(15)
+        flat_idx = (topk_ids.astype(jnp.int32) << jnp.int32(4)) | slot
+        if mesh is not None and not mesh.empty:
+            return table.at[flat_idx].get(out_sharding=sharding).astype(topk_ids.dtype)
+        return table[flat_idx].astype(topk_ids.dtype)
+
+    num_valid_row = info.logical_to_all_physical_map_num_valid[layer_id]
+    replicas_row = info.logical_to_all_physical_map[layer_id]
+    if mesh is not None and not mesh.empty:
+        rep_sharding = NamedSharding(mesh, P(*sharding.spec, None))
+        num_valid = num_valid_row.at[topk_ids].get(out_sharding=sharding)
+        selected_expert_replicas = replicas_row.at[topk_ids].get(out_sharding=rep_sharding)
+    else:
+        num_valid = num_valid_row[topk_ids]
+        selected_expert_replicas = replicas_row[topk_ids]
 
     rng_key = jax.random.key(0)
     random_offsets = jax.random.randint(
@@ -439,4 +490,4 @@ def _topk_ids_logical_to_physical_dynamic(
         selected_expert_replicas, chosen_dispatch_index[..., None], axis=-1
     ).squeeze(-1)
 
-    return physical_ids
+    return physical_ids.astype(topk_ids.dtype)

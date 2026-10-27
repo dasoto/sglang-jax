@@ -480,10 +480,17 @@ class KimiK3LatentMoE(nnx.Module):
             self.routed_expert_norm = None
 
         self.is_mxfp4 = _is_mxfp4_quant(quantization_config)
+        self.gate_prepermuted = False
+        metadata = get_global_expert_location_metadata()
+        num_physical_experts = (
+            int(metadata.num_physical_experts)
+            if metadata is not None and getattr(metadata, "num_physical_experts", 0) > 0
+            else config.num_experts
+        )
         expert_cls = MXFP4EPMoE if self.is_mxfp4 else EPMoE
         self.experts = expert_cls(
             hidden_size=self.latent_size,
-            num_experts=config.num_experts,
+            num_experts=num_physical_experts,
             num_experts_per_tok=config.num_experts_per_token,
             ep_size=ep_size,
             mesh=mesh,
@@ -529,7 +536,9 @@ class KimiK3LatentMoE(nnx.Module):
     ) -> tuple[jax.Array, jax.Array]:
         router_scores = self.gate(hidden_states)
         topk_weights, topk_ids = self.topk(
-            router_scores, self.gate.bias.value, dispatch_info=dispatch_info
+            router_scores,
+            self.gate.bias.value,
+            dispatch_info=None if self.gate_prepermuted else dispatch_info,
         )
         if self.routed_expert_down_proj is not None:
             latent, _ = self.routed_expert_down_proj(hidden_states)
@@ -1015,14 +1024,42 @@ class KimiK3ForConditionalGeneration(nnx.Module):
         moe = layer.block_sparse_moe
         moe_src = f"{prefix}.block_sparse_moe"
         moe_dst = f"{target}.block_sparse_moe"
-        mappings[f"{moe_src}.gate.weight"] = WeightSpec(
-            target_path=f"{moe_dst}.gate.kernel",
-            sharding=moe.gate.kernel_axes,
-            transpose=True,
+        order = self._expert_order(layer_idx)
+        prepermute_gate = (
+            order is not None
+            and len(order) == cfg.num_experts
+            and not self.model.eplb_record
+            and os.environ.get("SGLANG_JAX_EPLB_PREPERMUTE_GATE", "1").strip().lower()
+            in ("1", "true", "yes", "on")
+            and len(set(order)) == len(order)
         )
-        mappings[f"{moe_src}.gate.e_score_correction_bias"] = WeightSpec(
-            target_path=f"{moe_dst}.gate.bias", sharding=(None,)
-        )
+        moe.gate_prepermuted = prepermute_gate
+        gate_key = f"{moe_src}.gate.weight"
+        bias_key = f"{moe_src}.gate.e_score_correction_bias"
+        if prepermute_gate:
+            mappings[gate_key] = WeightSpec(
+                target_path=f"{moe_dst}.gate.kernel",
+                sources=(gate_key,),
+                sharding=moe.gate.kernel_axes,
+                recipe=lambda inputs, o=order, ax=moe.gate.kernel_axes: (
+                    self._permuted_gate_kernel(inputs[0], o, ax),
+                ),
+            )
+            mappings[bias_key] = WeightSpec(
+                target_path=f"{moe_dst}.gate.bias",
+                sources=(bias_key,),
+                sharding=(None,),
+                recipe=lambda inputs, o=order: (self._permuted_gate_bias(inputs[0], o),),
+            )
+        else:
+            mappings[gate_key] = WeightSpec(
+                target_path=f"{moe_dst}.gate.kernel",
+                sharding=moe.gate.kernel_axes,
+                transpose=True,
+            )
+            mappings[bias_key] = WeightSpec(
+                target_path=f"{moe_dst}.gate.bias", sharding=(None,)
+            )
         if moe.routed_expert_down_proj is not None:
             mappings.update(
                 linear(
@@ -1058,7 +1095,7 @@ class KimiK3ForConditionalGeneration(nnx.Module):
                     target_prefix=moe_dst,
                     num_experts=cfg.num_experts,
                     moe_path="experts",
-                    expert_order=self._expert_order(layer_idx),
+                    expert_order=order,
                 )
             )
         else:
@@ -1070,11 +1107,24 @@ class KimiK3ForConditionalGeneration(nnx.Module):
                 expert_type_names=("w1", "w3", "w2"),
                 moe_backend="epmoe",
                 moe_path="block_sparse_moe",
+                physical_to_logical_map=(
+                    None if order is None else np.asarray(order, dtype=np.int64)
+                ),
             )
             for spec in expert_mappings.values():
                 spec.target_path = spec.target_path.replace(f"{moe_dst}.", f"{moe_dst}.experts.", 1)
                 mappings[spec.target_path] = spec
         return mappings
+
+    def _permuted_gate_kernel(self, weight: np.ndarray, order, kernel_axes) -> jax.Array:
+        arr = np.ascontiguousarray(np.asarray(weight)[order].T, dtype=self.dtype)
+        sharding = NamedSharding(self.mesh, P(*kernel_axes))
+        return jax.make_array_from_callback(arr.shape, sharding, lambda idx, a=arr: a[idx])
+
+    def _permuted_gate_bias(self, bias: np.ndarray, order) -> jax.Array:
+        arr = np.ascontiguousarray(np.asarray(bias, dtype=np.float32)[order])
+        sharding = NamedSharding(self.mesh, P(None))
+        return jax.make_array_from_callback(arr.shape, sharding, lambda idx, a=arr: a[idx])
 
     def _expert_order(self, layer_idx: int):
         """EPLB placement of this layer's routed experts: the logical expert in each physical
