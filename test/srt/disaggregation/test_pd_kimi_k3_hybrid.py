@@ -443,7 +443,7 @@ def test_mla_kv_multi_block_gather_and_write():
     padded_src = np.zeros(padded_pages, dtype=np.int32)
     padded_src[:valid_pages] = p_global_pages
 
-    in_spec = p_pool.kv_spec
+    in_spec = p_pool.kv_buffer[0].sharding.spec
     out_spec = P("data", "tensor", None, None, None)
     idx_sharding = NamedSharding(mesh, P())
     dev_idx = jax.device_put(jnp.asarray(padded_src, dtype=jnp.int32), idx_sharding)
@@ -467,7 +467,7 @@ def test_mla_kv_multi_block_gather_and_write():
             stacked,
             dev_dst,
             mesh=mesh,
-            buf_spec=d_pool.kv_spec,
+            buf_spec=d_pool.kv_buffer[0].sharding.spec,
             val_spec=out_spec,
         )
     )
