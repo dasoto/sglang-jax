@@ -443,17 +443,16 @@ def test_mla_kv_multi_block_gather_and_write():
     padded_src = np.zeros(padded_pages, dtype=np.int32)
     padded_src[:valid_pages] = p_global_pages
 
-    in_spec = p_pool.kv_buffer[0].sharding.spec
-    out_spec = P("data", "tensor", None, None, None)
+    buf_sharding = p_pool.kv_buffer[0].sharding
+    out_sharding = NamedSharding(mesh, P("data", "tensor", None, None, None))
     idx_sharding = NamedSharding(mesh, P())
     dev_idx = jax.device_put(jnp.asarray(padded_src, dtype=jnp.int32), idx_sharding)
 
-    stacked = _jit_gather_mla_kv_chunk(
-        tuple(p_pool.kv_buffer),
+    gathered_layers = _jit_gather_mla_kv_chunk(
+        list(p_pool.kv_buffer),
         dev_idx,
-        mesh=mesh,
-        in_spec=in_spec,
-        out_spec=out_spec,
+        buf_sharding,
+        out_sharding,
     )
     # Write to D's dp_rank=0 (global pages 3..32), with dummy page 0 for padding
     d_global_pages = np.arange(3, 3 + valid_pages, dtype=np.int32)
@@ -463,12 +462,11 @@ def test_mla_kv_multi_block_gather_and_write():
 
     d_pool.kv_buffer = list(
         _jit_write_all_mla_kv_layers_shard_map(
-            tuple(d_pool.kv_buffer),
-            stacked,
+            gathered_layers,
             dev_dst,
-            mesh=mesh,
-            buf_spec=d_pool.kv_buffer[0].sharding.spec,
-            val_spec=out_spec,
+            list(d_pool.kv_buffer),
+            out_sharding,
+            d_pool.kv_buffer[0].sharding,
         )
     )
     for l_idx in range(3):
