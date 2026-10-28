@@ -209,6 +209,75 @@ class TestMixedChunkDP(unittest.TestCase):
             running_req_dp1.origin_input_ids + running_req_dp1.output_ids,
         )
 
+    def test_mix_with_running_merges_recurrent_track_entries(self):
+        # DP0: two prefill reqs and one running req, both sides tracked. DP1: running
+        # reqs only. DP2: prefill only. DP3: prefill tracked, running side built none.
+        prefill = [[_make_req("p0a", 0), _make_req("p0b", 0)], [], [_make_req("p2", 2)]]
+        prefill.append([_make_req("p3", 3)])
+        running = [[_make_req("r0", 0)], [_make_req("r1a", 1), _make_req("r1b", 1)], []]
+        running.append([_make_req("r3", 3)])
+
+        def make(reqs_per_dp, base):
+            return _make_extend_batch(
+                reqs_per_dp=reqs_per_dp,
+                input_ids_per_dp=[np.arange(len(r), dtype=np.int32) + base for r in reqs_per_dp],
+                out_cache_loc_per_dp=[
+                    np.arange(len(r), dtype=np.int32) + base for r in reqs_per_dp
+                ],
+                req_pool_indices_per_dp=[
+                    np.arange(len(r), dtype=np.int32) + base for r in reqs_per_dp
+                ],
+                seq_lens_per_dp=[np.full(len(r), 6, dtype=np.int32) for r in reqs_per_dp],
+            )
+
+        new_batch = make(prefill, 100)
+        running_batch = make(running, 200)
+        tracks = [
+            (new_batch, 0, [7, 0], [1, 0]),
+            (new_batch, 2, [5], [1]),
+            (new_batch, 3, [3], [1]),
+            (running_batch, 0, [9], [1]),
+            (running_batch, 1, [0, 11], [0, 1]),
+        ]
+        for batch, dp_rank, indices, mask in tracks:
+            batch.reqs_info[dp_rank].recurrent_track_indices = np.array(indices, dtype=np.int32)
+            batch.reqs_info[dp_rank].recurrent_track_mask = np.array(mask, dtype=np.int32)
+
+        new_batch.mix_with_running(running_batch)
+
+        expected = {
+            0: ([7, 0, 9], [1, 0, 1]),
+            1: ([0, 11], [0, 1]),
+            2: ([5], [1]),
+            3: ([3, 0], [1, 0]),
+        }
+        for dp_rank, (indices, mask) in expected.items():
+            info = new_batch.reqs_info[dp_rank]
+            self.assertEqual(len(info.reqs), len(indices))
+            np.testing.assert_array_equal(info.recurrent_track_indices, indices)
+            np.testing.assert_array_equal(info.recurrent_track_mask, mask)
+
+    def test_mix_with_running_without_track_entries_leaves_none(self):
+        new_batch = _make_extend_batch(
+            reqs_per_dp=[[_make_req("p", 0)]],
+            input_ids_per_dp=[np.array([10], dtype=np.int32)],
+            out_cache_loc_per_dp=[np.array([100], dtype=np.int32)],
+            req_pool_indices_per_dp=[np.array([1], dtype=np.int32)],
+            seq_lens_per_dp=[np.array([6], dtype=np.int32)],
+        )
+        running_batch = _make_extend_batch(
+            reqs_per_dp=[[_make_req("r", 0)]],
+            input_ids_per_dp=[np.array([11], dtype=np.int32)],
+            out_cache_loc_per_dp=[np.array([101], dtype=np.int32)],
+            req_pool_indices_per_dp=[np.array([2], dtype=np.int32)],
+            seq_lens_per_dp=[np.array([6], dtype=np.int32)],
+        )
+
+        new_batch.mix_with_running(running_batch)
+
+        self.assertIsNone(new_batch.reqs_info[0].recurrent_track_indices)
+        self.assertIsNone(new_batch.reqs_info[0].recurrent_track_mask)
+
     def test_prefill_adder_accepts_per_dp_mixed_decode_tokens(self):
         adder = PrefillAdder(
             page_size=1,

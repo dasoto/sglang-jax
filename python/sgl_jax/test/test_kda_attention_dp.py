@@ -15,6 +15,7 @@ from sgl_jax.srt.layers.attention.linear.kda_backend import (
     conv_states_from_packed,
     conv_states_to_packed,
     l2_normalize,
+    tail_decode_rows,
 )
 from sgl_jax.srt.layers.radix_linear_attention import RadixLinearAttention
 from sgl_jax.srt.managers.schedule_batch import PADDING_BUCKETS, ModelWorkerBatch
@@ -584,6 +585,31 @@ def assert_pool_state_per_rank(
         )
 
 
+class TestTailDecodeRows(unittest.TestCase):
+    def test_tail_one_token_rows_split_off(self):
+        ext = np.array(
+            [
+                [128, 1, 1, 0],  # prefill row, two decode rows, a padding row
+                [64, 1, 32, 1],  # the inner one-token row stays with the prefill kernel
+                [1, 1, 0, 0],  # decode rows only
+                [96, 0, 0, 0],  # prefill only
+            ],
+            dtype=np.int32,
+        )
+        prefill_cu, starts, mask = tail_decode_rows(ext)
+
+        np.testing.assert_array_equal(
+            mask.reshape(4, 4), [[0, 1, 1, 0], [0, 0, 0, 1], [1, 1, 0, 0], [0, 0, 0, 0]]
+        )
+        np.testing.assert_array_equal(
+            starts.reshape(4, 4), [[0, 128, 129, 0], [0, 0, 0, 97], [0, 1, 0, 0], [0, 0, 0, 0]]
+        )
+        np.testing.assert_array_equal(
+            prefill_cu.reshape(4, 5),
+            [[0, 128, 128, 128, 128], [0, 64, 65, 97, 97], [0, 0, 0, 0, 0], [0, 96, 96, 96, 96]],
+        )
+
+
 class TestKDAAttentionDP(CustomTestCase):
     NUM_HEADS = 32
     HEAD_DIM = 128
@@ -760,6 +786,51 @@ class TestKDAAttentionDP(CustomTestCase):
             lens,
             dp_size=4,
             tp_size=1,
+            has_initial_state_per_rank=has_initial_state_per_rank,
+        )
+
+    def test_extend_mixed_tail_decode_rows_dp4(self):
+        # Mixed prefill+decode step: each section's running requests add one token
+        # each after its prefill rows; rank 2 has decode rows only.
+        lens = {0: [128, 1, 1, 1], 1: [64, 1], 2: [1, 1, 1], 3: [96]}
+        has_initial_state_per_rank = {
+            0: [False, True, True, True],
+            1: [True, True],
+            2: [True, True, False],
+            3: [False],
+        }
+        self._run_test(
+            "prefill",
+            lens,
+            dp_size=4,
+            tp_size=1,
+            has_initial_state_per_rank=has_initial_state_per_rank,
+        )
+
+    def test_extend_mixed_inner_one_token_row_dp4(self):
+        # A one-token row between prefill rows stays with the prefill kernel.
+        lens = {0: [64, 1, 32, 1, 1], 1: [1], 2: [], 3: [32, 1]}
+        has_initial_state_per_rank = {
+            0: [True, True, False, True, True],
+            1: [True],
+            3: [True, True],
+        }
+        self._run_test(
+            "prefill",
+            lens,
+            dp_size=4,
+            tp_size=1,
+            has_initial_state_per_rank=has_initial_state_per_rank,
+        )
+
+    def test_extend_mixed_dp2_tp2(self):
+        lens = {0: [128, 1, 1], 1: [1, 1]}
+        has_initial_state_per_rank = {0: [True, True, True], 1: [True, True]}
+        self._run_test(
+            "prefill",
+            lens,
+            dp_size=2,
+            tp_size=2,
             has_initial_state_per_rank=has_initial_state_per_rank,
         )
 

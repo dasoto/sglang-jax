@@ -5,6 +5,8 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.kernels.kda import (
@@ -18,6 +20,7 @@ from sgl_jax.srt.layers.attention.hybrid_linear_attn_backend import (
 )
 from sgl_jax.srt.layers.attention.linear.short_convolution import short_convolution
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
+from sgl_jax.srt.utils.jax_utils import device_array
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
 if TYPE_CHECKING:
@@ -71,6 +74,58 @@ def conv_states_from_packed(packed, shards: int):
     return x.swapaxes(1, 2).reshape(b, d3, k1)
 
 
+def mixed_decode_rows_enabled() -> bool:
+    """SGLANG_JAX_KDA_MIXED_DECODE_ROWS=0 restores the single prefill-kernel call."""
+    flag = os.environ.get("SGLANG_JAX_KDA_MIXED_DECODE_ROWS", "1").strip().lower()
+    return flag not in ("0", "false", "no", "off")
+
+
+def tail_decode_rows(extend_lens_2d) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Split each DP section of an EXTEND batch into prefill rows and tail decode rows.
+
+    A mixed prefill+decode step appends the running requests, one new token each, after
+    the prefill requests. Mega KDA handles at most two requests per 64-token tile, so
+    those rows would send the whole batch to the chunked fallback, which pads every
+    request to a full tile. The one-token rows after the last multi-token row run the
+    single-step recurrence instead, and the prefill kernel gets cu_q_lens with those
+    rows emptied: they sit at the end of the section, so no other row moves.
+
+    Args:
+        extend_lens_2d: [dp_size, per_dp_bs] new tokens per row (0 for padding rows).
+
+    Returns:
+        (prefill_cu_q_lens [dp_size * (per_dp_bs + 1)], decode_row_starts and
+        decode_row_mask [dp_size * per_dp_bs]); starts are section-local token offsets.
+    """
+    ext = np.asarray(extend_lens_2d, dtype=np.int32)
+    dp, bs = ext.shape
+    rows = np.arange(bs, dtype=np.int32)
+    last_long = np.max(np.where(ext > 1, rows[None, :], -1), axis=1)
+    mask = (ext == 1) & (rows[None, :] > last_long[:, None])
+    cu = np.zeros((dp, bs + 1), dtype=np.int32)
+    cu[:, 1:] = np.cumsum(ext, axis=1)
+    prefill_cu = np.zeros((dp, bs + 1), dtype=np.int32)
+    prefill_cu[:, 1:] = np.cumsum(np.where(mask, 0, ext), axis=1)
+    starts = np.where(mask, cu[:, :-1], 0).astype(np.int32)
+    return prefill_cu.ravel(), starts.ravel(), mask.astype(np.int32).ravel()
+
+
+def kda_gate(g, A_log, dt_bias, lower_bound):
+    """KDA gate log-decay in float32: ``g`` [..., H, K], ``A_log`` [H], ``dt_bias`` [H, K]."""
+    g32 = g.astype(jnp.float32) + dt_bias.astype(jnp.float32)
+    a_scale = jnp.exp(A_log.astype(jnp.float32))[:, None]
+    if lower_bound is None:
+        return -a_scale * jax.nn.softplus(g32)
+    return lower_bound * jax.nn.sigmoid(a_scale * g32)
+
+
+def _gate_lower_bound(layer):
+    lower_bound = getattr(layer, "kda_gate_lower_bound", None)
+    if lower_bound is None:
+        lower_bound = getattr(layer, "kda_lower_bound", None)
+    return lower_bound
+
+
 class KDAAttnBackend(LinearRecurrentAttnBackend):
     """Attention backend for KDA (Kimi Delta Attention) linear attention."""
 
@@ -78,6 +133,22 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         super().__init__(
             mesh=mesh,
         )
+
+    def get_forward_metadata(self, batch):
+        metadata = super().get_forward_metadata(batch)
+        if batch.forward_mode == ForwardMode.EXTEND and mixed_decode_rows_enabled():
+            prefill_cu_q_lens, decode_row_starts, decode_row_mask = tail_decode_rows(
+                batch.extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
+            )
+            (
+                metadata.prefill_cu_q_lens,
+                metadata.decode_row_starts,
+                metadata.decode_row_mask,
+            ) = device_array(
+                (prefill_cu_q_lens, decode_row_starts, decode_row_mask),
+                sharding=NamedSharding(self.mesh, P("data")),
+            )
+        return metadata
 
     def __call__(
         self,
@@ -149,7 +220,22 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         a = a.reshape(a.shape[0], layer.num_q_heads, layer.head_q_dim)
         b = b.reshape(b.shape[0], layer.num_q_heads)
 
-        if forward_batch.forward_mode == ForwardMode.EXTEND:
+        decode_row_mask = self.forward_metadata.decode_row_mask
+        if forward_batch.forward_mode == ForwardMode.EXTEND and decode_row_mask is not None:
+            output, new_recurrent = self._forward_extend_mixed(
+                q,
+                k,
+                v,
+                a,
+                b,
+                ssm_states,
+                self.forward_metadata.prefill_cu_q_lens,
+                self.forward_metadata.decode_row_starts,
+                decode_row_mask,
+                layer,
+                scale=layer.scale,
+            )
+        elif forward_batch.forward_mode == ForwardMode.EXTEND:
             output, new_recurrent = self._forward_extend(
                 q,
                 k,
@@ -492,6 +578,98 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         )
         return o[0], final_state
 
+    @named_scope("kda_extend_mixed")
+    def _forward_extend_mixed(
+        self,
+        q: jax.Array,
+        k: jax.Array,
+        v: jax.Array,
+        g: jax.Array,
+        beta: jax.Array,
+        initial_state: jax.Array,
+        prefill_cu_q_lens: jax.Array,
+        decode_row_starts: jax.Array,
+        decode_row_mask: jax.Array,
+        layer: RadixLinearAttention,
+        scale: float | None = None,
+    ) -> tuple[jax.Array, jax.Array]:
+        """EXTEND whose DP sections may end in decode rows (see tail_decode_rows).
+
+        The prefill kernel runs over the multi-token rows with the decode rows emptied
+        from its cu_q_lens. Each decode row then takes the DECODE path's single-step
+        recurrence from its initial state, and its output token and final state replace
+        the prefill kernel's unused values for that row.
+        """
+        o_prefill, state_prefill = self._forward_extend(
+            q, k, v, g, beta, initial_state, prefill_cu_q_lens, layer, scale=scale
+        )
+        H = q.shape[-2]
+        A_log = layer.A_log.value.reshape(H)
+        dt_bias = layer.dt_bias.value.reshape(H, -1)
+        lower_bound = _gate_lower_bound(layer)
+        scale = scale if scale is not None else layer.scale
+
+        def _merge(q, k, v, g, beta, h0, o_p, s_p, starts, mask, A_log, dt_bias):
+            def _decode_rows(_):
+                qd = l2_normalize(q[starts])
+                kd = l2_normalize(k[starts])
+                gd = kda_gate(g[starts], A_log, dt_bias, lower_bound)
+                od, sd = naive_recurrent_kda(
+                    qd[:, None],
+                    kd[:, None],
+                    v[starts][:, None],
+                    gd[:, None],
+                    beta[starts][:, None],
+                    scale=scale,
+                    initial_state=h0,
+                    output_final_state=True,
+                )
+                rows = mask != 0
+                # Out-of-range positions drop the other rows' updates.
+                pos = jnp.where(rows, starts, o_p.shape[0])
+                o = o_p.at[pos].set(od[:, 0].astype(o_p.dtype), mode="drop")
+                s = jnp.where(rows[:, None, None, None], sd.astype(s_p.dtype), s_p)
+                return o, s
+
+            return jax.lax.cond(jnp.any(mask != 0), _decode_rows, lambda _: (o_p, s_p), None)
+
+        token_spec = P("data", "tensor", None)
+        state_spec = P("data", "tensor", None, None)
+        sharded = jax.shard_map(
+            _merge,
+            mesh=self.mesh,
+            in_specs=(
+                token_spec,  # q [T, H, K]
+                token_spec,  # k [T, H, K]
+                token_spec,  # v [T, H, V]
+                token_spec,  # g [T, H, K]
+                P("data", "tensor"),  # beta [T, H]
+                state_spec,  # initial_state [N, H, K, V]
+                token_spec,  # prefill-kernel output [T, H, V]
+                state_spec,  # prefill-kernel final state [N, H, K, V]
+                P("data"),  # decode_row_starts [N]
+                P("data"),  # decode_row_mask [N]
+                P("tensor"),  # A_log [H]
+                P("tensor", None),  # dt_bias [H, K]
+            ),
+            out_specs=(token_spec, state_spec),
+            check_vma=False,
+        )
+        return sharded(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            initial_state,
+            o_prefill,
+            state_prefill,
+            decode_row_starts,
+            decode_row_mask,
+            A_log,
+            dt_bias,
+        )
+
     @named_scope("kda_decode")
     def _forward_decode(
         self,
@@ -554,16 +732,12 @@ class KDAAttnBackend(LinearRecurrentAttnBackend):
         if layer.A_log is None or layer.dt_bias is None:
             raise ValueError("KDA gate activation requires layer.A_log and layer.dt_bias")
         H = g.shape[-2]
-        g32 = g.astype(jnp.float32) + layer.dt_bias.value.reshape(H, -1).astype(jnp.float32)
-        a_scale = jnp.exp(layer.A_log.value.reshape(H, 1).astype(jnp.float32))
-        lower_bound = getattr(layer, "kda_gate_lower_bound", None)
-        if lower_bound is None:
-            lower_bound = getattr(layer, "kda_lower_bound", None)
-        if lower_bound is None:
-            out = -a_scale * jax.nn.softplus(g32)
-        else:
-            out = lower_bound * jax.nn.sigmoid(a_scale * g32)
-        return out
+        return kda_gate(
+            g,
+            layer.A_log.value.reshape(H),
+            layer.dt_bias.value.reshape(H, -1),
+            _gate_lower_bound(layer),
+        )
 
     def _unpack_conv_states(
         self,
@@ -613,4 +787,7 @@ __all__ = [
     "conv_state_shards",
     "conv_states_from_packed",
     "conv_states_to_packed",
+    "kda_gate",
+    "mixed_decode_rows_enabled",
+    "tail_decode_rows",
 ]

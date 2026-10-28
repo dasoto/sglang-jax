@@ -49,6 +49,25 @@ class TestLinearRecurrentAttnBackendMetadataTrack(unittest.TestCase):
 
         self.assertIsNone(rebuilt.recurrent_track_indices)
         self.assertIsNone(rebuilt.recurrent_track_mask)
+        self.assertIsNone(rebuilt.prefill_cu_q_lens)
+        self.assertIsNone(rebuilt.decode_row_starts)
+        self.assertIsNone(rebuilt.decode_row_mask)
+
+    def test_mixed_decode_row_arrays_round_trip(self):
+        md = LinearRecurrentAttnBackendMetadata(
+            cu_q_lens=np.array([0, 5, 6], dtype=np.int32),
+            recurrent_track_mask=np.array([0, 1], dtype=np.int32),
+            prefill_cu_q_lens=np.array([0, 5, 5], dtype=np.int32),
+            decode_row_starts=np.array([0, 5], dtype=np.int32),
+            decode_row_mask=np.array([0, 1], dtype=np.int32),
+        )
+        rebuilt = LinearRecurrentAttnBackendMetadata.tree_unflatten(*reversed(md.tree_flatten()))
+
+        np.testing.assert_array_equal(rebuilt.cu_q_lens, [0, 5, 6])
+        np.testing.assert_array_equal(rebuilt.recurrent_track_mask, [0, 1])
+        np.testing.assert_array_equal(rebuilt.prefill_cu_q_lens, [0, 5, 5])
+        np.testing.assert_array_equal(rebuilt.decode_row_starts, [0, 5])
+        np.testing.assert_array_equal(rebuilt.decode_row_mask, [0, 1])
 
 
 def _minimal_forward_batch(**overrides):

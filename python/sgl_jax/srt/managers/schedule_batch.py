@@ -933,6 +933,13 @@ def _build_recurrent_track_entries(
     )
 
 
+def _track_or_dormant(arr: np.ndarray | None, n: int) -> np.ndarray:
+    """A per-DP track array, or ``n`` dormant (0) entries when that side built none."""
+    if arr is None:
+        return np.zeros(n, dtype=np.int32)
+    return np.asarray(arr, dtype=np.int32)
+
+
 def swa_eviction_interval(sliding_window_size: int, page_size: int) -> int:
     """Return the page-aligned decode interval between SWA evictions."""
     multiplier = float(os.environ.get("SGL_JAX_SWA_EVICTION_INTERVAL_MULTIPLIER", "1.0"))
@@ -1217,6 +1224,9 @@ class ScheduleBatch:
         merged_input_ids_per_dp: dict[int, np.ndarray] = {}
         merged_out_cache_loc_per_dp: dict[int, np.ndarray] = {}
         added_prefix_lens_per_dp: dict[int, list[int]] = {}
+        # Extra-buffer track entries: prepare_for_extend built the prefill rows',
+        # running_batch.prepare_for_decode the decode rows' (read-then-flip done).
+        merged_track_per_dp: dict[int, tuple[np.ndarray, np.ndarray]] = {}
 
         delta = 0 if self.enable_overlap else -1
         for dp_rank in range(self.dp_size):
@@ -1262,6 +1272,27 @@ class ScheduleBatch:
                 len(r.origin_input_ids) + len(r.output_ids) + delta for r in running_reqs
             ]
 
+            if (
+                self_info.recurrent_track_mask is not None
+                or running_info.recurrent_track_mask is not None
+            ):
+                n_self = len(self_info.reqs or [])
+                n_running = len(running_reqs)
+                merged_track_per_dp[dp_rank] = (
+                    np.concatenate(
+                        [
+                            _track_or_dormant(self_info.recurrent_track_indices, n_self),
+                            _track_or_dormant(running_info.recurrent_track_indices, n_running),
+                        ]
+                    ),
+                    np.concatenate(
+                        [
+                            _track_or_dormant(self_info.recurrent_track_mask, n_self),
+                            _track_or_dormant(running_info.recurrent_track_mask, n_running),
+                        ]
+                    ),
+                )
+
         self.merge_batch(running_batch)
 
         for dp_rank in range(self.dp_size):
@@ -1274,6 +1305,10 @@ class ScheduleBatch:
 
             info.input_ids = merged_input_ids_per_dp[dp_rank]
             info.out_cache_loc = merged_out_cache_loc_per_dp[dp_rank]
+            if dp_rank in merged_track_per_dp:
+                info.recurrent_track_indices, info.recurrent_track_mask = merged_track_per_dp[
+                    dp_rank
+                ]
 
             if info.prefix_lens is None:
                 info.prefix_lens = []

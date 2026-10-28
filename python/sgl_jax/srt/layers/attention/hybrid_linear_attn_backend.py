@@ -36,6 +36,12 @@ class LinearRecurrentAttnBackendMetadata:
     # Optional: None when the batch crosses no track boundary.
     recurrent_track_indices: jax.Array = None
     recurrent_track_mask: jax.Array = None
+    # Mixed prefill+decode EXTEND batches (KDA): the one-token rows at the end of each
+    # DP section take the decode recurrence; the prefill kernel gets cu_q_lens with
+    # those rows emptied. None outside EXTEND (see kda_backend.tail_decode_rows).
+    prefill_cu_q_lens: jax.Array = None
+    decode_row_starts: jax.Array = None
+    decode_row_mask: jax.Array = None
 
     def tree_flatten(self):
         children = (
@@ -44,6 +50,9 @@ class LinearRecurrentAttnBackendMetadata:
             self.has_initial_state,
             self.recurrent_track_indices,
             self.recurrent_track_mask,
+            self.prefill_cu_q_lens,
+            self.decode_row_starts,
+            self.decode_row_mask,
         )
         aux_data = {}
         return children, aux_data
@@ -56,6 +65,9 @@ class LinearRecurrentAttnBackendMetadata:
             has_initial_state=children[2],
             recurrent_track_indices=children[3],
             recurrent_track_mask=children[4],
+            prefill_cu_q_lens=children[5],
+            decode_row_starts=children[6],
+            decode_row_mask=children[7],
         )
 
 
