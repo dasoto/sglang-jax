@@ -444,7 +444,7 @@ def test_mla_kv_multi_block_gather_and_write():
     padded_src[:valid_pages] = p_global_pages
 
     buf_sharding = p_pool.kv_buffer[0].sharding
-    out_sharding = NamedSharding(mesh, local_kv_spec_for_pool(p_pool, mesh))
+    out_sharding = NamedSharding(mesh, local_kv_spec_for_pool(p_pool, mesh, padded_pages))
     idx_sharding = NamedSharding(mesh, P())
     dev_idx = jax.device_put(jnp.asarray(padded_src, dtype=jnp.int32), idx_sharding)
 
