@@ -1408,46 +1408,197 @@ def write_kv_layer(
     )
 
 
-def _write_mla_kv_layer_impl(
+@partial(
+    jax.jit,
+    static_argnames=("lkv_sharding", "cache_sharding"),
+    donate_argnames=("kv_cache",),
+)
+def _jit_write_mla_kv_layer_shard_map(
     layer_kv: jax.Array,
     dst_global_page_indices: jax.Array,
     kv_cache: jax.Array,
+    lkv_sharding: jax.sharding.NamedSharding,
+    cache_sharding: jax.sharding.NamedSharding,
 ) -> jax.Array:
-    sharding = jax.typeof(kv_cache).sharding
-    if sharding is not None and any(
-        t == jax.sharding.AxisType.Explicit for t in sharding.mesh.axis_types
-    ):
+    mesh = cache_sharding.mesh
+    cache_spec = cache_sharding.spec
+    lkv_spec = lkv_sharding.spec
+    dp_size = mesh.shape.get("data", 1)
+    tp_size = mesh.shape.get("tensor", 1)
 
-        @partial(jax.sharding.auto_axes, out_sharding=sharding)
-        def _impl(lkv, idx, cache):
-            return cache.at[idx].set(lkv, mode="drop")
+    def _write_fn(lkv, idx, c_local):
+        if len(lkv_spec) > 0 and lkv_spec[0] is not None:
+            lkv = jax.lax.all_gather(lkv, lkv_spec[0], axis=0, tiled=True)
+        if len(lkv_spec) > 1 and lkv_spec[1] is not None:
+            lkv = jax.lax.all_gather(lkv, lkv_spec[1], axis=1, tiled=True)
+        if len(lkv_spec) > 3 and lkv_spec[3] is not None:
+            lkv = jax.lax.all_gather(lkv, lkv_spec[3], axis=3, tiled=True)
+        local_num_pages = c_local.shape[0]
+        if cache_spec[0] == ("data", "tensor"):
+            my_shard = jax.lax.axis_index("data") * tp_size + jax.lax.axis_index("tensor")
+            num_shards = dp_size * tp_size
+        elif cache_spec[0] == "data":
+            my_shard = jax.lax.axis_index("data")
+            num_shards = dp_size
+        else:
+            my_shard = 0
+            num_shards = 1
+        total_pages = local_num_pages * num_shards
+        owner = idx // local_num_pages
+        local_page = idx % local_num_pages
+        valid = (idx >= 0) & (idx < total_pages) & (owner == my_shard)
+        num_p = idx.shape[0]
 
-        return _impl(layer_kv, dst_global_page_indices, kv_cache)
-    return kv_cache.at[dst_global_page_indices].set(layer_kv, mode="drop")
+        def _step(p, c):
+            lp = local_page[p]
+            return jax.lax.cond(
+                valid[p],
+                lambda c_in: jax.lax.dynamic_update_index_in_dim(c_in, lkv[p], lp, axis=0),
+                lambda c_in: c_in,
+                c,
+            )
+
+        return jax.lax.fori_loop(0, num_p, _step, c_local)
+
+    return jax.shard_map(
+        _write_fn,
+        mesh=mesh,
+        in_specs=(lkv_spec, P(None), cache_spec),
+        out_specs=cache_spec,
+        check_vma=False,
+    )(layer_kv, dst_global_page_indices, kv_cache)
 
 
-@partial(jax.jit, donate_argnames=("kv_cache",))
 def write_mla_kv_layer(
     layer_kv: jax.Array,
     dst_global_page_indices: jax.Array,
     kv_cache: jax.Array,
+    *,
+    lkv_sharding: jax.sharding.NamedSharding | None = None,
+    cache_sharding: jax.sharding.NamedSharding | None = None,
 ) -> jax.Array:
     """In-place page-level scatter into a single layer's MLA KV cache buffer.
 
-    Out-of-bounds indices (e.g. ``total_pages`` padding) are ignored via ``mode='drop'``.
+    Out-of-bounds indices (e.g. ``total_pages`` padding) are ignored.
     """
-    return _write_mla_kv_layer_impl(layer_kv, dst_global_page_indices, kv_cache)
+    if cache_sharding is None:
+        sh = getattr(kv_cache, "sharding", None)
+        if isinstance(sh, jax.sharding.NamedSharding):
+            cache_sharding = sh
+    if lkv_sharding is None:
+        sh = getattr(layer_kv, "sharding", None)
+        if isinstance(sh, jax.sharding.NamedSharding):
+            lkv_sharding = sh
+    if cache_sharding is not None and lkv_sharding is not None:
+        return _jit_write_mla_kv_layer_shard_map(
+            layer_kv, dst_global_page_indices, kv_cache, lkv_sharding, cache_sharding
+        )
+    return kv_cache.at[dst_global_page_indices].set(layer_kv, mode="drop")
 
 
-@partial(jax.jit, donate_argnames=("kv_buffers",))
+@partial(
+    jax.jit,
+    static_argnames=("lkv_sharding", "cache_sharding"),
+    donate_argnames=("kv_buffers",),
+)
+def _jit_write_all_mla_kv_layers_shard_map(
+    kv: jax.Array | list[jax.Array],
+    dst_global_page_indices: jax.Array,
+    kv_buffers: list[jax.Array],
+    lkv_sharding: jax.sharding.NamedSharding,
+    cache_sharding: jax.sharding.NamedSharding,
+) -> list[jax.Array]:
+    mesh = cache_sharding.mesh
+    cache_spec = cache_sharding.spec
+    lkv_spec = lkv_sharding.spec
+    dp_size = mesh.shape.get("data", 1)
+    tp_size = mesh.shape.get("tensor", 1)
+    is_stacked = isinstance(kv, jax.Array)
+
+    def _write_fn(kv_in, idx, c_list):
+        local_num_pages = c_list[0].shape[0]
+        if cache_spec[0] == ("data", "tensor"):
+            my_shard = jax.lax.axis_index("data") * tp_size + jax.lax.axis_index("tensor")
+            num_shards = dp_size * tp_size
+        elif cache_spec[0] == "data":
+            my_shard = jax.lax.axis_index("data")
+            num_shards = dp_size
+        else:
+            my_shard = 0
+            num_shards = 1
+        total_pages = local_num_pages * num_shards
+        owner = idx // local_num_pages
+        local_page = idx % local_num_pages
+        valid = (idx >= 0) & (idx < total_pages) & (owner == my_shard)
+
+        if is_stacked:
+            g_all = kv_in
+            if len(lkv_spec) > 1 and lkv_spec[1] is not None:
+                g_all = jax.lax.all_gather(g_all, lkv_spec[1], axis=1, tiled=True)
+            if len(lkv_spec) > 2 and lkv_spec[2] is not None:
+                g_all = jax.lax.all_gather(g_all, lkv_spec[2], axis=2, tiled=True)
+            if len(lkv_spec) > 4 and lkv_spec[4] is not None:
+                g_all = jax.lax.all_gather(g_all, lkv_spec[4], axis=4, tiled=True)
+        else:
+            g_all = jnp.stack(kv_in, axis=0)
+            if len(lkv_spec) > 0 and lkv_spec[0] is not None:
+                g_all = jax.lax.all_gather(g_all, lkv_spec[0], axis=1, tiled=True)
+            if len(lkv_spec) > 1 and lkv_spec[1] is not None:
+                g_all = jax.lax.all_gather(g_all, lkv_spec[1], axis=2, tiled=True)
+            if len(lkv_spec) > 3 and lkv_spec[3] is not None:
+                g_all = jax.lax.all_gather(g_all, lkv_spec[3], axis=4, tiled=True)
+
+        num_p = idx.shape[0]
+
+        def _step(p, cs):
+            lp = local_page[p]
+
+            def _do_upd(cs_in):
+                return [
+                    jax.lax.dynamic_update_index_in_dim(c, g_all[l, p], lp, axis=0)
+                    for l, c in enumerate(cs_in)
+                ]
+
+            return jax.lax.cond(valid[p], _do_upd, lambda cs_in: cs_in, cs)
+
+        return jax.lax.fori_loop(0, num_p, _step, c_list)
+
+    kv_in_spec = lkv_spec if is_stacked else [lkv_spec for _ in kv_buffers]
+    return jax.shard_map(
+        _write_fn,
+        mesh=mesh,
+        in_specs=(kv_in_spec, P(None), [cache_spec for _ in kv_buffers]),
+        out_specs=[cache_spec for _ in kv_buffers],
+        check_vma=False,
+    )(kv, dst_global_page_indices, kv_buffers)
+
+
 def write_all_mla_kv_layers(
     kv: jax.Array | list[jax.Array],
     dst_global_page_indices: jax.Array,
     kv_buffers: list[jax.Array],
+    *,
+    lkv_sharding: jax.sharding.NamedSharding | None = None,
+    cache_sharding: jax.sharding.NamedSharding | None = None,
 ) -> list[jax.Array]:
     """In-place page-level scatter into all MLA KV cache buffers in a single JIT dispatch."""
+    if not kv_buffers:
+        return []
+    if cache_sharding is None:
+        sh = getattr(kv_buffers[0], "sharding", None)
+        if isinstance(sh, jax.sharding.NamedSharding):
+            cache_sharding = sh
+    if lkv_sharding is None:
+        sample = kv if isinstance(kv, jax.Array) else kv[0]
+        sh = getattr(sample, "sharding", None)
+        if isinstance(sh, jax.sharding.NamedSharding):
+            lkv_sharding = sh
+    if cache_sharding is not None and lkv_sharding is not None:
+        return _jit_write_all_mla_kv_layers_shard_map(
+            kv, dst_global_page_indices, kv_buffers, lkv_sharding, cache_sharding
+        )
     return [
-        _write_mla_kv_layer_impl(kv[i], dst_global_page_indices, kv_buffers[i])
+        write_mla_kv_layer(kv[i], dst_global_page_indices, kv_buffers[i])
         for i in range(len(kv_buffers))
     ]
 
