@@ -317,3 +317,83 @@ def test_multihost_sync_63bit_bootstrap_room_without_x64():
     assert success == {big_room_ok}
     assert failed == {big_room_fail}
 
+
+def test_pd_prefill_chunked_unified_radix_cache():
+    """Verify multi-chunk PD prefill with UnifiedRadixCache preserves last_node and hits prefix cache."""
+    from sgl_jax.srt.mem_cache.common import release_kv_cache
+    from sgl_jax.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+    mesh = _make_mesh()
+    prefill_sched = _DummyHybridScheduler(mesh)
+    tree_cache = UnifiedRadixCache(
+        req_to_token_pool=prefill_sched.req_to_token_pool,
+        token_to_kv_pool_allocator=prefill_sched.token_to_kv_pool_allocator,
+        page_size=8,
+        disable=False,
+    )
+    prefill_sched.tree_cache = tree_cache
+
+    req1 = Req(
+        rid="pd-chunk-1",
+        origin_input_text="hello world",
+        origin_input_ids=list(range(10, 42)),  # 32 tokens = 4 pages of 8
+        sampling_params=SamplingParams(max_new_tokens=4, temperature=0.0),
+        dp_rank=0,
+    )
+    req1.sampling_params.normalize(None)
+    req1.bootstrap_room = 111222
+
+    # Round 1: initial admission with tree_cache (16-token chunk = 2 pages)
+    req1.init_next_round_input(tree_cache)
+    assert req1.last_node is tree_cache.root_node
+    lock1 = tree_cache.inc_lock_ref(req1.last_node)
+    req1.cache_lock_params = lock1.to_dec_params()
+    req1.extend_input_len = 16
+    req1.fill_ids = req1.origin_input_ids[:16]
+    b1 = ScheduleBatch.init_new(
+        reqs=[[req1], []],
+        req_to_token_pool=prefill_sched.req_to_token_pool,
+        token_to_kv_pool_allocator=prefill_sched.token_to_kv_pool_allocator,
+        tree_cache=tree_cache,
+        model_config=prefill_sched.model_config,
+        enable_overlap=False,
+        dp_size=2,
+        mesh=mesh,
+    )
+    b1.prepare_for_extend()
+    tree_cache.cache_unfinished_req(req1)
+    saved_node = req1.last_node
+    assert saved_node is not None and saved_node is not tree_cache.root_node
+    assert len(req1.prefix_indices) == 16
+
+    # Round 2: continuation round (scheduler calls init_next_round_input() with tree_cache=None)
+    req1.init_next_round_input()
+    assert req1.last_node is saved_node
+    assert req1.extend_input_len == 16
+    req1.fill_ids = req1.origin_input_ids[:32]
+    # Allocate only the second chunk's KV pages without re-allocating req_pool_idx
+    kv_chunk2 = prefill_sched.token_to_kv_pool_allocator.alloc(16, dp_rank=0)
+    prefill_sched.req_to_token_pool.write((req1.req_pool_idx, slice(16, 32)), kv_chunk2)
+    req1.kv_committed_len = 32
+    req1.kv_allocated_len = 32
+    # Verify a second cache_unfinished_req (e.g. if there were a 3rd chunk) does NOT crash on None last_node
+    tree_cache.cache_unfinished_req(req1)
+    assert req1.last_node is not None and req1.last_node is not tree_cache.root_node
+    release_kv_cache(req1, tree_cache)
+
+    # Request 2 shares the first 24 tokens with req1 -> should hit 24 tokens in UnifiedRadixCache
+    req2 = Req(
+        rid="pd-chunk-2",
+        origin_input_text="hello world again",
+        origin_input_ids=list(range(10, 34)) + [99, 100, 101, 102, 103, 104, 105, 106],
+        sampling_params=SamplingParams(max_new_tokens=4, temperature=0.0),
+        dp_rank=0,
+    )
+    req2.sampling_params.normalize(None)
+    req2.bootstrap_room = 333444
+    req2.init_next_round_input(tree_cache)
+    assert len(req2.prefix_indices) == 24
+    assert req2.extend_input_len == 8
+    assert req2.last_node is not None and req2.last_node is not tree_cache.root_node
+
+

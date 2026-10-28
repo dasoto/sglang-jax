@@ -33,8 +33,7 @@ def _get_recurrent_zero_allocator(shape, dtype, sharding):
     return _RECURRENT_ZERO_ALLOCATOR_CACHE[key]
 
 
-@partial(jax.jit, static_argnames=("out_sharding",))
-def _jit_gather_recurrent_slot(
+def _gather_recurrent_slot_impl(
     buf: jax.Array, global_slot: jax.Array, out_sharding: NamedSharding
 ) -> jax.Array:
     if out_sharding is not None and any(
@@ -49,8 +48,36 @@ def _jit_gather_recurrent_slot(
     return _impl(buf, global_slot)
 
 
-@partial(jax.jit, donate_argnames=("buf",))
-def _jit_write_recurrent_slot(
+@partial(jax.jit, static_argnames=("out_sharding",))
+def _jit_gather_recurrent_slot(
+    buf: jax.Array, global_slot: jax.Array, out_sharding: NamedSharding
+) -> jax.Array:
+    return _gather_recurrent_slot_impl(buf, global_slot, out_sharding)
+
+
+@partial(
+    jax.jit,
+    static_argnames=("t_layer_sharding", "c_layer_sharding"),
+)
+def _jit_extract_all_recurrent_slots(
+    recurrent_buffers: list[jax.Array],
+    conv_buffers: list[list[jax.Array]],
+    global_slot: jax.Array,
+    t_layer_sharding: NamedSharding,
+    c_layer_sharding: NamedSharding,
+) -> tuple[jax.Array, jax.Array]:
+    t_layers = [
+        _gather_recurrent_slot_impl(buf, global_slot, t_layer_sharding)
+        for buf in recurrent_buffers
+    ]
+    c_layers = [
+        _gather_recurrent_slot_impl(inner[0], global_slot, c_layer_sharding)
+        for inner in conv_buffers
+    ]
+    return jnp.stack(t_layers, axis=0), jnp.stack(c_layers, axis=0)
+
+
+def _write_recurrent_slot_impl(
     buf: jax.Array, global_slot: jax.Array, val: jax.Array
 ) -> jax.Array:
     sharding = jax.typeof(buf).sharding
@@ -64,6 +91,32 @@ def _jit_write_recurrent_slot(
 
         return _impl(buf, global_slot, val)
     return buf.at[global_slot].set(val)
+
+
+@partial(jax.jit, donate_argnames=("buf",))
+def _jit_write_recurrent_slot(
+    buf: jax.Array, global_slot: jax.Array, val: jax.Array
+) -> jax.Array:
+    return _write_recurrent_slot_impl(buf, global_slot, val)
+
+
+@partial(jax.jit, donate_argnames=("recurrent_buffers", "conv_buffers"))
+def _jit_install_all_recurrent_slots(
+    recurrent_buffers: list[jax.Array],
+    conv_buffers: list[list[jax.Array]],
+    global_slot: jax.Array,
+    temporal_stacked: jax.Array,
+    conv_stacked: jax.Array,
+) -> tuple[list[jax.Array], list[list[jax.Array]]]:
+    new_recurrent = [
+        _write_recurrent_slot_impl(recurrent_buffers[l], global_slot, temporal_stacked[l])
+        for l in range(len(recurrent_buffers))
+    ]
+    new_conv = [
+        [_write_recurrent_slot_impl(conv_buffers[l][0], global_slot, conv_stacked[l])]
+        for l in range(len(conv_buffers))
+    ]
+    return new_recurrent, new_conv
 
 
 _DTYPE_MAP = {
@@ -328,15 +381,13 @@ class RecurrentStatePool:
             NamedSharding(self.mesh, P()),
         )
         _, _, t_layer_sharding, c_layer_sharding = self._slot_transfer_specs_and_layer_shardings()
-        t_layers = [
-            _jit_gather_recurrent_slot(self.recurrent_buffers[l], gslot, t_layer_sharding)
-            for l in range(self.num_linear_recurrent_layers)
-        ]
-        c_layers = [
-            _jit_gather_recurrent_slot(self.conv_buffers[l][0], gslot, c_layer_sharding)
-            for l in range(self.num_linear_recurrent_layers)
-        ]
-        return jnp.stack(t_layers, axis=0), jnp.stack(c_layers, axis=0)
+        return _jit_extract_all_recurrent_slots(
+            self.recurrent_buffers,
+            self.conv_buffers,
+            gslot,
+            t_layer_sharding,
+            c_layer_sharding,
+        )
 
     def install_slot(
         self,
@@ -349,13 +400,13 @@ class RecurrentStatePool:
             jnp.asarray(self.global_slot_index(dp_rank, local_slot), dtype=jnp.int32),
             NamedSharding(self.mesh, P()),
         )
-        for l in range(self.num_linear_recurrent_layers):
-            self.recurrent_buffers[l] = _jit_write_recurrent_slot(
-                self.recurrent_buffers[l], gslot, temporal_stacked[l]
-            )
-            self.conv_buffers[l][0] = _jit_write_recurrent_slot(
-                self.conv_buffers[l][0], gslot, conv_stacked[l]
-            )
+        self.recurrent_buffers, self.conv_buffers = _jit_install_all_recurrent_slots(
+            self.recurrent_buffers,
+            self.conv_buffers,
+            gslot,
+            temporal_stacked,
+            conv_stacked,
+        )
 
     def copy_slots(self, src_indices, dst_indices):
         """Clone src->dst slots across all layers; rows with src==0 keep dst.
