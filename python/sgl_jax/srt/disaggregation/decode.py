@@ -1183,8 +1183,9 @@ class SchedulerDisaggregationDecodeMixin:
             info.seq_lens = np.array([seqlen], dtype=np.int32)
             info.seq_lens_sum = seqlen
             info.output_ids = np.array([first_token_id], dtype=np.int32)
-            info.top_logprobs_nums = [req.top_logprobs_num]
-            info.token_ids_logprobs = [req.token_ids_logprob]
+            if admit_batch.return_logprob:
+                info.top_logprobs_nums = [req.top_logprobs_num]
+                info.token_ids_logprobs = [req.token_ids_logprob]
             info.sampling_info = SamplingBatchInfo.from_schedule_batch(
                 info,
                 self.model_config.vocab_size,

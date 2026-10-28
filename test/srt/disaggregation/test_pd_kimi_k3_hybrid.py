@@ -61,7 +61,7 @@ def _make_hybrid_pools(mesh: Mesh, *, page_size: int = 8):
         dcp_size=dcp_size,
     )
     rec_pool = RecurrentStatePool(
-        size=8,
+        size=16,
         num_heads=4,
         head_dim=16,
         num_k_heads=4,
@@ -263,6 +263,34 @@ def test_mla_dcp_and_kda_roundtrip_and_pure_decode_admission():
     assert info0.seq_lens.tolist() == [21]
     assert info0.recurrent_indices.tolist() == [d_req.recurrent_pool_idx]
     assert info0.out_cache_loc.tolist() == [int(d_kv_indices[20])]
+    info0.output_ids = np.array([778], dtype=np.int32)
+
+    # Admit a second pure-decode request onto the same dp_rank=0, merge, finish req 1, and filter
+    d_req2 = Req(
+        rid="req-k3-2",
+        origin_input_text="world",
+        origin_input_ids=list(range(100, 112)),
+        sampling_params=SamplingParams(max_new_tokens=8, temperature=0.0),
+        dp_rank=0,
+    )
+    d_req2.sampling_params.normalize(None)
+    d_req2.fill_ids = list(d_req2.origin_input_ids)
+    d_req2.bootstrap_room = 987654
+    d_kv_indices2 = decode_sched.token_to_kv_pool_allocator.alloc(16, dp_rank=0)
+    assert d_kv_indices2 is not None
+    decode_sched._enqueue_hybrid_pure_decode(d_req2, d_kv_indices2, 888)
+    decode_sched._drain_ready_pure_decode()
+    assert len(decode_sched.running_batch.reqs_info[0].reqs) == 2
+    assert decode_sched.running_batch.reqs_info[0].top_logprobs_nums is None
+
+    # Finish the first request and verify filter_batch succeeds without IndexError
+    from sgl_jax.srt.managers.schedule_batch import FINISH_LENGTH
+
+    d_req.finished_reason = FINISH_LENGTH(8)
+    decode_sched.running_batch.filter_batch()
+    assert len(decode_sched.running_batch.reqs_info[0].reqs) == 1
+    assert decode_sched.running_batch.reqs_info[0].reqs[0].rid == "req-k3-2"
+
 
 
 def test_multihost_sync_63bit_bootstrap_room_without_x64():

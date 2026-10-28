@@ -2131,28 +2131,16 @@ class ScheduleBatch:
                     ]
                 )
 
-            # Merge logprobs
-            if self.return_logprob and other.return_logprob:
-                if (
-                    self_info.top_logprobs_nums is not None
-                    and other_info.top_logprobs_nums is not None
-                ):
-                    self_info.top_logprobs_nums.extend(other_info.top_logprobs_nums)
-                self_info.token_ids_logprobs.extend(other_info.token_ids_logprobs)
-
-            elif self.return_logprob and self_info.top_logprobs_nums is not None:
-                self_info.top_logprobs_nums.extend([0] * len(other_info.reqs))
-                self_info.token_ids_logprobs.extend([None] * len(other_info.reqs))
-            elif other.return_logprob and other_info.top_logprobs_nums is not None:
-                self_info.top_logprobs_nums = [0] * len(
-                    self_info.reqs
-                ) + other_info.top_logprobs_nums
-                self_info.token_ids_logprobs = [None] * len(
-                    self_info.reqs
-                ) + other_info.token_ids_logprobs
-
             # Merge reqs list
             self_info.reqs.extend(other_info.reqs)
+
+            # Merge logprobs consistently from merged reqs list
+            if self.return_logprob or other.return_logprob:
+                self_info.top_logprobs_nums = [r.top_logprobs_num for r in self_info.reqs]
+                self_info.token_ids_logprobs = [r.token_ids_logprob for r in self_info.reqs]
+            else:
+                self_info.top_logprobs_nums = None
+                self_info.token_ids_logprobs = None
 
             # Merge spec_info
             if self_info.spec_info and other_info.spec_info:
