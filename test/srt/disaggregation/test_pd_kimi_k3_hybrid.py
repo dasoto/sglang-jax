@@ -400,7 +400,10 @@ def test_pd_prefill_chunked_unified_radix_cache():
 def test_mla_kv_multi_block_gather_and_write():
     """Verify >32-page (64-page) multi-block fori_loop MLA KV gather & write bit-exactness."""
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from sgl_jax.srt.disaggregation.prefill import _jit_gather_mla_kv_chunk
+    from sgl_jax.srt.disaggregation.prefill import (
+        _jit_gather_mla_kv_chunk,
+        _mla_kv_transfer_shardings,
+    )
     from sgl_jax.srt.mem_cache.memory_pool import _jit_write_all_mla_kv_layers_shard_map
 
     mesh = _make_mesh()
@@ -444,7 +447,7 @@ def test_mla_kv_multi_block_gather_and_write():
     padded_src[:valid_pages] = p_global_pages
 
     buf_sharding = p_pool.kv_buffer[0].sharding
-    out_sharding = NamedSharding(mesh, local_kv_spec_for_pool(p_pool, mesh, padded_pages))
+    out_sharding, _ = _mla_kv_transfer_shardings(p_pool, padded_pages)
     idx_sharding = NamedSharding(mesh, P())
     dev_idx = jax.device_put(jnp.asarray(padded_src, dtype=jnp.int32), idx_sharding)
 
