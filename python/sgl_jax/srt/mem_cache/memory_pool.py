@@ -1496,6 +1496,9 @@ def write_mla_kv_layer(
     return kv_cache.at[dst_global_page_indices].set(layer_kv, mode="drop")
 
 
+_MLA_KV_WRITE_MAX_BLOCK_PAGES = 32
+
+
 @partial(
     jax.jit,
     static_argnames=("lkv_sharding", "cache_sharding"),
@@ -1527,41 +1530,74 @@ def _jit_write_all_mla_kv_layers_shard_map(
             my_shard = 0
             num_shards = 1
         total_pages = local_num_pages * num_shards
-        owner = idx // local_num_pages
-        local_page = idx % local_num_pages
-        valid = (idx >= 0) & (idx < total_pages) & (owner == my_shard)
 
-        if is_stacked:
-            g_all = kv_in
-            if len(lkv_spec) > 1 and lkv_spec[1] is not None:
-                g_all = jax.lax.all_gather(g_all, lkv_spec[1], axis=1, tiled=True)
-            if len(lkv_spec) > 2 and lkv_spec[2] is not None:
-                g_all = jax.lax.all_gather(g_all, lkv_spec[2], axis=2, tiled=True)
-            if len(lkv_spec) > 4 and lkv_spec[4] is not None:
-                g_all = jax.lax.all_gather(g_all, lkv_spec[4], axis=4, tiled=True)
-        else:
-            g_all = jnp.stack(kv_in, axis=0)
-            if len(lkv_spec) > 0 and lkv_spec[0] is not None:
-                g_all = jax.lax.all_gather(g_all, lkv_spec[0], axis=1, tiled=True)
-            if len(lkv_spec) > 1 and lkv_spec[1] is not None:
-                g_all = jax.lax.all_gather(g_all, lkv_spec[1], axis=2, tiled=True)
-            if len(lkv_spec) > 3 and lkv_spec[3] is not None:
-                g_all = jax.lax.all_gather(g_all, lkv_spec[3], axis=4, tiled=True)
+        kv_stacked = kv_in if is_stacked else jnp.stack(kv_in, axis=0)
+        page_axis_spec = (
+            (lkv_spec[1] if len(lkv_spec) > 1 else None)
+            if is_stacked
+            else (lkv_spec[0] if len(lkv_spec) > 0 else None)
+        )
+        s1_axis_spec = (
+            (lkv_spec[2] if len(lkv_spec) > 2 else None)
+            if is_stacked
+            else (lkv_spec[1] if len(lkv_spec) > 1 else None)
+        )
+        s3_axis_spec = (
+            (lkv_spec[4] if len(lkv_spec) > 4 else None)
+            if is_stacked
+            else (lkv_spec[3] if len(lkv_spec) > 3 else None)
+        )
 
-        num_p = idx.shape[0]
+        def _scatter_block(kv_blk, idx_blk, cs_init):
+            g_blk = kv_blk
+            if page_axis_spec is not None:
+                g_blk = jax.lax.all_gather(g_blk, page_axis_spec, axis=1, tiled=True)
+            if s1_axis_spec is not None:
+                g_blk = jax.lax.all_gather(g_blk, s1_axis_spec, axis=2, tiled=True)
+            if s3_axis_spec is not None:
+                g_blk = jax.lax.all_gather(g_blk, s3_axis_spec, axis=4, tiled=True)
 
-        def _step(p, cs):
-            lp = local_page[p]
+            owner = idx_blk // local_num_pages
+            local_page = idx_blk % local_num_pages
+            valid = (idx_blk >= 0) & (idx_blk < total_pages) & (owner == my_shard)
+            num_p = idx_blk.shape[0]
 
-            def _do_upd(cs_in):
-                return [
-                    jax.lax.dynamic_update_index_in_dim(c, g_all[l, p], lp, axis=0)
-                    for l, c in enumerate(cs_in)
-                ]
+            def _step(p, cs):
+                lp = local_page[p]
 
-            return jax.lax.cond(valid[p], _do_upd, lambda cs_in: cs_in, cs)
+                def _do_upd(cs_in):
+                    return [
+                        jax.lax.dynamic_update_index_in_dim(c, g_blk[l, p], lp, axis=0)
+                        for l, c in enumerate(cs_in)
+                    ]
 
-        return jax.lax.fori_loop(0, num_p, _step, c_list)
+                return jax.lax.cond(valid[p], _do_upd, lambda cs_in: cs_in, cs)
+
+            return jax.lax.fori_loop(0, num_p, _step, cs_init)
+
+        padded_pages = idx.shape[0]
+        page_sharded_on_data = page_axis_spec == "data" and dp_size > 1
+        dp_factor = dp_size if page_sharded_on_data else 1
+        block_pages = max(dp_factor, (_MLA_KV_WRITE_MAX_BLOCK_PAGES // dp_factor) * dp_factor)
+
+        if padded_pages <= block_pages or padded_pages % block_pages != 0:
+            return _scatter_block(kv_stacked, idx, c_list)
+
+        num_blocks = padded_pages // block_pages
+        block_per_dp = block_pages // dp_factor
+        pages_per_dp = padded_pages // dp_factor
+        idx_2d = idx.reshape(dp_factor, pages_per_dp)
+
+        def _block_loop(blk, cs):
+            kv_blk = jax.lax.dynamic_slice_in_dim(
+                kv_stacked, blk * block_per_dp, block_per_dp, axis=1
+            )
+            idx_blk = jax.lax.dynamic_slice_in_dim(
+                idx_2d, blk * block_per_dp, block_per_dp, axis=1
+            ).reshape(block_pages)
+            return _scatter_block(kv_blk, idx_blk, cs)
+
+        return jax.lax.fori_loop(0, num_blocks, _block_loop, c_list)
 
     kv_in_spec = lkv_spec if is_stacked else [lkv_spec for _ in kv_buffers]
     return jax.shard_map(
