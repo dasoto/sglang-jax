@@ -451,9 +451,9 @@ def test_mla_kv_multi_block_gather_and_write():
     stacked = _jit_gather_mla_kv_chunk(
         tuple(p_pool.kv_buffer),
         dev_idx,
-        mesh,
-        in_spec,
-        out_spec,
+        mesh=mesh,
+        in_spec=in_spec,
+        out_spec=out_spec,
     )
     # Write to D's dp_rank=0 (global pages 3..32), with dummy page 0 for padding
     d_global_pages = np.arange(3, 3 + valid_pages, dtype=np.int32)
