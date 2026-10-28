@@ -1408,16 +1408,11 @@ def write_kv_layer(
     )
 
 
-@partial(jax.jit, donate_argnames=("kv_cache",))
-def write_mla_kv_layer(
+def _write_mla_kv_layer_impl(
     layer_kv: jax.Array,
     dst_global_page_indices: jax.Array,
     kv_cache: jax.Array,
 ) -> jax.Array:
-    """In-place page-level scatter into a single layer's MLA KV cache buffer.
-
-    Out-of-bounds indices (e.g. ``total_pages`` padding) are ignored via ``mode='drop'``.
-    """
     sharding = jax.typeof(kv_cache).sharding
     if sharding is not None and any(
         t == jax.sharding.AxisType.Explicit for t in sharding.mesh.axis_types
@@ -1429,6 +1424,32 @@ def write_mla_kv_layer(
 
         return _impl(layer_kv, dst_global_page_indices, kv_cache)
     return kv_cache.at[dst_global_page_indices].set(layer_kv, mode="drop")
+
+
+@partial(jax.jit, donate_argnames=("kv_cache",))
+def write_mla_kv_layer(
+    layer_kv: jax.Array,
+    dst_global_page_indices: jax.Array,
+    kv_cache: jax.Array,
+) -> jax.Array:
+    """In-place page-level scatter into a single layer's MLA KV cache buffer.
+
+    Out-of-bounds indices (e.g. ``total_pages`` padding) are ignored via ``mode='drop'``.
+    """
+    return _write_mla_kv_layer_impl(layer_kv, dst_global_page_indices, kv_cache)
+
+
+@partial(jax.jit, donate_argnames=("kv_buffers",))
+def write_all_mla_kv_layers(
+    kv: jax.Array | list[jax.Array],
+    dst_global_page_indices: jax.Array,
+    kv_buffers: list[jax.Array],
+) -> list[jax.Array]:
+    """In-place page-level scatter into all MLA KV cache buffers in a single JIT dispatch."""
+    return [
+        _write_mla_kv_layer_impl(kv[i], dst_global_page_indices, kv_buffers[i])
+        for i in range(len(kv_buffers))
+    ]
 
 
 def update_fused_kv_cache(

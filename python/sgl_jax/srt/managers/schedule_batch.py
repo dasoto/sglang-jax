@@ -551,30 +551,32 @@ class Req:
             self.last_matched_prefix_len = len(self.prefix_indices)
             self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
             return
-        # PD req with empty output_ids: skip match_prefix to avoid
-        # stale radix cache hits, but preserve prefix_indices set by
-        # cache_unfinished_req for chunked-prefill continuation rounds
-        # (otherwise extend_input_len never shrinks and a req longer than
-        # chunked-prefill-size loops forever, and a budget-chunked short
-        # req leaks its first round's pages).
-        # TODO(pd-radix): PD chunked-prefill is currently validated with
-        # ChunkCache (--disable-radix-cache). If RadixCache support is added,
-        # continuation rounds must also preserve/update last_node and radix
-        # lock state, not just prefix_indices.
+        # PD req with empty output_ids:
+        # - On chunked-prefill continuation rounds (kv_committed_len > 0),
+        #   cache_unfinished_req has already updated prefix_indices, last_node,
+        #   and cache_lock_params; preserve them and only recompute extend_input_len.
+        # - On initial admission (kv_committed_len == 0), skip match_prefix only
+        #   when tree_cache is disabled (ChunkCache) or when Raiden chunk transfer
+        #   is used (which requires start_send_idx == 0). With UnifiedRadixCache
+        #   and whole-prompt JAX transfer, fall through to tree_cache.match_prefix
+        #   so PD prefill gets prefix + recurrent-state cache hits.
         if getattr(self, "bootstrap_room", None) is not None and not self.output_ids:
-            # A completed middle chunk decrements is_chunked before
-            # this continuation round is initialized. kv_committed_len, not the
-            # in-flight counter, is the durable signal that prefix_indices owns
-            # already-computed prompt KV (#1496).
-            if self.kv_committed_len == 0:
+            if self.kv_committed_len > 0:
+                self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
+                return
+            if (
+                tree_cache is None
+                or getattr(tree_cache, "disable", False)
+                or global_server_args_dict.get("disaggregation_transfer_backend") == "raiden"
+            ):
                 self.prefix_indices = []
                 self.last_matched_prefix_len = 0
-            self.extend_input_len = len(self.fill_ids) - len(self.prefix_indices)
-            root = getattr(tree_cache, "root_node", None) if tree_cache is not None else None
-            self.last_node = root
-            self.last_host_node = root
-            self.host_hit_length = 0
-            return
+                self.extend_input_len = len(self.fill_ids)
+                root = getattr(tree_cache, "root_node", None) if tree_cache is not None else None
+                self.last_node = root
+                self.last_host_node = root
+                self.host_hit_length = 0
+                return
         if tree_cache is not None:
             if getattr(tree_cache, "disable", False):
                 self.prefix_indices = np.empty((0,), dtype=np.int32)

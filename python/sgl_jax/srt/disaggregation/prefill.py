@@ -583,15 +583,19 @@ class SchedulerDisaggregationPrefillMixin:
         for req in pd_reqs:
             self._pd_mark_time(req, "forward_done")
 
-        for info in getattr(batch, "reqs_info", None) or ():
-            if info.reqs and getattr(info, "output_ids", None) is not None:
-                for r_obj, tok_id in zip(info.reqs, info.output_ids):
+        next_tids = getattr(result, "next_token_ids", None)
+        per_dp_bs = int(getattr(batch, "per_dp_bs_size", 0) or 0)
+        for dp_rank, info in enumerate(getattr(batch, "reqs_info", None) or ()):
+            if not info.reqs:
+                continue
+            out_ids = getattr(info, "output_ids", None)
+            if out_ids is None and next_tids is not None and per_dp_bs > 0:
+                out_ids = next_tids[dp_rank * per_dp_bs : dp_rank * per_dp_bs + len(info.reqs)]
+            if out_ids is not None:
+                for r_obj, tok_id in zip(info.reqs, out_ids):
                     r_obj._pd_first_token_id = int(tok_id)
-        if (
-            getattr(batch, "reqs_info", None) is None
-            and getattr(result, "next_token_ids", None) is not None
-        ):
-            for r_obj, tok_id in zip(batch_reqs, result.next_token_ids):
+        if getattr(batch, "reqs_info", None) is None and next_tids is not None:
+            for r_obj, tok_id in zip(batch_reqs, next_tids):
                 r_obj._pd_first_token_id = int(tok_id)
 
         self.set_next_batch_sampling_info_done(batch)
@@ -1048,9 +1052,11 @@ class SchedulerDisaggregationPrefillMixin:
         terminal callback is safe.
         """
 
+        from sgl_jax.srt.managers.schedule_batch import FINISH_ABORT
         from sgl_jax.srt.mem_cache.common import release_kv_cache
 
-        release_kv_cache(req, self.tree_cache)
+        is_insert = not isinstance(getattr(req, "finished_reason", None), FINISH_ABORT)
+        release_kv_cache(req, self.tree_cache, is_insert=is_insert)
 
     def _release_prefill_req_resources(self: Scheduler, req: Req) -> None:
         """Release prefill-side KV and request-pool resources."""
