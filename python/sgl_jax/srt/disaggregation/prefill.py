@@ -165,11 +165,78 @@ def _jit_gather_one_layer(buf, page_indices, out_sharding):
     return buf.at[page_indices].get(out_sharding=out_sharding)
 
 
-def _jit_gather_all_layers(buffers, page_indices, out_sharding):
-    """Gather ``page_indices`` from every per-layer KV buffer.
+@partial(jax.jit, static_argnames=("buf_sharding", "out_sharding"))
+def _jit_gather_mla_kv_chunk(
+    buf_chunk: list[jax.Array],
+    page_indices: jax.Array,
+    buf_sharding: jax.sharding.NamedSharding,
+    out_sharding: jax.sharding.NamedSharding,
+) -> list[jax.Array]:
+    """Gather ``page_indices`` from a chunk of MLA KV buffers via local ``shard_map``.
 
-    Dispatches an independent per-layer jit call so each compiles separately.
+    Slicing locally inside ``shard_map`` avoids GSPMD's 256-way ``all-to-all``
+    and keeps temporary HBM proportional to ``padded_pages`` rather than ``total_pages``.
     """
+    from jax.sharding import PartitionSpec as _P
+
+    mesh = out_sharding.mesh
+    buf_spec = buf_sharding.spec
+    out_spec = out_sharding.spec
+    dp_size = mesh.shape.get("data", 1)
+    tp_size = mesh.shape.get("tensor", 1)
+
+    def _gather_fn(b_list, idx):
+        local_num_pages = b_list[0].shape[0]
+        if buf_spec[0] == ("data", "tensor"):
+            my_shard = jax.lax.axis_index("data") * tp_size + jax.lax.axis_index("tensor")
+            num_shards = dp_size * tp_size
+        elif buf_spec[0] == "data":
+            my_shard = jax.lax.axis_index("data")
+            num_shards = dp_size
+        else:
+            my_shard = 0
+            num_shards = 1
+        total_pages = local_num_pages * num_shards
+        owner = idx // local_num_pages
+        local_page = idx % local_num_pages
+        valid = (idx >= 0) & (idx < total_pages) & (owner == my_shard)
+        safe_idx = jnp.where(valid, local_page, 0)
+        g_all = jnp.stack([b_local[safe_idx] for b_local in b_list], axis=0)
+        g_all = jnp.where(valid[None, :, None, None, None], g_all, jnp.zeros_like(g_all))
+        if out_spec[0] == "data":
+            g_all = jax.lax.psum_scatter(g_all, "data", scatter_dimension=1, tiled=True)
+        elif dp_size > 1 and buf_spec[0] in (("data", "tensor"), "data"):
+            g_all = jax.lax.psum(g_all, "data")
+        if out_spec[1] == "tensor":
+            g_all = jax.lax.psum_scatter(g_all, "tensor", scatter_dimension=2, tiled=True)
+        elif len(out_spec) > 3 and out_spec[3] == "tensor":
+            g_all = jax.lax.psum_scatter(g_all, "tensor", scatter_dimension=4, tiled=True)
+        elif tp_size > 1 and buf_spec[0] == ("data", "tensor"):
+            g_all = jax.lax.psum(g_all, "tensor")
+        return [g_all[i] for i in range(len(b_list))]
+
+    in_specs = ([buf_spec for _ in buf_chunk], _P(None))
+    out_specs = [out_spec for _ in buf_chunk]
+    return jax.shard_map(
+        _gather_fn,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        check_vma=False,
+    )(buf_chunk, page_indices)
+
+
+_MLA_KV_GATHER_CHUNK_SIZE = 24
+
+
+def _jit_gather_all_layers(buffers, page_indices, out_sharding, *, mla_buf_sharding=None):
+    """Gather ``page_indices`` from every per-layer KV buffer."""
+    if mla_buf_sharding is not None:
+        out: list[jax.Array] = []
+        for start in range(0, len(buffers), _MLA_KV_GATHER_CHUNK_SIZE):
+            chunk = buffers[start : start + _MLA_KV_GATHER_CHUNK_SIZE]
+            out.extend(_jit_gather_mla_kv_chunk(chunk, page_indices, mla_buf_sharding, out_sharding))
+        return out
     return [_jit_gather_one_layer(buf, page_indices, out_sharding) for buf in buffers]
 
 
@@ -1032,7 +1099,12 @@ class SchedulerDisaggregationPrefillMixin:
             pool_pspec = kv_pool.kv_sharding.spec
             gather_pspec = _P(None, *pool_pspec[1:])
             gather_out_sharding = _NamedSharding(kv_pool.mesh, gather_pspec)
-        layer_kvs = _jit_gather_all_layers(layer_buffers, page_indices, gather_out_sharding)
+        layer_kvs = _jit_gather_all_layers(
+            layer_buffers,
+            page_indices,
+            gather_out_sharding,
+            mla_buf_sharding=kv_pool.kv_sharding if is_mla else None,
+        )
         if jax.process_count() > 1:
             # Multi-host: expose only this host's TP shard as a fully-addressable
             # local-mesh array; each P host registers its 1/nproc slice and the
