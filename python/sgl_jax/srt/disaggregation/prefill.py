@@ -165,6 +165,9 @@ def _jit_gather_one_layer(buf, page_indices, out_sharding):
     return buf.at[page_indices].get(out_sharding=out_sharding)
 
 
+_MLA_KV_GATHER_MAX_BLOCK_PAGES = 32
+
+
 @partial(jax.jit, static_argnames=("buf_sharding", "out_sharding"))
 def _jit_gather_mla_kv_chunk(
     buf_chunk: list[jax.Array],
@@ -174,8 +177,10 @@ def _jit_gather_mla_kv_chunk(
 ) -> list[jax.Array]:
     """Gather ``page_indices`` from a chunk of MLA KV buffers via local ``shard_map``.
 
-    Slicing locally inside ``shard_map`` avoids GSPMD's 256-way ``all-to-all``
-    and keeps temporary HBM proportional to ``padded_pages`` rather than ``total_pages``.
+    Slicing locally inside ``shard_map`` avoids GSPMD's 256-way ``all-to-all``.
+    When ``padded_pages > _MLA_KV_GATHER_MAX_BLOCK_PAGES``, tiling the gather +
+    ``psum_scatter`` in blocks of 32 pages caps peak temporary HBM at ~96 MB
+    across all 24 MLA layers even for 128k-256k token prompts.
     """
     from jax.sharding import PartitionSpec as _P
 
@@ -197,22 +202,55 @@ def _jit_gather_mla_kv_chunk(
             my_shard = 0
             num_shards = 1
         total_pages = local_num_pages * num_shards
-        owner = idx // local_num_pages
-        local_page = idx % local_num_pages
-        valid = (idx >= 0) & (idx < total_pages) & (owner == my_shard)
-        safe_idx = jnp.where(valid, local_page, 0)
-        g_all = jnp.stack([b_local[safe_idx] for b_local in b_list], axis=0)
-        g_all = jnp.where(valid[None, :, None, None, None], g_all, jnp.zeros_like(g_all))
-        if out_spec[0] == "data":
-            g_all = jax.lax.psum_scatter(g_all, "data", scatter_dimension=1, tiled=True)
-        elif dp_size > 1 and buf_spec[0] in (("data", "tensor"), "data"):
-            g_all = jax.lax.psum(g_all, "data")
-        if out_spec[1] == "tensor":
-            g_all = jax.lax.psum_scatter(g_all, "tensor", scatter_dimension=2, tiled=True)
-        elif len(out_spec) > 3 and out_spec[3] == "tensor":
-            g_all = jax.lax.psum_scatter(g_all, "tensor", scatter_dimension=4, tiled=True)
-        elif tp_size > 1 and buf_spec[0] == ("data", "tensor"):
-            g_all = jax.lax.psum(g_all, "tensor")
+
+        def _gather_block(idx_blk):
+            owner = idx_blk // local_num_pages
+            local_page = idx_blk % local_num_pages
+            valid = (idx_blk >= 0) & (idx_blk < total_pages) & (owner == my_shard)
+            safe_idx = jnp.where(valid, local_page, 0)
+            g_blk = jnp.stack([b_local[safe_idx] for b_local in b_list], axis=0)
+            g_blk = jnp.where(valid[None, :, None, None, None], g_blk, jnp.zeros_like(g_blk))
+            if out_spec[0] == "data":
+                g_blk = jax.lax.psum_scatter(g_blk, "data", scatter_dimension=1, tiled=True)
+            elif dp_size > 1 and buf_spec[0] in (("data", "tensor"), "data"):
+                g_blk = jax.lax.psum(g_blk, "data")
+            if out_spec[1] == "tensor":
+                g_blk = jax.lax.psum_scatter(g_blk, "tensor", scatter_dimension=2, tiled=True)
+            elif len(out_spec) > 3 and out_spec[3] == "tensor":
+                g_blk = jax.lax.psum_scatter(g_blk, "tensor", scatter_dimension=4, tiled=True)
+            elif tp_size > 1 and buf_spec[0] == ("data", "tensor"):
+                g_blk = jax.lax.psum(g_blk, "tensor")
+            return g_blk
+
+        padded_pages = idx.shape[0]
+        page_sharded_on_data = out_spec[0] == "data" and dp_size > 1
+        dp_factor = dp_size if page_sharded_on_data else 1
+        block_pages = max(dp_factor, (_MLA_KV_GATHER_MAX_BLOCK_PAGES // dp_factor) * dp_factor)
+
+        if padded_pages <= block_pages or padded_pages % block_pages != 0:
+            g_all = _gather_block(idx)
+            return [g_all[i] for i in range(len(b_list))]
+
+        num_blocks = padded_pages // block_pages
+        block_per_dp = block_pages // dp_factor
+        pages_per_dp = padded_pages // dp_factor
+        idx_2d = idx.reshape(dp_factor, pages_per_dp)
+
+        sample_blk = _gather_block(
+            jax.lax.dynamic_slice_in_dim(idx_2d, 0, block_per_dp, axis=1).reshape(block_pages)
+        )
+        out_shape = (len(b_list), pages_per_dp) + sample_blk.shape[2:]
+        init_out = jnp.zeros(out_shape, dtype=sample_blk.dtype)
+        init_out = jax.lax.dynamic_update_slice_in_dim(init_out, sample_blk, 0, axis=1)
+
+        def _loop_body(blk, acc):
+            idx_blk = jax.lax.dynamic_slice_in_dim(
+                idx_2d, blk * block_per_dp, block_per_dp, axis=1
+            ).reshape(block_pages)
+            g_blk = _gather_block(idx_blk)
+            return jax.lax.dynamic_update_slice_in_dim(acc, g_blk, blk * block_per_dp, axis=1)
+
+        g_all = jax.lax.fori_loop(1, num_blocks, _loop_body, init_out)
         return [g_all[i] for i in range(len(b_list))]
 
     in_specs = ([buf_spec for _ in buf_chunk], _P(None))

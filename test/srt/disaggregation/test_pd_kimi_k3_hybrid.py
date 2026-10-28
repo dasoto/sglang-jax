@@ -397,3 +397,84 @@ def test_pd_prefill_chunked_unified_radix_cache():
     assert req2.last_node is not None and req2.last_node is not tree_cache.root_node
 
 
+def test_mla_kv_multi_block_gather_and_write():
+    """Verify >32-page (64-page) multi-block fori_loop MLA KV gather & write bit-exactness."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+    from sgl_jax.srt.disaggregation.prefill import _jit_gather_mla_kv_chunk
+    from sgl_jax.srt.mem_cache.memory_pool import _jit_write_all_mla_kv_layers_shard_map
+
+    mesh = _make_mesh()
+    dp_size = 2
+    dcp_size = 2
+    page_size = 8
+    # 40 pages per (dp, dcp) shard => 160 pages total
+    size = 40 * page_size * dp_size * dcp_size
+    p_pool = MLATokenToKVPool(
+        size=size,
+        page_size=page_size,
+        dtype=jnp.bfloat16,
+        layer_num=3,
+        mesh=mesh,
+        kv_lora_rank=64,
+        qk_rope_head_dim=32,
+        dp_size=dp_size,
+        dcp_size=dcp_size,
+    )
+    d_pool = MLATokenToKVPool(
+        size=size,
+        page_size=page_size,
+        dtype=jnp.bfloat16,
+        layer_num=3,
+        mesh=mesh,
+        kv_lora_rank=64,
+        qk_rope_head_dim=32,
+        dp_size=dp_size,
+        dcp_size=dcp_size,
+    )
+    rng = np.random.default_rng(777)
+    for l_idx in range(3):
+        arr = jnp.asarray(rng.standard_normal(p_pool.kv_buffer[l_idx].shape), dtype=jnp.bfloat16)
+        p_pool.kv_buffer[l_idx] = jax.device_put(arr, p_pool.kv_buffer[l_idx].sharding)
+
+    # 30 valid pages on P's dp_rank=1 (global pages 41..70), padded to 64 pages (>32 block size)
+    valid_pages = 30
+    padded_pages = 64
+    p_global_pages = np.arange(41, 41 + valid_pages, dtype=np.int32)
+    padded_src = np.zeros(padded_pages, dtype=np.int32)
+    padded_src[:valid_pages] = p_global_pages
+
+    in_spec = p_pool.kv_spec
+    out_spec = P("data", "tensor", None, None, None)
+    idx_sharding = NamedSharding(mesh, P())
+    dev_idx = jax.device_put(jnp.asarray(padded_src, dtype=jnp.int32), idx_sharding)
+
+    stacked = _jit_gather_mla_kv_chunk(
+        tuple(p_pool.kv_buffer),
+        dev_idx,
+        mesh,
+        in_spec,
+        out_spec,
+    )
+    # Write to D's dp_rank=0 (global pages 3..32), with dummy page 0 for padding
+    d_global_pages = np.arange(3, 3 + valid_pages, dtype=np.int32)
+    padded_dst = np.zeros(padded_pages, dtype=np.int32)
+    padded_dst[:valid_pages] = d_global_pages
+    dev_dst = jax.device_put(jnp.asarray(padded_dst, dtype=jnp.int32), idx_sharding)
+
+    d_pool.kv_buffer = list(
+        _jit_write_all_mla_kv_layers_shard_map(
+            tuple(d_pool.kv_buffer),
+            stacked,
+            dev_dst,
+            mesh=mesh,
+            buf_spec=d_pool.kv_spec,
+            val_spec=out_spec,
+        )
+    )
+    for l_idx in range(3):
+        p_np = np.asarray(jax.device_get(p_pool.kv_buffer[l_idx]))
+        d_np = np.asarray(jax.device_get(d_pool.kv_buffer[l_idx]))
+        np.testing.assert_array_equal(d_np[d_global_pages], p_np[p_global_pages])
+
+
+
