@@ -1,5 +1,6 @@
 """Per-round routing updates load atomically while preserving intake order."""
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -303,6 +304,32 @@ def test_route_hook_reports_assignments_and_only_the_first_deferral(monkeypatch)
     assert router().assign(req) == 1
     # Past the deferral limit the router probes only eligible ranks.
     assert seen == [(None, 0, {0: 3, 1: 0}, [1]), (1, 2, {1: 0}, [1])]
+
+
+def test_scheduler_route_log_accepts_intake_requests(caplog):
+    # The router hands the hook the intake TokenizedGenerateReqInput, not a scheduler Req.
+    scheduler = object.__new__(Scheduler)
+    scheduler.dp_size = 2
+    scheduler._dp_route_log = True
+    scheduler._dp_probe_kv = {}
+
+    def lookup(tokens, key, rank):
+        scheduler._dp_probe_kv[rank] = 4 if rank == 0 else 0
+        return 3 if rank == 0 else 0
+
+    router = DpRouter(
+        DpLoadSnapshot((0, 0), (0, 0), (0, 0), (256, 256)),
+        "cache_aware",
+        Mock(return_value=(4, 4)),
+        lookup,
+        on_route=scheduler._log_dp_route,
+    )
+    with caplog.at_level(logging.INFO, logger="sgl_jax.srt.managers.scheduler"):
+        assert router.assign(_req()) == 0
+    assert (
+        "DP route rid=req isl=4 chosen=0 defer=0 valid=[3, 0] kv=[4, 0] counts=[0, 0] "
+        "eligible=[0, 1]" in caplog.text
+    )
 
 
 def test_sticky_setting_does_not_change_other_policies(monkeypatch):

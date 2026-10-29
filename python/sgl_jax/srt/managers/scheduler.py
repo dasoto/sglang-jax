@@ -906,19 +906,24 @@ class Scheduler(
         return len(result.device_indices)
 
     def _log_dp_route(self, req, details: dict) -> None:
+        # ``req`` is the intake TokenizedGenerateReqInput, not a scheduler Req. Diagnostics
+        # must never take the scheduler down.
         kv, self._dp_probe_kv = self._dp_probe_kv, {}
-        matches = details["matches"]
-        logger.info(
-            "DP route rid=%s isl=%d chosen=%s defer=%d valid=%s kv=%s counts=%s eligible=%s",
-            req.rid,
-            len(req.origin_input_ids),
-            details["chosen"],
-            details["deferrals"],
-            [matches.get(r, -1) for r in range(self.dp_size)],
-            [kv.get(r, -1) if r in matches else -1 for r in range(self.dp_size)],
-            list(details["counts"]),
-            list(details["eligible"]),
-        )
+        try:
+            matches = details["matches"]
+            logger.info(
+                "DP route rid=%s isl=%d chosen=%s defer=%d valid=%s kv=%s counts=%s eligible=%s",
+                getattr(req, "rid", None),
+                len(getattr(req, "input_ids", None) or ()),
+                details["chosen"],
+                details["deferrals"],
+                [matches.get(r, -1) for r in range(self.dp_size)],
+                [kv.get(r, -1) if r in matches else -1 for r in range(self.dp_size)],
+                list(details["counts"]),
+                list(details["eligible"]),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("DP route log failed")
 
     def _iter_dp_requests(self):
         """Enumerate request owners; DpLoadSnapshot deduplicates shared references.
