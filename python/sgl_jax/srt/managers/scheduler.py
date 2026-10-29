@@ -247,6 +247,15 @@ class Scheduler(
         self.tp_size = server_args.tp_size
         self.schedule_policy = server_args.schedule_policy
         self.dp_schedule_policy = server_args.dp_schedule_policy
+        # One INFO line per cache-aware DP routing decision: per-rank recurrent-valid
+        # and KV-only prefix matches, request counts and the chosen rank.
+        self._dp_route_log = os.environ.get("SGLANG_JAX_DP_ROUTE_LOG", "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self._dp_probe_kv: dict[int, int] = {}
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.stream_interval = server_args.stream_interval
         self.max_seq_len = server_args.max_seq_len
@@ -892,7 +901,24 @@ class Scheduler(
         result = self.tree_cache.match_prefix(
             MatchPrefixParams(key=RadixKey(token_ids, extra_key, dp_rank))
         )
+        if getattr(self, "_dp_route_log", False):
+            self._dp_probe_kv[dp_rank] = result.kv_match_len
         return len(result.device_indices)
+
+    def _log_dp_route(self, req, details: dict) -> None:
+        kv, self._dp_probe_kv = self._dp_probe_kv, {}
+        matches = details["matches"]
+        logger.info(
+            "DP route rid=%s isl=%d chosen=%s defer=%d valid=%s kv=%s counts=%s eligible=%s",
+            req.rid,
+            len(req.origin_input_ids),
+            details["chosen"],
+            details["deferrals"],
+            [matches.get(r, -1) for r in range(self.dp_size)],
+            [kv.get(r, -1) if r in matches else -1 for r in range(self.dp_size)],
+            list(details["counts"]),
+            list(details["eligible"]),
+        )
 
     def _iter_dp_requests(self):
         """Enumerate request owners; DpLoadSnapshot deduplicates shared references.
@@ -957,6 +983,7 @@ class Scheduler(
             self._estimate_req_input_output_tokens,
             self._lookup_prefix_length,
             round_robin_start=self.dp_round_robin_counter,
+            on_route=self._log_dp_route if getattr(self, "_dp_route_log", False) else None,
         )
         result = assign_dp_ranks(
             recv_reqs=recv_reqs,

@@ -819,6 +819,7 @@ class UnifiedRadixCache(BasePrefixCache):
             last_host_node=best_host_node if self.hicache_enabled else best_device_node,
             best_match_node=best_host_node if self.hicache_enabled else best_device_node,
             host_hit_length=host_hit_length if self.hicache_enabled else 0,
+            kv_match_len=sum(len(v) for v in value),
         )
         for component in self._components_tuple:
             result = component.finalize_match_result(

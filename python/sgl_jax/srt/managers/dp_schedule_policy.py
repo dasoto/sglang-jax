@@ -73,6 +73,7 @@ def pick_cache_aware_dp(
     item_input: int = 0,
     item_output: int = 0,
     max_spill_tokens: int | None = None,
+    holder_slack_tokens: int | None = None,
 ) -> int | None:
     """Cache-affinity DP policy with shape-aware miss fallback.
 
@@ -87,7 +88,12 @@ def pick_cache_aware_dp(
        affinity and pick the least-loaded rank.
     2. Otherwise route to the least-loaded rank among the *holders* -- ranks whose
        cached prefix covers more than ``CACHE_THRESHOLD`` of the prompt -- so a hot
-       prefix spreads across all its holders by load.
+       prefix spreads across all its holders by load. With ``holder_slack_tokens``
+       set, only holders within that many tokens of the longest holder match
+       compete on load: a multi-turn session stays on the rank holding its own
+       previous turn instead of moving to a lighter rank that holds only a shared
+       prefix (a sibling subagent's system prompt and tools, or the parent context
+       it forked from) and re-prefilling the rest.
     3. No holders (or no usable ``prompt_len``) -> shape-aware fallback.
 
     Holder and large-skew load order is ``(running, tokens, rank)``. Eligibility
@@ -113,6 +119,9 @@ def pick_cache_aware_dp(
     if prompt_len > 0:
         holders = [r for r in eligible if matches.get(r, 0) / prompt_len > CACHE_THRESHOLD]
         if holders:
+            if holder_slack_tokens is not None:
+                best = max(matches.get(r, 0) for r in holders)
+                holders = [r for r in holders if matches.get(r, 0) >= best - holder_slack_tokens]
             return least_loaded(holders)
 
     return pick_shape_aware_dp(eligible, input_counts, output_counts, item_input, item_output)

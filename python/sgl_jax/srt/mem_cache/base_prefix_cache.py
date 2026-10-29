@@ -122,6 +122,10 @@ class MatchResult(NamedTuple):
     # Always None in the base path (clones the full match); branch truncation is
     # a follow-up.
     recurrent_branching_seqlen: int | None = None
+    # Device KV tokens on the walked path before the auxiliary validators cut the
+    # match (UnifiedRadixCache only; 0 elsewhere). Diagnostics: a gap to
+    # len(device_indices) means the KV is cached but no recurrent snapshot is.
+    kv_match_len: int = 0
 
 
 class BasePrefixCache(abc.ABC):

@@ -117,6 +117,22 @@ class TestRecurrentSupersededEviction(unittest.TestCase):
         self.assertFalse(getattr(n1, "_recurrent_superseded", False))
         self.assertTrue(getattr(n2, "_recurrent_superseded", False))
 
+    def test_kv_match_len_counts_kv_past_the_last_snapshot(self):
+        from sgl_jax.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+
+        pool, cache, comp, n1, n2, n3, nb = self._build("1")
+        a = []
+        node = n3
+        while node is not None and node is not cache.root_node:
+            a = list(node.key.token_ids) + a
+            node = node.parent
+        res = cache.match_prefix(MatchPrefixParams(key=RadixKey(a[:2500])))
+        self.assertEqual((len(res.device_indices), res.kv_match_len), (2000, 2500))
+        comp._mark_superseded_ancestors(n3)
+        cache.evict(EvictParams(recurrent_num=2, dp_rank=0))
+        res = cache.match_prefix(MatchPrefixParams(key=RadixKey(a[:2500])))
+        self.assertEqual((len(res.device_indices), res.kv_match_len), (0, 2500))
+
 
 if __name__ == "__main__":
     unittest.main()

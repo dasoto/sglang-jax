@@ -262,6 +262,49 @@ def test_sticky_cache_aware_spills_when_holder_gap_is_small(monkeypatch):
     assert _sticky_router(lookup).assign(_req()) == 1
 
 
+def test_holder_slack_env_keeps_the_longest_holder(monkeypatch):
+    # Both ranks hold over half of the 3-token reusable prefix; rank 1 is lighter.
+    lookup = Mock(side_effect=lambda tokens, key, rank: 3 if rank == 0 else 2)
+
+    def router():
+        return DpRouter(
+            DpLoadSnapshot((2, 0), (8, 0), (8, 0), (256, 256)),
+            "cache_aware",
+            Mock(return_value=(4, 4)),
+            lookup,
+        )
+
+    monkeypatch.delenv("SGLANG_JAX_DP_HOLDER_SLACK_TOKENS", raising=False)
+    assert router().assign(_req()) == 1
+    monkeypatch.setenv("SGLANG_JAX_DP_HOLDER_SLACK_TOKENS", "0")
+    assert router().assign(_req()) == 0
+
+
+def test_route_hook_reports_assignments_and_only_the_first_deferral(monkeypatch):
+    monkeypatch.setenv("SGLANG_JAX_DP_MAX_SPILL_TOKENS", "1")
+    monkeypatch.setenv("SGLANG_JAX_DP_MAX_DEFER_ROUNDS", "2")
+    lookup = Mock(side_effect=lambda tokens, key, rank: 3 if rank == 0 else 0)
+    seen = []
+
+    def router():
+        return DpRouter(
+            DpLoadSnapshot((0, 0), (0, 0), (0, 0), (0, 256)),
+            "cache_aware",
+            Mock(return_value=(4, 4)),
+            lookup,
+            on_route=lambda req, d: seen.append(
+                (d["chosen"], d["deferrals"], dict(d["matches"]), list(d["eligible"]))
+            ),
+        )
+
+    req = _req()
+    assert router().assign(req) is None
+    assert router().assign(req) is None
+    assert router().assign(req) == 1
+    # Past the deferral limit the router probes only eligible ranks.
+    assert seen == [(None, 0, {0: 3, 1: 0}, [1]), (1, 2, {1: 0}, [1])]
+
+
 def test_sticky_setting_does_not_change_other_policies(monkeypatch):
     monkeypatch.setenv("SGLANG_JAX_DP_MAX_SPILL_TOKENS", "1")
     lookup = Mock(side_effect=lambda tokens, key, rank: 3 if rank == 0 else 0)

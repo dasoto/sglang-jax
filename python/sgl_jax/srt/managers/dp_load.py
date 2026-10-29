@@ -73,6 +73,10 @@ def _env_int(name: str) -> int | None:
 # SGLANG_JAX_DP_MAX_DEFER_ROUNDS deferrals it may spill again. A round is one intake call,
 # made once per scheduler iteration in lockstep on every node, so the count is identical
 # across nodes and routing stays deterministic.
+#
+# SGLANG_JAX_DP_HOLDER_SLACK_TOKENS (``cache_aware`` only, off unless set): among the
+# eligible holders, only those within this many tokens of the longest match compete on
+# load (see ``pick_cache_aware_dp``).
 _DEFAULT_MAX_DEFER_ROUNDS = 500
 
 
@@ -91,6 +95,7 @@ class DpRouter:
         estimate_io,
         lookup_prefix,
         round_robin_start: int = 0,
+        on_route=None,
     ):
         self.request_counts = list(snapshot.request_counts)
         self.input_tokens = list(snapshot.input_tokens)
@@ -106,6 +111,12 @@ class DpRouter:
         )
         max_defer = _env_int("SGLANG_JAX_DP_MAX_DEFER_ROUNDS")
         self.max_defer_rounds = _DEFAULT_MAX_DEFER_ROUNDS if max_defer is None else max_defer
+        self.holder_slack_tokens = (
+            _env_int("SGLANG_JAX_DP_HOLDER_SLACK_TOKENS") if policy == "cache_aware" else None
+        )
+        # Optional diagnostics hook, called with (req, details) after each cache-aware
+        # decision: every assignment, and a deferral only on its first round.
+        self._on_route = on_route
 
     def assign(self, req) -> int | None:
         """Choose or preserve a DP rank, then record its load exactly once.
@@ -220,7 +231,20 @@ class DpRouter:
             input_tokens,
             output_tokens,
             max_spill_tokens=self.max_spill_tokens if sticky else None,
+            holder_slack_tokens=self.holder_slack_tokens,
         )
+        if self._on_route is not None and (rank is not None or deferrals == 0):
+            self._on_route(
+                req,
+                {
+                    "chosen": rank,
+                    "prompt_len": prompt_len,
+                    "matches": matches,
+                    "eligible": eligible,
+                    "counts": tuple(self.request_counts),
+                    "deferrals": deferrals,
+                },
+            )
         if rank is None and sticky:
             req._dp_defer_rounds = deferrals + 1
             if req._dp_defer_rounds == self.max_defer_rounds:

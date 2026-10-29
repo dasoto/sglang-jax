@@ -146,6 +146,44 @@ def test_sticky_off_keeps_spilling_to_cold_ranks():
     assert _sticky([1, 2, 3], matches, 72_000, max_spill_tokens=None) == 1
 
 
+def _slack(eligible, counts, matches, prompt_len, holder_slack_tokens):
+    tokens = [10 * c for c in counts]
+    return pick(
+        eligible,
+        counts,
+        tokens,
+        matches,
+        prompt_len,
+        counts,
+        tokens,
+        0,
+        0,
+        holder_slack_tokens=holder_slack_tokens,
+    )
+
+
+def test_holder_slack_keeps_a_session_on_its_own_rank():
+    # Rank 0 holds the session's previous turn (60K); the lighter rank 1 holds only a
+    # 40K prefix shared with a sibling. Without slack the lighter holder wins.
+    matches = {0: 60_000, 1: 40_000, 2: 0, 3: 0}
+    counts = [3, 1, 0, 0]
+    assert _slack([0, 1, 2, 3], counts, matches, 62_000, holder_slack_tokens=None) == 1
+    assert _slack([0, 1, 2, 3], counts, matches, 62_000, holder_slack_tokens=2048) == 0
+
+
+def test_holder_slack_still_spreads_a_hot_prefix_by_load():
+    # Holders within the slack of the longest match compete on load.
+    matches = {0: 10_000, 1: 9_500, 2: 0, 3: 0}
+    assert _slack([0, 1, 2, 3], [3, 1, 0, 0], matches, 10_500, holder_slack_tokens=1024) == 1
+
+
+def test_holder_slack_is_relative_to_the_longest_eligible_holder():
+    # The longest match sits on a full rank; ranks 1 and 2 are within the slack of each
+    # other and compete on load.
+    matches = {0: 60_000, 1: 40_000, 2: 39_000, 3: 0}
+    assert _slack([1, 2, 3], [0, 3, 1, 0], matches, 62_000, holder_slack_tokens=2048) == 2
+
+
 def test_holder_and_load_tie_breaks_by_lowest_rank():
     counts = [2, 2, 2, 2]
     tokens = [20, 20, 20, 20]
