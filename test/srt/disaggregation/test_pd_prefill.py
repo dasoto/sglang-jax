@@ -669,9 +669,14 @@ class TestPadToPageBucket:
             (128, 128),
             (129, 256),
             (256, 256),
-            (257, 512),
+            (257, 384),
+            (384, 384),
+            (385, 512),
             (512, 512),
-            (513, 1024),  # beyond largest bucket: rounds up, never truncates
+            (513, 640),
+            (769, 896),
+            (1025, 1280),
+            (2049, 4096),  # beyond largest bucket: rounds up, never truncates
         ],
     )
     def test_bucket_selection(self, input_pages, expected_bucket):
