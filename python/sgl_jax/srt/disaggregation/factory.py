@@ -122,6 +122,17 @@ def _create_jax_backend(
             pool_name="pd_prefill",
         )
 
+    pull_workers = int(server_args.disaggregation_channel_number)
+    if role == "decode":
+        per_dp_max = int(getattr(scheduler, "per_dp_max_running_requests", 0) or 0)
+        dp_sz = int(getattr(scheduler, "dp_size", 1) or 1)
+        pull_workers = max(
+            pull_workers,
+            int(server_args.disaggregation_max_inflight_transfers),
+            per_dp_max * dp_sz,
+            64,
+        )
+
     return JaxTransferKVManager(
         wrapper,
         notifier,
@@ -130,7 +141,7 @@ def _create_jax_backend(
         ack_timeout_seconds=server_args.disaggregation_ack_timeout_seconds,
         pull_timeout_seconds=server_args.disaggregation_pull_timeout_seconds,
         reaper_interval_seconds=server_args.disaggregation_orphan_reaper_interval_seconds,
-        pull_worker_count=server_args.disaggregation_channel_number,
+        pull_worker_count=pull_workers,
     )
 
 

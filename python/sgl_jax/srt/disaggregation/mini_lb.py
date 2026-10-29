@@ -125,6 +125,8 @@ class MiniLoadBalancer:
 
         prefill_req = request.copy()
         decode_req = request.copy()
+        prefill_req.pop("_x_correlation_id", None)
+        decode_req.pop("_x_correlation_id", None)
         prefill_req["dp_rank"] = p_rank
         decode_req["dp_rank"] = d_rank
         decode_req["disagg_prefill_dp_rank"] = p_rank
@@ -156,14 +158,18 @@ class MiniLoadBalancer:
                     total += len(str(m.get("content", "")))
         elif isinstance(request.get("text"), str):
             total = len(request["text"])
+        elif isinstance(request.get("prompt"), str):
+            total = len(request["prompt"])
         return max(total, 256)
 
     def _select_sticky_p_and_loaded_d(self, request: dict, p_size: int, d_size: int) -> tuple[int, int]:
         self._ensure_load_arrays(p_size, d_size)
         msgs = request.get("messages")
         candidate_keys: list[object] = []
-        tree_rid: str | None = None
-        if isinstance(msgs, list) and msgs:
+        x_corr_id = request.get("_x_correlation_id")
+        if isinstance(x_corr_id, str) and x_corr_id:
+            candidate_keys.append(("cid", x_corr_id))
+        elif isinstance(msgs, list) and msgs:
             sys_prefix = (
                 str(msgs[0].get("content", ""))[:256]
                 if isinstance(msgs[0], dict)
@@ -174,10 +180,6 @@ class MiniLoadBalancer:
                 if isinstance(m, dict) and m.get("role") == "user":
                     first_user_content = str(m.get("content", ""))
                     break
-            if first_user_content.startswith("[rid:"):
-                end_idx = first_user_content.find("]", 5, 32)
-                if end_idx != -1:
-                    tree_rid = first_user_content[: end_idx + 1]
             if len(msgs) >= 4 and isinstance(msgs[2], dict):
                 candidate_keys.append(
                     (
@@ -187,8 +189,8 @@ class MiniLoadBalancer:
                         str(msgs[2].get("content", ""))[:160],
                     )
                 )
-            if len(first_user_content) >= 320:
-                candidate_keys.append(("u0", sys_prefix, first_user_content[:160]))
+            if first_user_content:
+                candidate_keys.append(("u0", sys_prefix, first_user_content[:256]))
             head = msgs[:2] if len(msgs) >= 2 else msgs[:1]
             candidate_keys.append(
                 repr(
@@ -207,33 +209,21 @@ class MiniLoadBalancer:
                 break
 
         if p_rank is None:
-            min_active = min(self._p_active_reqs) if self._p_active_reqs else 0
-            if tree_rid is not None and tree_rid in self._tree_dp_map:
-                r_tree = self._tree_dp_map[tree_rid]
-                if isinstance(msgs, list) and len(msgs) >= 4:
-                    p_rank = r_tree
-                elif self._p_active_reqs[r_tree] <= min_active:
-                    p_rank = r_tree
-            if p_rank is None:
-                p_rank = min(
-                    range(p_size),
-                    key=lambda r: (
-                        self._p_active_reqs[r],
-                        self._p_active_chars[r],
-                        self._p_conv_count[r],
-                        r,
-                    ),
-                )
-                self._p_conv_count[p_rank] += 1
+            p_rank = min(
+                range(p_size),
+                key=lambda r: (
+                    self._p_active_reqs[r],
+                    self._p_active_chars[r],
+                    self._p_conv_count[r],
+                    r,
+                ),
+            )
+            self._p_conv_count[p_rank] += 1
 
         for k in candidate_keys:
             if len(self._sticky_dp_map) >= 16384 and k not in self._sticky_dp_map:
                 self._sticky_dp_map.pop(next(iter(self._sticky_dp_map)))
             self._sticky_dp_map[k] = p_rank
-        if tree_rid is not None and tree_rid not in self._tree_dp_map:
-            if len(self._tree_dp_map) >= 8192:
-                self._tree_dp_map.pop(next(iter(self._tree_dp_map)))
-            self._tree_dp_map[tree_rid] = p_rank
 
         d_rank = min(
             range(d_size),
@@ -276,6 +266,8 @@ class MiniLoadBalancer:
 
         prefill_req = request.copy()
         decode_req = request.copy()
+        prefill_req.pop("_x_correlation_id", None)
+        decode_req.pop("_x_correlation_id", None)
         prefill_req["dp_rank"] = p_rank
         decode_req["dp_rank"] = d_rank
         decode_req["disagg_prefill_dp_rank"] = p_rank
@@ -472,7 +464,7 @@ class MiniLoadBalancer:
 
 
 try:
-    from fastapi import FastAPI, HTTPException
+    from fastapi import FastAPI, HTTPException, Request
     from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 
     from sgl_jax.srt.disaggregation.mini_lb_helpers import (
@@ -665,17 +657,32 @@ try:
             if not released:
                 _admission_sem.release()
 
+    def _attach_correlation_id(request_data: dict, raw_request: Request | None) -> dict:
+        if raw_request is not None:
+            cid = raw_request.headers.get("x-correlation-id") or raw_request.headers.get(
+                "x-session-id"
+            )
+            if cid and "_x_correlation_id" not in request_data:
+                return {**request_data, "_x_correlation_id": cid}
+        return request_data
+
     @app.post("/generate")
-    async def handle_generate_request(request_data: dict):
-        return await _forward_to_backend(request_data, "generate")
+    async def handle_generate_request(request_data: dict, raw_request: Request = None):
+        return await _forward_to_backend(
+            _attach_correlation_id(request_data, raw_request), "generate"
+        )
 
     @app.post("/v1/chat/completions")
-    async def handle_chat_completion_request(request_data: dict):
-        return await _forward_to_backend(request_data, "v1/chat/completions")
+    async def handle_chat_completion_request(request_data: dict, raw_request: Request = None):
+        return await _forward_to_backend(
+            _attach_correlation_id(request_data, raw_request), "v1/chat/completions"
+        )
 
     @app.post("/v1/completions")
-    async def handle_completion_request(request_data: dict):
-        return await _forward_to_backend(request_data, "v1/completions")
+    async def handle_completion_request(request_data: dict, raw_request: Request = None):
+        return await _forward_to_backend(
+            _attach_correlation_id(request_data, raw_request), "v1/completions"
+        )
 
     @app.get("/v1/models")
     async def get_models():

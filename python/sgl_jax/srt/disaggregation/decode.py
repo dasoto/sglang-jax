@@ -509,8 +509,9 @@ class SchedulerDisaggregationDecodeMixin:
 
     def process_decode_queue(self: Scheduler) -> None:
         """Drive prealloc -> transfer -> ready transitions."""
-        if self.running_batch is not None and not self.running_batch.is_empty():
-            self.running_batch.filter_batch()
+        rb = getattr(self, "running_batch", None)
+        if rb is not None and not rb.is_empty():
+            rb.filter_batch()
         self._admit_decode_prealloc()
         self._drain_decode_transfer_terminals()
         if getattr(self, "_pd_ready_pure_decode_queue", None):
@@ -683,6 +684,12 @@ class SchedulerDisaggregationDecodeMixin:
         page_size = allocator.page_size
         reserved_per = self.server_args.disaggregation_num_reserved_decode_tokens
         max_inflight = self.server_args.disaggregation_max_inflight_transfers
+        if (
+            max_inflight > 0
+            and getattr(self.disagg_kv_manager, "engine_name", "raiden") != "raiden"
+        ):
+            per_dp_max = int(getattr(self, "per_dp_max_running_requests", 0) or 0)
+            max_inflight = max(max_inflight, per_dp_max * int(self.dp_size))
         per_rank_inflight = per_rank_inflight_limit(max_inflight, self.dp_size)
         n_transfer = len(self.disagg_transfer_queue)
         admitted = 0
