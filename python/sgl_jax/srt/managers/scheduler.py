@@ -256,6 +256,9 @@ class Scheduler(
             "on",
         )
         self._dp_probe_kv: dict[int, int] = {}
+        # Work stealing (off unless set): see _steal_for_idle_dp_ranks.
+        steal = os.environ.get("SGLANG_JAX_DP_STEAL_MAX_CACHED_TOKENS", "").strip()
+        self._dp_steal_max_cached = int(steal) if steal else None
         self.skip_tokenizer_init = server_args.skip_tokenizer_init
         self.stream_interval = server_args.stream_interval
         self.max_seq_len = server_args.max_seq_len
@@ -2179,6 +2182,89 @@ class Scheduler(
 
         return ret
 
+    def _steal_for_idle_dp_ranks(self, adder, chunk_exhausted_dps) -> None:
+        """Hand queued cold requests to DP ranks that would otherwise prefill nothing.
+
+        A DP rank admits one prefill request at a time, so a long chunked prefill holds back
+        every request queued behind it while other ranks, whose own queues are empty, run their
+        share of each step on padding. After the normal admission pass, each rank left without
+        a prefill takes the oldest queued request of a rank that cannot start it this round
+        (busy with a chunked prefill, or at its request cap) and that has at most
+        SGLANG_JAX_DP_STEAL_MAX_CACHED_TOKENS cached there: a cold request (a first turn, a
+        new subagent) loses at most that many cached tokens and starts at once instead of
+        waiting for its rank. Later turns of the moved conversation follow its cache to the new
+        rank. Deterministic on every node: it reads only replicated scheduler and tree state.
+        """
+        cap = self.per_dp_max_running_requests
+        infos = self.running_batch.reqs_info
+
+        def busy(r):
+            return (
+                self.chunked_reqs[r] is not None
+                or adder.new_chunked_reqs[r] is not None
+                or infos[r].batch_is_full
+                or len(infos[r].reqs) + len(adder.can_run_list[r]) >= cap
+            )
+
+        idle = [
+            r
+            for r in range(self.dp_size)
+            if r not in chunk_exhausted_dps and not busy(r) and not adder.can_run_list[r]
+        ]
+        if not idle:
+            return
+        admitted = {id(x) for reqs in adder.can_run_list.values() for x in reqs}
+        probes = 0
+        for req in list(self.waiting_queue):
+            if not idle:
+                break
+            home = req.dp_rank
+            if id(req) in admitted or home in idle or not busy(home):
+                continue
+            if getattr(req, "bootstrap_room", None) is not None:
+                continue
+            cached = getattr(req, "_steal_home_cached", None)
+            if cached is None or cached[0] != home:
+                if probes >= 8:  # radix walks per round; the rest wait for the next round
+                    break
+                probes += 1
+                match = self.tree_cache.match_prefix(MatchPrefixParams(key=req.match_key()))
+                cached = req._steal_home_cached = (home, len(match.device_indices))
+            if cached[1] > self._dp_steal_max_cached:
+                continue
+            target = idle[0]
+            if self.tree_cache is not None and self.tree_cache.supports_recurrent():
+                per_req = self.req_to_token_pool.request_owned_slots
+                if recurrent_admission_blocked(
+                    self.req_to_token_pool.recurrent_available_size(target),
+                    self.tree_cache.recurrent_evictable_size(target),
+                    per_req,
+                    keeps_locked=1,
+                ):
+                    idle.pop(0)
+                    continue
+            self._release_queue_pin(req)
+            req.dp_rank = target
+            req.init_next_round_input(self.tree_cache)
+            res = adder.add_one_req(req)
+            if res != AddReqResult.CONTINUE:
+                req.dp_rank = home
+                if res == AddReqResult.DP_BUDGET_EXHAUSTED or res == AddReqResult.NO_TOKEN:
+                    idle.pop(0)
+                    continue
+                break
+            idle.pop(0)
+            if getattr(self, "_dp_route_log", False):
+                logger.info(
+                    "DP steal rid=%s isl=%d from=%d to=%d home_cached=%d cached=%d",
+                    req.rid,
+                    len(req.origin_input_ids),
+                    home,
+                    target,
+                    cached[1],
+                    len(req.prefix_indices),
+                )
+
     def get_new_batch_prefill(self) -> ScheduleBatch | None:
         # Pathways-PD sets _pd_admission_paused while its D-pool token gate is
         # closed: existing chunked requests still advance, but nothing new is
@@ -2360,6 +2446,15 @@ class Scheduler(
                     break
             if _reserved_bid is not None:
                 req.disagg_host_buffer_id = _reserved_bid
+
+        if (
+            getattr(self, "_dp_steal_max_cached", None) is not None
+            and self.dp_size > 1
+            and not admissions_paused
+            and self.lora_paths is None
+            and not self.running_batch.batch_is_full
+        ):
+            self._steal_for_idle_dp_ranks(adder, chunk_exhausted_dps)
 
         # Update waiting queue
         # Collect H2D flush plans from admitted reqs; drained donation-safe later.

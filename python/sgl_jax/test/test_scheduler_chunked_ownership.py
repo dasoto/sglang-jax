@@ -702,6 +702,84 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         self.assertEqual(scheduler.chunked_reqs, [None])
         self.assertEqual(scheduler._pending_chunked_abort_reqs, [None])
 
+    def _make_steal_scheduler(self, home_cached, chunked_home=True):
+        # Two DP ranks: rank 0 is busy with a chunked prefill, rank 1 has nothing to prefill.
+        scheduler, _ = self._make_scheduler([[], []])
+        scheduler.per_dp_max_running_requests = 32
+        scheduler._dp_steal_max_cached = 4096
+        scheduler._dp_route_log = False
+        chunk = self._make_req("chunk", [1, 2, 3], [], dp_rank=0)
+        chunk.init_next_round_input = Mock()
+        scheduler.chunked_reqs = [chunk if chunked_home else None, None]
+        req = self._make_req("cold", [5, 6, 7, 8], [], dp_rank=0)
+        req.init_next_round_input = Mock()
+        req.match_key = Mock(return_value="key")
+        scheduler.waiting_queue = [req]
+        scheduler.tree_cache = SimpleNamespace(
+            match_prefix=Mock(return_value=SimpleNamespace(device_indices=[0] * home_cached)),
+            supports_recurrent=lambda: False,
+        )
+        adder = SimpleNamespace(
+            can_run_list={0: [], 1: []},
+            new_chunked_reqs=[None, None],
+            pending_h2d=[],
+            add_chunked_req=Mock(return_value=chunk),
+        )
+
+        def add_one_req(r):
+            adder.can_run_list[r.dp_rank].append(r)
+            return AddReqResult.CONTINUE
+
+        adder.add_one_req = Mock(side_effect=add_one_req)
+        return scheduler, adder, req
+
+    def test_idle_dp_rank_steals_a_cold_request_from_a_busy_rank(self):
+        scheduler, adder, req = self._make_steal_scheduler(home_cached=128)
+        scheduler._steal_for_idle_dp_ranks(adder, set())
+        self.assertEqual(req.dp_rank, 1)
+        req.init_next_round_input.assert_called_once_with(scheduler.tree_cache)
+        self.assertEqual(adder.can_run_list, {0: [], 1: [req]})
+
+    def test_warm_request_is_not_stolen(self):
+        scheduler, adder, req = self._make_steal_scheduler(home_cached=8192)
+        scheduler._steal_for_idle_dp_ranks(adder, set())
+        self.assertEqual(req.dp_rank, 0)
+        adder.add_one_req.assert_not_called()
+
+    def test_no_steal_when_the_home_rank_can_start_the_request(self):
+        scheduler, adder, req = self._make_steal_scheduler(home_cached=0, chunked_home=False)
+        scheduler._steal_for_idle_dp_ranks(adder, set())
+        self.assertEqual(req.dp_rank, 0)
+        adder.add_one_req.assert_not_called()
+
+    def test_no_steal_into_a_rank_whose_chunk_budget_is_exhausted(self):
+        scheduler, adder, req = self._make_steal_scheduler(home_cached=0)
+        scheduler._steal_for_idle_dp_ranks(adder, {1})
+        self.assertEqual(req.dp_rank, 0)
+        adder.add_one_req.assert_not_called()
+
+    def test_failed_steal_restores_the_home_rank(self):
+        scheduler, adder, req = self._make_steal_scheduler(home_cached=0)
+        adder.add_one_req = Mock(return_value=AddReqResult.DP_BUDGET_EXHAUSTED)
+        scheduler._steal_for_idle_dp_ranks(adder, set())
+        self.assertEqual(req.dp_rank, 0)
+        self.assertEqual(adder.can_run_list, {0: [], 1: []})
+
+    def test_get_new_batch_prefill_steals_only_when_enabled(self):
+        for limit in (None, 4096):
+            with self.subTest(limit=limit):
+                scheduler, adder, req = self._make_steal_scheduler(home_cached=0)
+                scheduler._dp_steal_max_cached = limit
+                scheduler._steal_for_idle_dp_ranks = Mock()
+                with patch("sgl_jax.srt.managers.scheduler.PrefillAdder", return_value=adder):
+                    self.assertIsNone(scheduler.get_new_batch_prefill())
+                if limit is None:
+                    scheduler._steal_for_idle_dp_ranks.assert_not_called()
+                else:
+                    scheduler._steal_for_idle_dp_ranks.assert_called_once_with(adder, set())
+                # The busy home rank never admitted it in the normal pass.
+                adder.add_one_req.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
