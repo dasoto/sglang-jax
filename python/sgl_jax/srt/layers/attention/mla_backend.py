@@ -59,6 +59,70 @@ def _dcp_rs_bf16_enabled() -> bool:
     return os.environ.get(MLA_DCP_RS_BF16_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
 
 
+# One-token sequences of EXTEND batches first (SGLANG_JAX_MLA_DECODE_ROWS_FIRST=1). The v2 kernel
+# runs sequences [0, distribution[0]) through its decode branches (q_len = 1, batched) and the
+# rest through the mixed branch, whose query blocks are sized for prefill chunks. A mixed
+# prefill+decode step puts its decode rows after the prefill chunks of each DP section, so with
+# distribution (0, 0, n) every decode row ran as a mixed sequence: a query block for one token
+# over the row's whole context. Read when the metadata is built.
+MLA_DECODE_ROWS_FIRST_ENV = "SGLANG_JAX_MLA_DECODE_ROWS_FIRST"
+
+
+def _decode_rows_first_enabled() -> bool:
+    return os.environ.get(MLA_DECODE_ROWS_FIRST_ENV, "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _decode_rows_first_layout(ext_2d, seq_lens_2d, pages_2d, page_size, tokens_per_dp):
+    """Reorder each DP rank's sequences so the one-token ones come first.
+
+    Args: per-rank extend lengths and sequence lengths ``[dp, bs]``, the per-rank page lists
+    ``[dp, pages]`` (each live sequence's pages contiguous, in sequence order, padding after),
+    the page size and the padded token count per rank.
+
+    Returns the extend lengths, sequence lengths and page lists in the new order (stable within
+    each class: one-token sequences, other live sequences, padding), the number of one-token
+    sequences per rank, and per-rank token indices ``perm`` (new position -> old position) and
+    ``unperm`` (old -> new), both ``[dp, tokens_per_dp]`` and local to the rank. Padding tokens
+    keep their positions.
+    """
+    dp, bs = ext_2d.shape
+    live = seq_lens_2d > 0
+    key = np.where(~live, 2, np.where(ext_2d == 1, 0, 1))
+    order = np.argsort(key, axis=1, kind="stable")
+    num_one = np.sum(key == 0, axis=1).astype(np.int32)
+    seq_pages = np.where(live, (seq_lens_2d + page_size - 1) // page_size, 0)
+    new_pages = np.empty_like(pages_2d)
+    perm = np.empty((dp, tokens_per_dp), dtype=np.int32)
+    unperm = np.empty((dp, tokens_per_dp), dtype=np.int32)
+    for r in range(dp):
+        cu_q = np.concatenate([[0], np.cumsum(ext_2d[r])])
+        cu_p = np.concatenate([[0], np.cumsum(seq_pages[r])])
+        toks, pages = [], []
+        for s in order[r]:
+            if not live[r, s]:
+                continue
+            toks.append(np.arange(cu_q[s], cu_q[s + 1], dtype=np.int32))
+            pages.append(pages_2d[r, cu_p[s] : cu_p[s + 1]])
+        head = np.concatenate(toks) if toks else np.empty((0,), np.int32)
+        perm[r] = np.concatenate([head, np.arange(len(head), tokens_per_dp, dtype=np.int32)])
+        unperm[r, perm[r]] = np.arange(tokens_per_dp, dtype=np.int32)
+        used = int(cu_p[-1])
+        new_pages[r] = np.concatenate(pages + [pages_2d[r, used:]]) if pages else pages_2d[r]
+    return (
+        np.take_along_axis(ext_2d, order, axis=1),
+        np.take_along_axis(seq_lens_2d, order, axis=1),
+        new_pages,
+        num_one,
+        perm,
+        unperm,
+    )
+
+
 @register_pytree_node_class
 @dataclass
 class MLAAttentionMetadata:
@@ -77,6 +141,10 @@ class MLAAttentionMetadata:
     distribution: jax.Array = None
     page_seq_positions: jax.Array = None
     global_seq_lens: jax.Array = None
+    # SGLANG_JAX_MLA_DECODE_ROWS_FIRST (EXTEND only): per-rank token gather indices into the
+    # reordered sequence layout (new <- old) and back (old <- new).
+    tok_perm: jax.Array = None
+    tok_unperm: jax.Array = None
 
     def tree_flatten(self):
         children = (
@@ -87,6 +155,8 @@ class MLAAttentionMetadata:
             self.distribution,
             self.page_seq_positions,
             self.global_seq_lens,
+            self.tok_perm,
+            self.tok_unperm,
         )
         aux_data = {}
         return (children, aux_data)
@@ -101,6 +171,8 @@ class MLAAttentionMetadata:
         obj.distribution = children[4]
         obj.page_seq_positions = children[5] if len(children) > 5 else None
         obj.global_seq_lens = children[6] if len(children) > 6 else None
+        obj.tok_perm = children[7] if len(children) > 7 else None
+        obj.tok_unperm = children[8] if len(children) > 8 else None
         return obj
 
 
@@ -197,8 +269,27 @@ class MLAAttentionBackend(AttentionBackend):
         strided_2d = cache_loc_2d[:, :: self.page_size]
         logical_pages_2d = strided_2d // self.page_size
 
+        extend_seq_lens = batch.extend_seq_lens
+        all_seq_lens = batch.seq_lens
+        num_one = tok_perm = tok_unperm = None
+        if batch.forward_mode == ForwardMode.EXTEND and _decode_rows_first_enabled():
+            shape_2d = (batch.dp_size, batch.per_dp_bs_size)
+            ext_r, seq_r, logical_pages_2d, num_one, tok_perm, tok_unperm = (
+                _decode_rows_first_layout(
+                    np.asarray(extend_seq_lens).reshape(shape_2d),
+                    np.asarray(all_seq_lens).reshape(shape_2d),
+                    logical_pages_2d,
+                    self.page_size,
+                    len(batch.out_cache_loc) // batch.dp_size,
+                )
+            )
+            extend_seq_lens = ext_r.ravel()
+            all_seq_lens = seq_r.ravel()
+            tok_perm = tok_perm.ravel()
+            tok_unperm = tok_unperm.ravel()
+
         if batch.forward_mode == ForwardMode.EXTEND:
-            ext_2d = batch.extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
+            ext_2d = extend_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
             cu_q_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
             cu_q_2d[:, 1:] = np.cumsum(ext_2d, axis=1)
             cu_q_lens = cu_q_2d.ravel()
@@ -208,25 +299,28 @@ class MLAAttentionBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        seq_lens = batch.seq_lens
-        aligned_seq_lens = (
-            (batch.seq_lens + self.page_size - 1) // self.page_size
-        ) * self.page_size
+        seq_lens = all_seq_lens
+        aligned_seq_lens = ((all_seq_lens + self.page_size - 1) // self.page_size) * self.page_size
 
         aligned_2d = aligned_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
         cu_kv_2d = np.zeros((batch.dp_size, batch.per_dp_bs_size + 1), dtype=np.int32)
         cu_kv_2d[:, 1:] = np.cumsum(aligned_2d, axis=1)
 
-        seq_lens_2d = batch.seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
+        seq_lens_2d = all_seq_lens.reshape(batch.dp_size, batch.per_dp_bs_size)
         local_num_seqs = np.sum(seq_lens_2d > 0, axis=1, dtype=np.int32)
         if batch.forward_mode == ForwardMode.DECODE:
             distribution = np.repeat(local_num_seqs, 3)
         elif batch.forward_mode == ForwardMode.EXTEND:
-            distribution = np.column_stack(
-                [np.zeros_like(local_num_seqs), np.zeros_like(local_num_seqs), local_num_seqs]
-            ).ravel()
+            first = num_one if num_one is not None else np.zeros_like(local_num_seqs)
+            distribution = np.column_stack([first, first, local_num_seqs]).ravel()
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
+
+        if tok_perm is not None:
+            metadata.tok_perm, metadata.tok_unperm = device_array(
+                (tok_perm, tok_unperm),
+                sharding=(NamedSharding(self.mesh, P(self.attention_data_partition_axis))),
+            )
 
         if self.dcp_size <= 1:
             page_indices = logical_pages_2d.ravel()
@@ -457,8 +551,15 @@ class MLAAttentionBackend(AttentionBackend):
                 cu_q_lens_,
                 cu_kv_lens_,
                 distribution_,
+                *perms,
             ):
-                return mla_ragged_paged_attention(
+                if perms:
+                    # Kernel order: this rank's one-token sequences first.
+                    ql_nope_, q_pe_, new_kv_c_, new_k_pe_ = (
+                        jnp.take(x, perms[0], axis=0)
+                        for x in (ql_nope_, q_pe_, new_kv_c_, new_k_pe_)
+                    )
+                out = mla_ragged_paged_attention(
                     ql_nope_,
                     q_pe_,
                     new_kv_c_,
@@ -477,7 +578,14 @@ class MLAAttentionBackend(AttentionBackend):
                     decode_batch_size=self.decode_batch_size,
                     vmem_limit_bytes=self.vmem_limit_bytes,
                 )
+                if perms:
+                    out = (jnp.take(out[0], perms[1], axis=0), out[1])
+                return out
 
+            perm_args = ()
+            if self.forward_metadata.tok_perm is not None:
+                in_specs = in_specs + (P(dpa), P(dpa))
+                perm_args = (self.forward_metadata.tok_perm, self.forward_metadata.tok_unperm)
             o_latent, updated_cache = jax.shard_map(
                 _run,
                 in_specs=in_specs,
@@ -494,6 +602,7 @@ class MLAAttentionBackend(AttentionBackend):
                 self.forward_metadata.cu_q_lens,
                 self.forward_metadata.cu_kv_lens,
                 self.forward_metadata.distribution,
+                *perm_args,
             )
 
             return o_latent, updated_cache
@@ -525,6 +634,8 @@ class MLAAttentionBackend(AttentionBackend):
             P((dpa, "tensor"), None, None, None),  # updated cache
         )
 
+        has_perm = self.forward_metadata.tok_perm is not None
+
         def _run_dcp(
             ql_nope_,
             q_pe_,
@@ -539,9 +650,12 @@ class MLAAttentionBackend(AttentionBackend):
             page_seq_positions_,
             global_seq_lens_,
             out_cache_loc_,
-            w_uk_=None,
-            w_uv_=None,
+            *extra,
         ):
+            perm_ = unperm_ = None
+            if has_perm:
+                perm_, unperm_, extra = extra[0], extra[1], extra[2:]
+            w_uk_, w_uv_ = (extra[0], extra[1]) if extra else (None, None)
             dcp_rank = jax.lax.axis_index("tensor")
             lkv_dim = align_to(new_kv_c_.shape[-1], 128)
             r_dim = align_to(new_k_pe_.shape[-1], 128)
@@ -572,6 +686,14 @@ class MLAAttentionBackend(AttentionBackend):
             idx = list(jnp.unravel_index(jnp.where(is_owned, flat_slot, 0), cache_.shape[:-1]))
             idx[0] = jnp.where(is_owned, idx[0], cache_.shape[0])  # out of bounds: dropped
             cache_updated = cache_.at[tuple(idx)].set(new_kv_fused, mode="drop")
+
+            if perm_ is not None:
+                # Kernel order: this rank's one-token sequences first (_decode_rows_first_layout).
+                # The cache scatter above keeps token order; the queries are permuted before the
+                # head all-gather, where they are 1/dcp_size of its output.
+                ql_nope_, q_pe_, new_kv_c_, new_k_pe_ = (
+                    jnp.take(x, perm_, axis=0) for x in (ql_nope_, q_pe_, new_kv_c_, new_k_pe_)
+                )
 
             # Gather all query heads so every DCP rank computes attention for all heads on its local KV pages.
             if absorb_weights is not None:
@@ -636,8 +758,12 @@ class MLAAttentionBackend(AttentionBackend):
                 num = jax.lax.psum_scatter(num, "tensor", scatter_dimension=1, tiled=True)
                 num = num.astype(jnp.float32)
                 den = jax.lax.psum_scatter(w, "tensor", scatter_dimension=1, tiled=True)
-                o_combined = num / jnp.where(den > 0.0, den, 1.0)[..., None]
-                return o_combined.astype(ql_nope_.dtype), cache_updated
+                o_combined = (num / jnp.where(den > 0.0, den, 1.0)[..., None]).astype(
+                    ql_nope_.dtype
+                )
+                if unperm_ is not None:
+                    o_combined = jnp.take(o_combined, unperm_, axis=0)
+                return o_combined, cache_updated
 
             # Combine (o_partial, lse_partial) across the "tensor" (DCP) axis.
             # o_partial: [T_dp, N_h, lkv_dim], lse_partial: [T_dp, N_h]
@@ -675,8 +801,14 @@ class MLAAttentionBackend(AttentionBackend):
             o_combined = jnp.sum(o_local_heads * weights_norm[..., None], axis=0).astype(
                 ql_nope_.dtype
             )
+            if unperm_ is not None:
+                o_combined = jnp.take(o_combined, unperm_, axis=0)
             return o_combined, cache_updated
 
+        perm_args = ()
+        if has_perm:
+            in_specs_dcp = in_specs_dcp + (P(dpa), P(dpa))
+            perm_args = (self.forward_metadata.tok_perm, self.forward_metadata.tok_unperm)
         absorb_args = ()
         if absorb_weights is not None:
             # Replicated (rank, n_h, dim) W_UK / W_UV: q is the [T, n_h, D_k] query and the
@@ -703,6 +835,7 @@ class MLAAttentionBackend(AttentionBackend):
             self.forward_metadata.page_seq_positions,
             self.forward_metadata.global_seq_lens,
             forward_batch.out_cache_loc,
+            *perm_args,
             *absorb_args,
         )
 

@@ -83,6 +83,11 @@ TUNED_BLOCK_SIZES_MLA: dict[str, dict[tuple, tuple]] = {
         ("decode", "bfloat16", "bfloat16", 128, 512, 64, 128, 128): (8, 1, 8),
         ("decode", "bfloat16", "bfloat16", 128, 512, 64, 128, 256): (8, 1, 8),
         ("decode", "bfloat16", "bfloat16", 128, 512, 64, 128, 512): (8, 1, 8),
+        # One-token rows of mixed EXTEND steps take the decode branch at the step's token
+        # bucket (SGLANG_JAX_MLA_DECODE_ROWS_FIRST): the 512-token pick, which depends on the
+        # rows' pages, not on the bucket.
+        ("decode", "bfloat16", "bfloat16", 128, 512, 64, 128, 1024): (8, 1, 8),
+        ("decode", "bfloat16", "bfloat16", 128, 512, 64, 128, 2048): (8, 1, 8),
         ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 4): (1, 16),
         ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 8): (1, 16),
         ("mixed", "bfloat16", "bfloat16", 128, 512, 64, 128, 16): (1, 16),

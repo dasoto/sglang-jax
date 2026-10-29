@@ -109,6 +109,7 @@ class TestMLADCPCPU(unittest.TestCase):
                 else None
             ),
             cache_loc=np.array(cache_loc, dtype=np.int32),
+            out_cache_loc=np.array(out_cache_loc, dtype=np.int32),
             forward_mode=forward_mode,
         )
         backend.forward_metadata = backend.get_forward_metadata(worker_batch)
@@ -449,6 +450,82 @@ class TestMLADCPCPU(unittest.TestCase):
         )
         np.testing.assert_allclose(out_pext_2, out_pext_1, rtol=1e-4, atol=1e-4)
 
+    def test_decode_rows_first_matches_mixed_order(self):
+        """SGLANG_JAX_MLA_DECODE_ROWS_FIRST: one-token rows of an EXTEND batch take the decode
+        branches (distribution (d, d, n)) with the same outputs as the all-mixed layout, for
+        one-token rows between and after the prefill chunks, with and without DCP."""
+        page_size = 16
+        num_heads, kv_lora_rank, qk_rope_head_dim = 4, 128, 64
+        env = "SGLANG_JAX_MLA_DECODE_ROWS_FIRST"
+        for dcp_size in (1, 2):
+            rng = np.random.default_rng(20261029 + dcp_size)
+            setups = {
+                flag: self._make_setup(dcp_size=dcp_size, page_size=page_size)
+                for flag in ("0", "1")
+            }
+            req_tokens = {flag: [] for flag in setups}
+
+            def cache_loc_of(toks_list, s_lens):
+                chunks = []
+                for toks, sl in zip(toks_list, s_lens):
+                    aligned = ((sl + page_size - 1) // page_size) * page_size
+                    chunks.extend(list(toks) + [0] * (aligned - len(toks)))
+                return np.array(chunks, dtype=np.int32)
+
+            def step(prefix_lens, extend_lens, check_order):
+                seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+                total = sum(extend_lens)
+                q = rng.standard_normal((total, num_heads, kv_lora_rank), dtype=np.float32) * 0.2
+                q_pe = (
+                    rng.standard_normal((total, num_heads, qk_rope_head_dim), dtype=np.float32)
+                    * 0.2
+                )
+                k_c = rng.standard_normal((total, kv_lora_rank), dtype=np.float32) * 0.2
+                k_pe = rng.standard_normal((total, qk_rope_head_dim), dtype=np.float32) * 0.2
+                outs = {}
+                for flag, (pool, alloc, backend, layer) in setups.items():
+                    toks = req_tokens[flag]
+                    last = [t[-1] if t else -1 for t in toks] or [-1] * len(seq_lens)
+                    if not toks:
+                        toks.extend([] for _ in seq_lens)
+                        last = [-1] * len(seq_lens)
+                    loc = alloc.alloc_extend(prefix_lens, seq_lens, last, total)
+                    cursor = 0
+                    for i, e in enumerate(extend_lens):
+                        toks[i].extend(int(x) for x in loc[cursor : cursor + e])
+                        cursor += e
+                    with mock.patch.dict(os.environ, {env: flag if check_order else "0"}):
+                        outs[flag] = self._run_step(
+                            pool,
+                            backend,
+                            layer,
+                            ForwardMode.EXTEND,
+                            seq_lens,
+                            extend_lens,
+                            cache_loc_of(toks, seq_lens),
+                            loc,
+                            q,
+                            k_c,
+                            q_pe,
+                            k_pe,
+                        )
+                    if check_order and flag == "1":
+                        n_one = sum(1 for e in extend_lens if e == 1)
+                        dist = np.asarray(jax.device_get(backend.forward_metadata.distribution))
+                        self.assertEqual(list(dist), [n_one, n_one, len(seq_lens)])
+                np.testing.assert_allclose(
+                    outs["1"],
+                    outs["0"],
+                    rtol=1e-4,
+                    atol=1e-4,
+                    err_msg=f"dcp={dcp_size} extend={extend_lens}",
+                )
+                return seq_lens
+
+            # Prefill four sequences (same layout in both setups), then two mixed steps.
+            seq_lens = step([0, 0, 0, 0], [35, 16, 20, 24], check_order=False)
+            seq_lens = step(seq_lens, [10, 1, 1, 7], check_order=True)  # rows between chunks
+            step(seq_lens, [5, 3, 1, 1], check_order=True)  # rows after the chunks
 
 if __name__ == "__main__":
     unittest.main()
