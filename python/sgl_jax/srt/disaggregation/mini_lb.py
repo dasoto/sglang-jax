@@ -64,9 +64,12 @@ class MiniLoadBalancer:
         self._tree_dp_map: dict[str, int] = {}
         self._rr_counter: int = 0
         self._p_active_reqs: list[int] = []
+        self._p_live_reqs: list[int] = []
         self._p_active_chars: list[int] = []
         self._p_conv_count: list[int] = []
         self._d_active_reqs: list[int] = []
+        self._d_decoding_reqs: list[int] = []
+        self._d_active_chars: list[int] = []
         self._d_total_reqs: list[int] = []
 
     def _validate_router_args(self, router_args) -> None:
@@ -142,10 +145,13 @@ class MiniLoadBalancer:
     def _ensure_load_arrays(self, p_size: int, d_size: int) -> None:
         if len(self._p_active_reqs) != p_size:
             self._p_active_reqs = [0] * p_size
+            self._p_live_reqs = [0] * p_size
             self._p_active_chars = [0] * p_size
             self._p_conv_count = [0] * p_size
         if len(self._d_active_reqs) != d_size:
             self._d_active_reqs = [0] * d_size
+            self._d_decoding_reqs = [0] * d_size
+            self._d_active_chars = [0] * d_size
             self._d_total_reqs = [0] * d_size
 
     @staticmethod
@@ -169,7 +175,7 @@ class MiniLoadBalancer:
         x_corr_id = request.get("_x_correlation_id")
         if isinstance(x_corr_id, str) and x_corr_id:
             candidate_keys.append(("cid", x_corr_id))
-        elif isinstance(msgs, list) and msgs:
+        if isinstance(msgs, list) and msgs:
             sys_prefix = (
                 str(msgs[0].get("content", ""))[:256]
                 if isinstance(msgs[0], dict)
@@ -189,18 +195,19 @@ class MiniLoadBalancer:
                         str(msgs[2].get("content", ""))[:160],
                     )
                 )
-            if first_user_content:
-                candidate_keys.append(("u0", sys_prefix, first_user_content[:256]))
-            head = msgs[:2] if len(msgs) >= 2 else msgs[:1]
-            candidate_keys.append(
-                repr(
-                    [
-                        (m.get("role"), m.get("content"))
-                        for m in head
-                        if isinstance(m, dict)
-                    ]
+            if not x_corr_id:
+                if first_user_content:
+                    candidate_keys.append(("u0", sys_prefix, first_user_content[:256]))
+                head = msgs[:2] if len(msgs) >= 2 else msgs[:1]
+                candidate_keys.append(
+                    repr(
+                        [
+                            (m.get("role"), m.get("content"))
+                            for m in head
+                            if isinstance(m, dict)
+                        ]
+                    )
                 )
-            )
 
         p_rank: int | None = None
         for k in candidate_keys:
@@ -212,6 +219,7 @@ class MiniLoadBalancer:
             p_rank = min(
                 range(p_size),
                 key=lambda r: (
+                    self._p_live_reqs[r] + self._p_active_reqs[r],
                     self._p_active_reqs[r],
                     self._p_active_chars[r],
                     self._p_conv_count[r],
@@ -228,7 +236,8 @@ class MiniLoadBalancer:
         d_rank = min(
             range(d_size),
             key=lambda r: (
-                self._d_active_reqs[r],
+                self._d_active_reqs[r] + self._d_decoding_reqs[r],
+                self._d_active_chars[r],
                 self._d_total_reqs[r],
                 r,
             ),
@@ -316,8 +325,10 @@ class MiniLoadBalancer:
         req_chars = self._estimate_request_chars(modified_request) if track_load else 0
         if track_load:
             self._p_active_reqs[p_rank] += 1
+            self._p_live_reqs[p_rank] += 1
             self._p_active_chars[p_rank] += req_chars
             self._d_active_reqs[d_rank] += 1
+            self._d_active_chars[d_rank] += req_chars
 
         try:
             async with aiohttp.ClientSession(
@@ -356,8 +367,10 @@ class MiniLoadBalancer:
         finally:
             if track_load:
                 self._p_active_reqs[p_rank] = max(0, self._p_active_reqs[p_rank] - 1)
+                self._p_live_reqs[p_rank] = max(0, self._p_live_reqs[p_rank] - 1)
                 self._p_active_chars[p_rank] = max(0, self._p_active_chars[p_rank] - req_chars)
                 self._d_active_reqs[d_rank] = max(0, self._d_active_reqs[d_rank] - 1)
+                self._d_active_chars[d_rank] = max(0, self._d_active_chars[d_rank] - req_chars)
 
     async def generate_stream(
         self,
@@ -393,8 +406,10 @@ class MiniLoadBalancer:
         req_chars = self._estimate_request_chars(modified_request) if track_load else 0
         if track_load:
             self._p_active_reqs[p_rank] += 1
+            self._p_live_reqs[p_rank] += 1
             self._p_active_chars[p_rank] += req_chars
             self._d_active_reqs[d_rank] += 1
+            self._d_active_chars[d_rank] += req_chars
 
         async def stream_results():
             p_released = False
@@ -421,6 +436,7 @@ class MiniLoadBalancer:
                             self._p_active_chars[p_rank] = max(
                                 0, self._p_active_chars[p_rank] - req_chars
                             )
+                            self._d_decoding_reqs[d_rank] += 1
                             p_released = True
 
                         async for chunk in _iter_stream_lines(decode_response.content):
@@ -446,6 +462,7 @@ class MiniLoadBalancer:
                                 self._p_active_chars[p_rank] = max(
                                     0, self._p_active_chars[p_rank] - req_chars
                                 )
+                                self._d_decoding_reqs[d_rank] += 1
                                 p_released = True
                             yield chunk
             finally:
@@ -455,7 +472,11 @@ class MiniLoadBalancer:
                         self._p_active_chars[p_rank] = max(
                             0, self._p_active_chars[p_rank] - req_chars
                         )
+                    else:
+                        self._d_decoding_reqs[d_rank] = max(0, self._d_decoding_reqs[d_rank] - 1)
+                    self._p_live_reqs[p_rank] = max(0, self._p_live_reqs[p_rank] - 1)
                     self._d_active_reqs[d_rank] = max(0, self._d_active_reqs[d_rank] - 1)
+                    self._d_active_chars[d_rank] = max(0, self._d_active_chars[d_rank] - req_chars)
 
         return StreamingResponse(
             stream_results(),
@@ -522,9 +543,12 @@ try:
             lb._tree_dp_map.clear()
             lb._rr_counter = 0
             lb._p_active_reqs.clear()
+            lb._p_live_reqs.clear()
             lb._p_active_chars.clear()
             lb._p_conv_count.clear()
             lb._d_active_reqs.clear()
+            lb._d_decoding_reqs.clear()
+            lb._d_active_chars.clear()
             lb._d_total_reqs.clear()
         async with aiohttp.ClientSession() as session:
             tasks = []

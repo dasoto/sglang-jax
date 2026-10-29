@@ -260,6 +260,73 @@ class UnifiedRadixCache(BasePrefixCache):
             params, value, best_device_node, best_value_len, best_host_node, host_hit_length
         )
 
+    def probe_and_touch_prefix(self, key: RadixKey) -> int:
+        """Read-only prefix walk that refreshes LRU timestamps on matched nodes and returns
+        the matched device-resident prefix length in tokens without splitting nodes or
+        allocating index arrays."""
+        if self.disable or len(key) == 0:
+            return 0
+        converted_key = RadixKey(self.key_convert_fn(key.token_ids), key.extra_key, key.dp_rank)
+        if self.page_size != 1:
+            page_aligned_len = len(converted_key) // self.page_size * self.page_size
+            converted_key = converted_key[:page_aligned_len]
+        if len(converted_key) == 0:
+            return 0
+
+        node = self.root_node
+        node.last_access_time = get_and_increase_time_counter()
+        ids = converted_key.token_ids
+        n_ids = len(ids)
+        off = 0
+        child_key = self._child_key_at(converted_key, ids, 0)
+        best_device_node = node
+        best_device_tokens = 0
+        cur_tokens = 0
+        device_broken = False
+        base_device_validator = self.components[BASE_COMPONENT_TYPE].create_match_validator(
+            match_device_only=True
+        )
+        device_validators = tuple(
+            comp.create_match_validator(match_device_only=True) for comp in self._components_tuple
+        )
+
+        while off < n_ids and child_key in node.children:
+            child = node.children[child_key]
+            if child.evicted and not child.backuped:
+                break
+            child.last_access_time = get_and_increase_time_counter()
+            self._refresh_component_lru(child, LRURefreshPhase.WALKDOWN)
+            prefix_len = self._key_match_at(child.key, converted_key, ids, off)
+            if prefix_len <= 0:
+                break
+            cur_tokens += prefix_len
+            if not base_device_validator(child):
+                device_broken = True
+            if prefix_len == len(child.key):
+                if not device_broken and all(v(child) for v in device_validators):
+                    best_device_node = child
+                    best_device_tokens = cur_tokens
+            else:
+                if not device_broken and base_device_validator(child):
+                    best_device_node = child
+                    if not self.supports_recurrent():
+                        best_device_tokens = cur_tokens
+                break
+            node = child
+            off += prefix_len
+            if off < n_ids:
+                child_key = self._child_key_at(converted_key, ids, off)
+
+        if best_device_node is not self.root_node:
+            self._refresh_component_lru(best_device_node, LRURefreshPhase.MATCH_END)
+            cur_time = get_and_increase_time_counter()
+            node_update: UnifiedTreeNode | None = best_device_node
+            while node_update is not None:
+                node_update.last_access_time = cur_time
+                cur_time -= 0.00001
+                node_update = node_update.parent
+        return best_device_tokens
+
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
             return InsertResult(prefix_len=0)

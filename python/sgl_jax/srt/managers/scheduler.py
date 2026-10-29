@@ -124,6 +124,8 @@ logger = logging.getLogger(__name__)
 _PIN_QUEUED_PREFIX = os.environ.get("SGLANG_JAX_PIN_QUEUED_PREFIX", "0").strip().lower() in (
     "1", "true", "yes", "on")
 _PIN_QUEUED_MIN_TOKENS = int(os.environ.get("SGLANG_JAX_PIN_QUEUED_MIN_TOKENS", "4096"))
+_PREFILL_SUF_SCHEDULE = os.environ.get("SGLANG_JAX_PREFILL_SUF_SCHEDULE", "1").strip().lower() in (
+    "1", "true", "yes", "on")
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
@@ -1693,6 +1695,8 @@ class Scheduler(
         self.num_generated_tokens = 0
         self.forward_ct_decode = 0
         self.new_token_ratio = self.init_new_token_ratio
+        self._prefill_sched_step = 0
+        self._enqueue_seq_counter = 0
 
         flushed_items = (
             self.token_to_kv_pool_allocator.available_size()
@@ -1734,6 +1738,9 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
+        self._enqueue_seq_counter = getattr(self, "_enqueue_seq_counter", 0) + 1
+        req._enqueue_seq = self._enqueue_seq_counter
+        req._enqueue_sched_step = getattr(self, "_prefill_sched_step", 0)
         if _PIN_QUEUED_PREFIX:
             self._pin_queued_prefix(req)
         self.waiting_queue.append(req)
@@ -1741,6 +1748,35 @@ class Scheduler(
             mark = getattr(self, "_pd_mark_time", None)
             if mark is not None:
                 mark(req, "queue_entry")
+
+    def _refresh_and_order_waiting_queue(self) -> None:
+        self._prefill_sched_step = getattr(self, "_prefill_sched_step", 0) + 1
+        if not self.waiting_queue or self.tree_cache is None:
+            return
+        probe_fn = getattr(self.tree_cache, "probe_and_touch_prefix", None)
+        if probe_fn is None:
+            return
+        for req in self.waiting_queue:
+            if req.dp_rank is None:
+                continue
+            ids = getattr(req, "radix_input_ids", None)
+            if not isinstance(ids, list) or not ids or not isinstance(ids[0], int):
+                ids = list(req.origin_input_ids)
+            if len(ids) > 1:
+                cached_len = probe_fn(RadixKey(ids[: len(ids) - 1], req.extra_key, req.dp_rank))
+            else:
+                cached_len = 0
+            req._uncached_prefill_tokens = max(0, len(ids) - cached_len)
+        if len(self.waiting_queue) > 1 and _PREFILL_SUF_SCHEDULE:
+            step_now = self._prefill_sched_step
+            age_chunk = max(1, int(self.chunked_prefill_size or 512))
+            self.waiting_queue.sort(
+                key=lambda r: (
+                    getattr(r, "_uncached_prefill_tokens", len(r.origin_input_ids))
+                    - (step_now - getattr(r, "_enqueue_sched_step", step_now)) * age_chunk,
+                    getattr(r, "_enqueue_seq", 0),
+                )
+            )
 
     def _extend_requests_to_queue(self, reqs: list[Req], is_retracted: bool = False):
         self.waiting_queue.extend(reqs)
@@ -2217,6 +2253,7 @@ class Scheduler(
 
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue)
+        self._refresh_and_order_waiting_queue()
 
         adder = PrefillAdder(
             self.page_size,
