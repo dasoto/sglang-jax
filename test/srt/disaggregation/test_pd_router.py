@@ -966,3 +966,61 @@ def test_stream_lines_support_large_events_and_fragmented_utf8(size):
             await runner.cleanup()
 
     asyncio.run(run())
+
+
+def test_sticky_p_overhang_invariant_and_loaded_d():
+    args = RouterArgs(
+        mini_lb=True,
+        pd_disaggregation=True,
+        prefill_urls=[("http://localhost:30100", 8998)],
+        decode_urls=["http://decode:30200"],
+    )
+    instance = MiniLoadBalancer(args)
+    instance._ensure_load_arrays(8, 8)
+    # Simulate active decode requests on ranks 0, 1, 2
+    instance._d_active_reqs[0] = 3
+    instance._d_active_reqs[1] = 2
+    instance._d_active_reqs[2] = 1
+    # Simulate active prefill requests on rank 0
+    instance._p_active_reqs[0] = 2
+
+    sys_msg = {"role": "system", "content": "S" * 400}
+    block0 = "[rid:abcdef012345]\n\n" + ("U" * 400)
+    overhang = "OVERHANG_TAIL"
+
+    # Turn 0 has trailing overhang on msgs[1]
+    req_t0 = {"messages": [sys_msg, {"role": "user", "content": block0 + overhang}]}
+    p0, d0 = instance._select_sticky_p_and_loaded_d(req_t0, 8, 8)
+    assert p0 == 1  # skips busy rank 0
+    assert d0 == 3  # picks first idle decode rank (0,1,2 are busy)
+
+    # Turn 1 strips overhang from msgs[1] and appends assistant + user
+    req_t1 = {
+        "messages": [
+            sys_msg,
+            {"role": "user", "content": block0},
+            {"role": "assistant", "content": "A" * 200},
+            {"role": "user", "content": "next turn"},
+        ]
+    }
+    instance._d_active_reqs[3] = 2
+    p1, d1 = instance._select_sticky_p_and_loaded_d(req_t1, 8, 8)
+    assert p1 == p0  # 100% sticky on P0 despite overhang truncation
+    assert d1 == 4  # decoupled least-loaded rank on D0
+
+    # Parallel subagent burst with same [rid:...] spreads when p0 is busy
+    instance._p_active_reqs[p0] = 1
+    sub_block0 = "[rid:abcdef012345]\n\n" + ("X" * 400)
+    req_sub_t0 = {"messages": [sys_msg, {"role": "user", "content": sub_block0 + overhang}]}
+    p_sub0, _ = instance._select_sticky_p_and_loaded_d(req_sub_t0, 8, 8)
+    assert p_sub0 == 2  # spreads to idle rank 2
+    req_sub_t1 = {
+        "messages": [
+            sys_msg,
+            {"role": "user", "content": sub_block0},
+            {"role": "assistant", "content": "B" * 200},
+            {"role": "user", "content": "sub turn 1"},
+        ]
+    }
+    p_sub1, _ = instance._select_sticky_p_and_loaded_d(req_sub_t1, 8, 8)
+    assert p_sub1 == p_sub0  # subagent turn 1 stays sticky to p_sub0

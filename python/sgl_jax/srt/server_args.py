@@ -715,11 +715,11 @@ class ServerArgs:
         option = "--disaggregation-enable-overlap-schedule"
         if self.disaggregation_mode not in ("prefill", "decode"):
             raise ValueError(f"{option} requires --disaggregation-mode prefill or decode")
-        if not self.disaggregation_use_raiden:
+        if not self.disaggregation_use_raiden and self.disaggregation_mode != "decode":
             raise ValueError(f"{option} requires --disaggregation-use-raiden")
         if not self.disable_radix_cache:
             raise ValueError(f"{option} requires --disable-radix-cache")
-        if self.nnodes != 1:
+        if self.disaggregation_use_raiden and self.nnodes != 1:
             raise ValueError(f"{option} requires --nnodes=1 per serving instance")
         if self.pd_disaggregation:
             raise ValueError(f"{option} does not support --pd-disaggregation (Pathways)")

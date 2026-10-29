@@ -33,7 +33,10 @@ def test_overlap_accepts_prefill_and_decode():
     ("override", "error"),
     [
         ({"disaggregation_mode": "null"}, "requires --disaggregation-mode"),
-        ({"disaggregation_use_raiden": False}, "requires --disaggregation-use-raiden"),
+        (
+            {"disaggregation_mode": "prefill", "disaggregation_use_raiden": False},
+            "requires --disaggregation-use-raiden",
+        ),
         ({"disable_radix_cache": False}, "requires --disable-radix-cache"),
         ({"nnodes": 2}, "requires --nnodes=1"),
         ({"disable_overlap_schedule": True}, "conflicts with --disable-overlap-schedule"),
@@ -42,6 +45,17 @@ def test_overlap_accepts_prefill_and_decode():
 def test_overlap_rejects_unsupported_configuration(override, error):
     with pytest.raises(ValueError, match=error):
         ServerArgs(**overlap_config(**override))
+
+
+def test_overlap_accepts_multihost_jax_decode():
+    args = ServerArgs(
+        **overlap_config(
+            disaggregation_mode="decode",
+            disaggregation_use_raiden=False,
+            nnodes=64,
+        )
+    )
+    assert args.disaggregation_enable_overlap_schedule
 
 
 def test_overlap_disabled_preserves_existing_default():

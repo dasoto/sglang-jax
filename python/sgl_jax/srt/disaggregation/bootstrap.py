@@ -661,6 +661,8 @@ class BootstrapClient:
         # the SSL context every time, which under load blocked the decode event
         # loop inside ``get_prefill_info``.
         self._client = httpx.Client(timeout=timeout_s)
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     @property
     def base_url(self) -> str:

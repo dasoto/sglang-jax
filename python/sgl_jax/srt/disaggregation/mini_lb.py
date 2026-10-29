@@ -60,8 +60,14 @@ class MiniLoadBalancer:
         self.prefill_dp_size = None
         self.decode_dp_size = None
         self.max_concurrent_requests = getattr(router_args, "max_concurrent_requests", None)
-        self._sticky_dp_map: dict[str, int] = {}
+        self._sticky_dp_map: dict[object, int] = {}
+        self._tree_dp_map: dict[str, int] = {}
         self._rr_counter: int = 0
+        self._p_active_reqs: list[int] = []
+        self._p_active_chars: list[int] = []
+        self._p_conv_count: list[int] = []
+        self._d_active_reqs: list[int] = []
+        self._d_total_reqs: list[int] = []
 
     def _validate_router_args(self, router_args) -> None:
         if getattr(router_args, "policy", "random") != "random":
@@ -131,6 +137,115 @@ class MiniLoadBalancer:
             return [int(room) % dp_size for room in bootstrap_room]
         return int(bootstrap_room) % dp_size
 
+    def _ensure_load_arrays(self, p_size: int, d_size: int) -> None:
+        if len(self._p_active_reqs) != p_size:
+            self._p_active_reqs = [0] * p_size
+            self._p_active_chars = [0] * p_size
+            self._p_conv_count = [0] * p_size
+        if len(self._d_active_reqs) != d_size:
+            self._d_active_reqs = [0] * d_size
+            self._d_total_reqs = [0] * d_size
+
+    @staticmethod
+    def _estimate_request_chars(request: dict) -> int:
+        msgs = request.get("messages")
+        total = 0
+        if isinstance(msgs, list):
+            for m in msgs:
+                if isinstance(m, dict):
+                    total += len(str(m.get("content", "")))
+        elif isinstance(request.get("text"), str):
+            total = len(request["text"])
+        return max(total, 256)
+
+    def _select_sticky_p_and_loaded_d(self, request: dict, p_size: int, d_size: int) -> tuple[int, int]:
+        self._ensure_load_arrays(p_size, d_size)
+        msgs = request.get("messages")
+        candidate_keys: list[object] = []
+        tree_rid: str | None = None
+        if isinstance(msgs, list) and msgs:
+            sys_prefix = (
+                str(msgs[0].get("content", ""))[:256]
+                if isinstance(msgs[0], dict)
+                else ""
+            )
+            first_user_content = ""
+            for m in msgs:
+                if isinstance(m, dict) and m.get("role") == "user":
+                    first_user_content = str(m.get("content", ""))
+                    break
+            if first_user_content.startswith("[rid:"):
+                end_idx = first_user_content.find("]", 5, 32)
+                if end_idx != -1:
+                    tree_rid = first_user_content[: end_idx + 1]
+            if len(msgs) >= 4 and isinstance(msgs[2], dict):
+                candidate_keys.append(
+                    (
+                        "t1",
+                        sys_prefix,
+                        first_user_content[:160],
+                        str(msgs[2].get("content", ""))[:160],
+                    )
+                )
+            if len(first_user_content) >= 320:
+                candidate_keys.append(("u0", sys_prefix, first_user_content[:160]))
+            head = msgs[:2] if len(msgs) >= 2 else msgs[:1]
+            candidate_keys.append(
+                repr(
+                    [
+                        (m.get("role"), m.get("content"))
+                        for m in head
+                        if isinstance(m, dict)
+                    ]
+                )
+            )
+
+        p_rank: int | None = None
+        for k in candidate_keys:
+            if k in self._sticky_dp_map:
+                p_rank = self._sticky_dp_map[k]
+                break
+
+        if p_rank is None:
+            min_active = min(self._p_active_reqs) if self._p_active_reqs else 0
+            if tree_rid is not None and tree_rid in self._tree_dp_map:
+                r_tree = self._tree_dp_map[tree_rid]
+                if isinstance(msgs, list) and len(msgs) >= 4:
+                    p_rank = r_tree
+                elif self._p_active_reqs[r_tree] <= min_active:
+                    p_rank = r_tree
+            if p_rank is None:
+                p_rank = min(
+                    range(p_size),
+                    key=lambda r: (
+                        self._p_active_reqs[r],
+                        self._p_active_chars[r],
+                        self._p_conv_count[r],
+                        r,
+                    ),
+                )
+                self._p_conv_count[p_rank] += 1
+
+        for k in candidate_keys:
+            if len(self._sticky_dp_map) >= 16384 and k not in self._sticky_dp_map:
+                self._sticky_dp_map.pop(next(iter(self._sticky_dp_map)))
+            self._sticky_dp_map[k] = p_rank
+        if tree_rid is not None and tree_rid not in self._tree_dp_map:
+            if len(self._tree_dp_map) >= 8192:
+                self._tree_dp_map.pop(next(iter(self._tree_dp_map)))
+            self._tree_dp_map[tree_rid] = p_rank
+
+        d_rank = min(
+            range(d_size),
+            key=lambda r: (
+                self._d_active_reqs[r],
+                self._d_total_reqs[r],
+                r,
+            ),
+        )
+        self._d_total_reqs[d_rank] += 1
+        return p_rank, d_rank
+
     async def _align_dp_requests(self, request: dict):
         await self._ensure_dp_sizes()
         p_size = int(self.prefill_dp_size or 1)
@@ -146,41 +261,24 @@ class MiniLoadBalancer:
             forced = int(forced_rank)
             if not 0 <= forced < p_size:
                 raise ValueError(f"SGLANG_JAX_PD_FORCE_DP_RANK={forced} is outside [0, {p_size})")
-            dp_rank = forced
+            p_rank = forced
+            d_rank = forced
         elif os.getenv("SGLANG_JAX_PD_STICKY_DP", "0") == "1" and not isinstance(
             request.get("bootstrap_room"), list
         ):
-            msgs = request.get("messages")
-            sticky_key = None
-            if isinstance(msgs, list) and msgs:
-                head = msgs[:2] if len(msgs) >= 2 else msgs[:1]
-                sticky_key = repr(
-                    [
-                        (m.get("role"), m.get("content"))
-                        for m in head
-                        if isinstance(m, dict)
-                    ]
-                )
-            if sticky_key is not None and sticky_key in self._sticky_dp_map:
-                dp_rank = self._sticky_dp_map[sticky_key]
-            else:
-                dp_rank = self._rr_counter % p_size
-                self._rr_counter += 1
-                if sticky_key is not None:
-                    if len(self._sticky_dp_map) >= 4096:
-                        self._sticky_dp_map.pop(next(iter(self._sticky_dp_map)))
-                    self._sticky_dp_map[sticky_key] = dp_rank
+            p_rank, d_rank = self._select_sticky_p_and_loaded_d(request, p_size, d_size)
             room = int(request["bootstrap_room"])
             request = request.copy()
-            request["bootstrap_room"] = (room // p_size) * p_size + dp_rank
+            request["bootstrap_room"] = (room // p_size) * p_size + p_rank
         else:
-            dp_rank = self._room_rank(request["bootstrap_room"], p_size)
+            p_rank = self._room_rank(request["bootstrap_room"], p_size)
+            d_rank = p_rank
 
         prefill_req = request.copy()
         decode_req = request.copy()
-        prefill_req["dp_rank"] = dp_rank
-        decode_req["dp_rank"] = dp_rank
-        decode_req["disagg_prefill_dp_rank"] = dp_rank
+        prefill_req["dp_rank"] = p_rank
+        decode_req["dp_rank"] = d_rank
+        decode_req["disagg_prefill_dp_rank"] = p_rank
         return prefill_req, decode_req
 
     def select_pair(self) -> tuple[str, int | None, str]:
@@ -215,39 +313,59 @@ class MiniLoadBalancer:
         else:
             prefill_req, decode_req = await self._align_dp_requests(modified_request)
 
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=self.timeout)
-        ) as session:
-            tasks = [
-                session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
-                session.post(f"{decode_server}/{endpoint}", json=decode_req),
-            ]
-            prefill_response, decode_response = await asyncio.gather(*tasks)
+        p_rank = prefill_req.get("dp_rank")
+        d_rank = decode_req.get("dp_rank")
+        track_load = (
+            isinstance(p_rank, int)
+            and isinstance(d_rank, int)
+            and 0 <= p_rank < len(self._p_active_reqs)
+            and 0 <= d_rank < len(self._d_active_reqs)
+        )
+        req_chars = self._estimate_request_chars(modified_request) if track_load else 0
+        if track_load:
+            self._p_active_reqs[p_rank] += 1
+            self._p_active_chars[p_rank] += req_chars
+            self._d_active_reqs[d_rank] += 1
 
-            if "return_logprob" in modified_request:
-                prefill_json = await prefill_response.json()
-                ret_json = await decode_response.json()
-                _prepend_input_logprobs(prefill_json.get("meta_info", {}), ret_json)
-            else:
-                ret_json = await decode_response.json()
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=self.timeout)
+            ) as session:
+                tasks = [
+                    session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
+                    session.post(f"{decode_server}/{endpoint}", json=decode_req),
+                ]
+                prefill_response, decode_response = await asyncio.gather(*tasks)
 
-            if expected_decode_dp_rank is not None:
-                actual = ret_json.get("meta_info", {}).get("dp_rank")
-                if actual != expected_decode_dp_rank:
-                    return ORJSONResponse(
-                        content={
-                            "error": (
-                                f"DP rank mismatch: expected {expected_decode_dp_rank}, "
-                                f"got {actual}"
-                            )
-                        },
-                        status_code=500,
-                    )
+                if "return_logprob" in modified_request:
+                    prefill_json = await prefill_response.json()
+                    ret_json = await decode_response.json()
+                    _prepend_input_logprobs(prefill_json.get("meta_info", {}), ret_json)
+                else:
+                    ret_json = await decode_response.json()
 
-            return ORJSONResponse(
-                content=ret_json,
-                status_code=decode_response.status,
-            )
+                if expected_decode_dp_rank is not None:
+                    actual = ret_json.get("meta_info", {}).get("dp_rank")
+                    if actual != expected_decode_dp_rank:
+                        return ORJSONResponse(
+                            content={
+                                "error": (
+                                    f"DP rank mismatch: expected {expected_decode_dp_rank}, "
+                                    f"got {actual}"
+                                )
+                            },
+                            status_code=500,
+                        )
+
+                return ORJSONResponse(
+                    content=ret_json,
+                    status_code=decode_response.status,
+                )
+        finally:
+            if track_load:
+                self._p_active_reqs[p_rank] = max(0, self._p_active_reqs[p_rank] - 1)
+                self._p_active_chars[p_rank] = max(0, self._p_active_chars[p_rank] - req_chars)
+                self._d_active_reqs[d_rank] = max(0, self._d_active_reqs[d_rank] - 1)
 
     async def generate_stream(
         self,
@@ -272,43 +390,80 @@ class MiniLoadBalancer:
         assert endpoint[0] != "/", f"Endpoint should not start with '/': {endpoint}"
 
         prefill_req, decode_req = await self._align_dp_requests(modified_request)
+        p_rank = prefill_req.get("dp_rank")
+        d_rank = decode_req.get("dp_rank")
+        track_load = (
+            isinstance(p_rank, int)
+            and isinstance(d_rank, int)
+            and 0 <= p_rank < len(self._p_active_reqs)
+            and 0 <= d_rank < len(self._d_active_reqs)
+        )
+        req_chars = self._estimate_request_chars(modified_request) if track_load else 0
+        if track_load:
+            self._p_active_reqs[p_rank] += 1
+            self._p_active_chars[p_rank] += req_chars
+            self._d_active_reqs[d_rank] += 1
 
         async def stream_results():
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=self.timeout)
-            ) as session:
-                tasks = [
-                    session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
-                    session.post(f"{decode_server}/{endpoint}", json=decode_req),
-                ]
-                prefill_response, decode_response = await asyncio.gather(*tasks)
+            p_released = False
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=self.timeout)
+                ) as session:
+                    tasks = [
+                        session.post(f"{prefill_server}/{endpoint}", json=prefill_req),
+                        session.post(f"{decode_server}/{endpoint}", json=decode_req),
+                    ]
+                    prefill_response, decode_response = await asyncio.gather(*tasks)
 
-                if modified_request.get("return_logprob", False):
-                    prefill_meta = {}
-                    async for chunk in _iter_stream_lines(prefill_response.content):
-                        if chunk.startswith(b"data:") and b"[DONE]" not in chunk:
-                            event_meta = orjson.loads(chunk[5:]).get("meta_info", {})
-                            if "input_token_logprobs" in event_meta:
-                                # Prompt logprobs may arrive after an initial empty event.
-                                prefill_meta = event_meta
+                    if modified_request.get("return_logprob", False):
+                        prefill_meta = {}
+                        async for chunk in _iter_stream_lines(prefill_response.content):
+                            if chunk.startswith(b"data:") and b"[DONE]" not in chunk:
+                                event_meta = orjson.loads(chunk[5:]).get("meta_info", {})
+                                if "input_token_logprobs" in event_meta:
+                                    # Prompt logprobs may arrive after an initial empty event.
+                                    prefill_meta = event_meta
+                        if track_load and not p_released:
+                            self._p_active_reqs[p_rank] = max(0, self._p_active_reqs[p_rank] - 1)
+                            self._p_active_chars[p_rank] = max(
+                                0, self._p_active_chars[p_rank] - req_chars
+                            )
+                            p_released = True
 
-                    async for chunk in _iter_stream_lines(decode_response.content):
-                        decoded_chunk = chunk.decode("utf-8")
-                        if (
-                            decoded_chunk
-                            and decoded_chunk.startswith("data:")
-                            and "[DONE]" not in decoded_chunk
+                        async for chunk in _iter_stream_lines(decode_response.content):
+                            decoded_chunk = chunk.decode("utf-8")
+                            if (
+                                decoded_chunk
+                                and decoded_chunk.startswith("data:")
+                                and "[DONE]" not in decoded_chunk
+                            ):
+                                ret_json = orjson.loads(decoded_chunk[5:].strip("\n"))
+                                _prepend_input_logprobs(prefill_meta, ret_json)
+                                yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
+                            else:
+                                yield chunk
+                    else:
+                        async for chunk in decode_response.content.iter_chunked(
+                            AIOHTTP_STREAM_READ_CHUNK_SIZE
                         ):
-                            ret_json = orjson.loads(decoded_chunk[5:].strip("\n"))
-                            _prepend_input_logprobs(prefill_meta, ret_json)
-                            yield b"data: " + orjson.dumps(ret_json) + b"\n\n"
-                        else:
+                            if track_load and not p_released:
+                                self._p_active_reqs[p_rank] = max(
+                                    0, self._p_active_reqs[p_rank] - 1
+                                )
+                                self._p_active_chars[p_rank] = max(
+                                    0, self._p_active_chars[p_rank] - req_chars
+                                )
+                                p_released = True
                             yield chunk
-                else:
-                    async for chunk in decode_response.content.iter_chunked(
-                        AIOHTTP_STREAM_READ_CHUNK_SIZE
-                    ):
-                        yield chunk
+            finally:
+                if track_load:
+                    if not p_released:
+                        self._p_active_reqs[p_rank] = max(0, self._p_active_reqs[p_rank] - 1)
+                        self._p_active_chars[p_rank] = max(
+                            0, self._p_active_chars[p_rank] - req_chars
+                        )
+                    self._d_active_reqs[d_rank] = max(0, self._d_active_reqs[d_rank] - 1)
 
         return StreamingResponse(
             stream_results(),
@@ -372,7 +527,13 @@ try:
 
         if lb is not None:
             lb._sticky_dp_map.clear()
+            lb._tree_dp_map.clear()
             lb._rr_counter = 0
+            lb._p_active_reqs.clear()
+            lb._p_active_chars.clear()
+            lb._p_conv_count.clear()
+            lb._d_active_reqs.clear()
+            lb._d_total_reqs.clear()
         async with aiohttp.ClientSession() as session:
             tasks = []
             for server in chain(lb.prefill_urls, lb.decode_urls):
