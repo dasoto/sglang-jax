@@ -486,13 +486,19 @@ class Scheduler(
         # ServerArgs validates launch flags; these facts are only known after
         # model/runtime initialization. nnodes=1 does not prove one JAX process,
         # and the multimodal launch flag does not identify every model type.
-        if server_args.disaggregation_enable_overlap_schedule and (
-            self.is_hybrid or self.model_config.is_multimodal or jax.process_count() != 1
-        ):
-            raise ValueError(
-                "PD scheduler overlap currently requires a single-process, "
-                "full-attention text model"
+        if server_args.disaggregation_enable_overlap_schedule:
+            is_jax_decode_overlap = (
+                server_args.disaggregation_mode == "decode"
+                and not server_args.disaggregation_use_raiden
+                and not self.model_config.is_multimodal
             )
+            if not is_jax_decode_overlap and (
+                self.is_hybrid or self.model_config.is_multimodal or jax.process_count() != 1
+            ):
+                raise ValueError(
+                    "PD scheduler overlap currently requires a single-process, "
+                    "full-attention text model"
+                )
         self.sliding_window_size = None
         if self.is_hybrid:
             self.sliding_window_size = self.tp_worker.sliding_window_size
@@ -1203,11 +1209,33 @@ class Scheduler(
                 except zmq.ZMQError:
                     break
                 recv_reqs.append(recv_rpc)
+
+            if self.nnodes > 1 and getattr(self, "disagg_transfer_queue", None):
+                with self.disagg_transfer_queue._lock:
+                    entries = list(self.disagg_transfer_queue._entries.values())
+                if entries:
+                    from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
+
+                    self._pd_sync_tick_counter = getattr(self, "_pd_sync_tick_counter", 0) + 1
+                    any_terminal = False
+                    for e in entries:
+                        try:
+                            if e.receiver.poll() in (KVPoll.SUCCESS, KVPoll.FAILED):
+                                any_terminal = True
+                        except Exception:
+                            pass
+                    if any_terminal or self._pd_sync_tick_counter % 64 == 0:
+                        recv_reqs.append("_PD_SYNC_TRANSFERS")
         else:
             recv_reqs = None
 
         if self.nnodes > 1:
             recv_reqs = self.broadcast_pyobj(recv_reqs)
+            if recv_reqs and recv_reqs[-1] == "_PD_SYNC_TRANSFERS":
+                recv_reqs.pop()
+                self._pd_sync_transfers_this_tick = True
+            else:
+                self._pd_sync_transfers_this_tick = False
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: list):
@@ -2425,10 +2453,13 @@ class Scheduler(
             self.tree_cache.finish_load_back(plan)
 
     def _wait_donation_safe(self) -> None:
-        """Block until the last forward's replace_all is done (donation barrier)."""
+        """Block until the last forward's replace_all and worker dispatch are done."""
         last = self.last_batch
         if last is not None and getattr(last, "launch_done", None) is not None:
             last.launch_done.wait()
+        idle_ev = getattr(getattr(self, "tp_worker", None), "worker_idle_event", None)
+        if idle_ev is not None:
+            idle_ev.wait()
 
     def update_running_batch(self, batch: ScheduleBatch) -> ScheduleBatch | None:
         """Update the current running decoding batch."""
@@ -2589,11 +2620,13 @@ class Scheduler(
                     )
                 elif self.dp_size > 1:
                     # In multi-host DP, next_token_ids may span non-addressable
-                    # devices.  Replicate first so device_get can proceed.
-                    from jax.experimental.multihost_utils import process_allgather
+                    # devices.  Replicate via cached JIT gather so device_get can proceed.
+                    from sgl_jax.srt.managers.tp_worker_overlap_thread import (
+                        get_token_ids_gather,
+                    )
 
-                    next_token_ids_device = process_allgather(next_token_ids_device, tiled=True)
-                    next_token_ids = np.array(jax.device_get(next_token_ids_device))
+                    next_token_ids_device = get_token_ids_gather(self.mesh)(next_token_ids_device)
+                    next_token_ids = np.asarray(jax.device_get(next_token_ids_device))
                 else:
                     next_token_ids = np.array(jax.device_get(next_token_ids_device))
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)

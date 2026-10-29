@@ -243,3 +243,40 @@ def test_retraction_still_needed_runs_only_after_pending_result_retired(monkeypa
     )
     scheduler.update_running_batch(batch)
     assert events == ["drain", "retract", "requeue", "prepare"]
+
+
+def test_recv_requests_piggybacks_pd_sync_transfers():
+    """Verify Scheduler.recv_requests polls disagg_transfer_queue and strips _PD_SYNC_TRANSFERS."""
+    import threading
+    import zmq
+    from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
+
+    class FakeZmqSock:
+        def recv_pyobj(self, flags=0):
+            raise zmq.ZMQError()
+
+    class FakeEntry:
+        def __init__(self, state):
+            self.receiver = SimpleNamespace(poll=lambda: state)
+
+    scheduler = scheduler_module.Scheduler.__new__(scheduler_module.Scheduler)
+    scheduler._idle_poll_ms = 0
+    scheduler.node_rank = 0
+    scheduler.nnodes = 2
+    scheduler.recv_from_tokenizer = FakeZmqSock()
+    scheduler.recv_from_rpc = FakeZmqSock()
+    scheduler.broadcast_pyobj = lambda obj: list(obj)
+    scheduler.disagg_transfer_queue = SimpleNamespace(
+        _lock=threading.Lock(),
+        _entries={1: FakeEntry(KVPoll.WAITING_FOR_INPUT)},
+    )
+
+    reqs = scheduler.recv_requests()
+    assert reqs == []
+    assert scheduler._pd_sync_transfers_this_tick is False
+
+    scheduler.disagg_transfer_queue._entries[1] = FakeEntry(KVPoll.SUCCESS)
+    reqs = scheduler.recv_requests()
+    assert reqs == []
+    assert scheduler._pd_sync_transfers_this_tick is True
+

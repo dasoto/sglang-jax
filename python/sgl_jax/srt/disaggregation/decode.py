@@ -509,7 +509,8 @@ class SchedulerDisaggregationDecodeMixin:
 
     def process_decode_queue(self: Scheduler) -> None:
         """Drive prealloc -> transfer -> ready transitions."""
-
+        if self.running_batch is not None and not self.running_batch.is_empty():
+            self.running_batch.filter_batch()
         self._admit_decode_prealloc()
         self._drain_decode_transfer_terminals()
         if getattr(self, "_pd_ready_pure_decode_queue", None):
@@ -642,6 +643,13 @@ class SchedulerDisaggregationDecodeMixin:
 
         with self.disagg_transfer_queue._lock:
             entries = list(self.disagg_transfer_queue._entries.values())
+        if not entries:
+            return []
+        if not getattr(self, "_pd_sync_transfers_this_tick", True):
+            for e in entries:
+                with suppress(Exception):
+                    e.receiver.poll()
+            return []
         success, failed = synced_terminal_rooms(
             entries,
             poll_fn=lambda e: e.receiver.poll(),
@@ -749,7 +757,11 @@ class SchedulerDisaggregationDecodeMixin:
             # window or pending metadata must not serialize otherwise independent
             # decode compute. No forwards launch inside this sweep, so one fence
             # protects every native receive admitted here.
-            if getattr(self, "enable_overlap", False) and not admission_fenced:
+            if (
+                getattr(self, "enable_overlap", False)
+                and not admission_fenced
+                and getattr(self.disagg_kv_manager, "engine_name", "raiden") == "raiden"
+            ):
                 self._wait_decode_admission_safe()
                 admission_fenced = True
 

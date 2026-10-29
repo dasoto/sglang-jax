@@ -61,6 +61,8 @@ class ModelWorkerClient:
         # Launch threads
         self.input_queue = Queue()
         self.output_queue = Queue()
+        self.worker_idle_event = threading.Event()
+        self.worker_idle_event.set()
         # JAX handles device execution automatically, no need for explicit streams
         self.forward_thread = threading.Thread(
             target=self.forward_thread_func,
@@ -109,6 +111,9 @@ class ModelWorkerClient:
         try:
             self.forward_thread_func_()
         except Exception:
+            idle_ev = getattr(self, "worker_idle_event", None)
+            if idle_ev is not None:
+                idle_ev.set()
             traceback = get_exception_traceback()
             logger.error("ModelWorkerClient hit an exception: %s", traceback)
             self.parent_process.send_signal(signal.SIGQUIT)
@@ -121,7 +126,10 @@ class ModelWorkerClient:
                 sampling_metadata,
                 forward_metadata,
             ) = self.input_queue.get()
+            idle_ev = getattr(self, "worker_idle_event", None)
             if not model_worker_batch:
+                if idle_ev is not None:
+                    idle_ev.set()
                 break
 
             if self.worker._pd_fuse_for_batch(model_worker_batch):
@@ -145,6 +153,8 @@ class ModelWorkerClient:
                 self.future_token_ids_map = new_future_map
                 self._wait_pd_prefill_kv_ready()
                 self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
+                if idle_ev is not None and self.input_queue.empty():
+                    idle_ev.set()
                 continue
 
             # Resolve future tokens in the input
@@ -183,6 +193,8 @@ class ModelWorkerClient:
                 next_token_ids.copy_to_host_async()
             self._wait_pd_prefill_kv_ready()
             self.output_queue.put((None, logits_output, next_token_ids, cache_miss_count))
+            if idle_ev is not None and self.input_queue.empty():
+                idle_ev.set()
 
     def _wait_pd_prefill_kv_ready(self):
         """Publish a P result only after its raw-buffer writes have finished.
@@ -326,6 +338,9 @@ class ModelWorkerClient:
         slots = future_slot_indices(seq_lens_np, req_pool_np, self.future_map_size)
 
         # Push a new batch to the queue (JAX handles synchronization automatically)
+        idle_ev = getattr(self, "worker_idle_event", None)
+        if idle_ev is not None:
+            idle_ev.clear()
         self.input_queue.put(
             (
                 model_worker_batch,

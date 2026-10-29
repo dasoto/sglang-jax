@@ -58,8 +58,28 @@ def _batch_reqs(batch) -> tuple[Req, ...]:
 
 
 # Bucket page counts to bound XLA's per-shape compile pool.
-# Largest bucket (512 pages × 128 tokens/page) covers 64k-token prompts.
-_KV_GATHER_PAGE_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512)
+# Finer steps above 256 pages avoid 2x padding waste on 16k-256k prompts.
+_KV_GATHER_PAGE_BUCKETS = (
+    1,
+    2,
+    4,
+    8,
+    16,
+    32,
+    64,
+    128,
+    256,
+    384,
+    512,
+    640,
+    768,
+    896,
+    1024,
+    1280,
+    1536,
+    1792,
+    2048,
+)
 
 
 def _pad_to_page_bucket(num_pages: int, *, min_pages: int = 1) -> int:
@@ -67,10 +87,9 @@ def _pad_to_page_bucket(num_pages: int, *, min_pages: int = 1) -> int:
     for b in _KV_GATHER_PAGE_BUCKETS:
         if b >= target and (min_pages <= 1 or b % min_pages == 0):
             return b
-    # Beyond the largest predefined bucket: round up to a multiple of it so we
+    # Beyond the largest predefined bucket: round up to 256-page steps so we
     # never truncate KV, while keeping the set of compiled shapes bounded.
-    largest = _KV_GATHER_PAGE_BUCKETS[-1]
-    step = max(largest, int(min_pages))
+    step = max(256, int(min_pages))
     return ((target + step - 1) // step) * step
 
 
