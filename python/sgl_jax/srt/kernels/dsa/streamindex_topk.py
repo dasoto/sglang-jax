@@ -102,7 +102,14 @@ def _scores_kernel(
     seq_batch_size: int,
     page_pool_size: int | None = None,
     num_bkv_max: int | None = None,
+    dcp_size: int = 1,
 ):
+    """DCP mode (``dcp_size`` > 1): ``page_indices_ref`` is this rank's fixed-stride
+    table of the pages it owns (page j of a sequence lives on rank j % dcp_size),
+    ``start_end_seq_idx_ref[2]`` is the rank, and ``seq_lens_ref`` stays global.
+    The kernel scans only the local pages; masks use each key's global position
+    ``(lp * dcp_size + rank) * page_size + offset``. Outputs stay in local space
+    (column lp*page_size + offset, or page lp in page mode)."""
     _, num_q_heads, head_dim = q_hbm_ref.shape
     lkv_dim = cache_kv_hbm_ref.shape[-1]
 
@@ -128,8 +135,14 @@ def _scores_kernel(
     batch_start_seq_idx = start_seq_idx + pl.program_id(0) * seq_batch_size
     batch_end_seq_idx = batch_start_seq_idx + seq_batch_size - 1
 
+    page_size = page_size_per_kv_packing * kv_packing
+    if dcp_size > 1:
+        assert compression_ratio == 1, "DCP mode supports uncompressed indexer keys only"
+        assert page_size & (page_size - 1) == 0, "DCP mode needs a power-of-two page size"
+        dcp_rank = start_end_seq_idx_ref[2]
     q_lens = []
-    kv_lens = []
+    kv_lens = []  # global kv length: masks
+    loop_kv_lens = []  # local kv span to scan: block loop bound
     seq_lens = []
     for batch_idx in range(seq_batch_size):
         q_start = cu_q_lens_ref[batch_start_seq_idx + batch_idx]
@@ -140,6 +153,12 @@ def _scores_kernel(
         seq_lens.append(seq_len)
         kv_len = seq_len // compression_ratio
         kv_lens.append(kv_len)
+        if dcp_size > 1:
+            n_pages = (seq_len + page_size - 1) // page_size
+            n_local = jnp.maximum(n_pages - dcp_rank + dcp_size - 1, 0) // dcp_size
+            loop_kv_lens.append(n_local * page_size)
+        else:
+            loop_kv_lens.append(kv_len)
 
     def wait_send_scores(bo_sem_idx):
         # Wait for the output buffer's previous DMA (if any) before reusing it.
@@ -331,7 +350,7 @@ def _scores_kernel(
 
     def process():
         # num_bkv is determined by the longest sequence length in the batch.
-        kv_len_max = jnp.max(jnp.array(kv_lens))
+        kv_len_max = jnp.max(jnp.array(loop_kv_lens))
         num_bkv = jnp.maximum(1, cdiv(kv_len_max, bkv_sz))
         if static_q_len is None:
             assert seq_batch_size == 1
@@ -393,6 +412,12 @@ def _scores_kernel(
                 if scale_val is not None:
                     s_summed = s_summed * scale_val
                 k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s_summed.shape, 1)
+                if dcp_size > 1:
+                    log2_ps = page_size.bit_length() - 1
+                    local_page = lax.shift_right_logical(k_span, log2_ps)
+                    k_span = lax.shift_left(local_page * dcp_size + dcp_rank, log2_ps) + (
+                        k_span & (page_size - 1)
+                    )
                 valid_mask = k_span < kv_lens[batch_idx]
                 causal_mask = k_span <= bq_pos_compressed[:, None]
                 mask = jnp.logical_and(valid_mask, causal_mask)
@@ -767,6 +792,8 @@ def select_topk_indices(scores: jax.Array, k: int, *, backend: str = "auto") -> 
         "vmem_limit_bytes",
         "decode_req_batch_size",
         "topk_backend",
+        "dcp_size",
+        "return_values",
     ),
 )
 def streamindex_topk(
@@ -785,7 +812,10 @@ def streamindex_topk(
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
     decode_req_batch_size: int = 4,
     topk_backend: str = "auto",
-) -> jax.Array:
+    dcp_size: int = 1,
+    dcp_rank: jax.Array | None = None,
+    return_values: bool = False,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
     Args:
@@ -811,9 +841,16 @@ def streamindex_topk(
       vmem_limit_bytes: the vmem limit for the pallas kernel.
       topk_backend: exit-stage selector: "auto" (SparseCore radix select when
         available and the row is large enough, else XLA), "sc" or "xla".
+      dcp_size, dcp_rank: decode context parallelism. ``cache_kv`` and
+        ``page_indices`` hold only this rank's pages (page j of a sequence on rank
+        j % dcp_size, fixed-stride local table); ``seq_lens`` stays global. The
+        result is this rank's local top-k, mapped to global positions.
+      return_values: also return the scores of the selected entries, so callers
+        can merge per-rank selections.
 
     Returns:
-      Top-K indices (in compressed space).
+      Top-K indices (in compressed space); ``(scores, indices)`` when
+      ``return_values``.
     """
     # Scale factors for the FP8 index cache format are packed directly inside
     # `cache_kv` along the width dimension, keeping HBM transactions fused.
@@ -938,11 +975,14 @@ def streamindex_topk(
             pltpu.SemaphoreType.DMA((4, 2, seq_batch_size)),
         ]
 
+        seq_range = [start_seq_idx, end_seq_idx]
+        if dcp_size > 1:
+            seq_range.append(dcp_rank)
         scalar_prefetches = (
             seq_lens,
             page_indices,
             cu_q_lens,
-            jnp.array([start_seq_idx, end_seq_idx], jnp.int32),
+            jnp.stack([jnp.asarray(v, jnp.int32) for v in seq_range]),
             jnp.zeros((3,), jnp.int32),  # (bq, bkv, bo) sem indices
             jnp.full((2,), -1, jnp.int32),  # in-flight out DMA row counts
         )
@@ -957,6 +997,7 @@ def streamindex_topk(
                     bq_sz=bq_sz,
                     bkv_p=bkv_p,
                     seq_batch_size=seq_batch_size,
+                    dcp_size=dcp_size,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),
@@ -1051,8 +1092,18 @@ def streamindex_topk(
     )
 
     scores = scores.reshape(q.shape[0], -1)
-    topk_idxs = select_topk_indices(scores, k, backend=topk_backend)
-    return topk_idxs[: q.shape[0], :k]
+    if dcp_size <= 1 and not return_values:
+        topk_idxs = select_topk_indices(scores, k, backend=topk_backend)
+        return topk_idxs[: q.shape[0], :k]
+    if scores.shape[-1] < k:
+        scores = jnp.pad(scores, ((0, 0), (0, k - scores.shape[-1])), constant_values=-jnp.inf)
+    top_vals, top_idxs = jax.lax.approx_max_k(scores, k, reduction_dimension=-1, recall_target=1.0)
+    if dcp_size > 1:
+        top_idxs = (top_idxs // page_size * dcp_size + dcp_rank) * page_size + top_idxs % page_size
+    top_idxs = jnp.where(top_vals == -jnp.inf, -1, top_idxs)
+    if return_values:
+        return top_vals[: q.shape[0], :k], top_idxs[: q.shape[0], :k]
+    return top_idxs[: q.shape[0], :k]
 
 
 @functools.partial(
@@ -1063,6 +1114,8 @@ def streamindex_topk(
         "num_kv_pages_per_block",
         "num_queries_per_block",
         "vmem_limit_bytes",
+        "dcp_size",
+        "return_values",
     ),
 )
 def streamindex_page_topk(
@@ -1079,7 +1132,10 @@ def streamindex_page_topk(
     num_kv_pages_per_block: int = 128,
     num_queries_per_block: int = 512,
     vmem_limit_bytes: int | None = 64 * 1024 * 1024,
-) -> jax.Array:
+    dcp_size: int = 1,
+    dcp_rank: jax.Array | None = None,
+    return_values: bool = False,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Page-level lightning-indexer top-k (prefill/extend form).
 
     Pallas twin of ``ref.streamindex_page_topk_ref(one_token_per_seq=False)``:
@@ -1087,8 +1143,12 @@ def streamindex_page_topk(
     ``[T, pages_per_seq]`` ever reaches HBM — no ``[T, max_kv]`` token-score
     materialization), then a cheap ``top_k`` over pages selects the budget.
 
+    ``dcp_size``/``dcp_rank``/``return_values``: as in ``streamindex_topk``; with
+    DCP the returned ids are global seq-local page ids of this rank's pages.
+
     Returns:
       i32[T, k_pages] seq-local page ids per query token; -1 for padding.
+      ``(scores, ids)`` when ``return_values``.
     """
     max_num_seqs = seq_lens.shape[0]
     original_dtype = q.dtype
@@ -1136,11 +1196,14 @@ def streamindex_page_topk(
         pltpu.SemaphoreType.DMA((4, 2, 1)),
     ]
 
+    seq_range = [jnp.int32(0), num_seqs.astype(jnp.int32)]
+    if dcp_size > 1:
+        seq_range.append(jnp.asarray(dcp_rank, jnp.int32))
     scalar_prefetches = (
         seq_lens,
         page_indices,
         cu_q_lens,
-        jnp.stack([jnp.int32(0), num_seqs.astype(jnp.int32)]),
+        jnp.stack(seq_range),
         jnp.zeros((3,), jnp.int32),
         jnp.full((2,), -1, jnp.int32),
     )
@@ -1157,6 +1220,7 @@ def streamindex_page_topk(
                 seq_batch_size=1,
                 page_pool_size=page_size,
                 num_bkv_max=num_bkv_max,
+                dcp_size=dcp_size,
             ),
             grid_spec=pltpu.PrefetchScalarGridSpec(
                 num_scalar_prefetch=len(scalar_prefetches),
@@ -1178,5 +1242,14 @@ def streamindex_page_topk(
     page_scores = kernel(*scalar_prefetches, q, prepared_indexer_weights, cache_kv, scores_init)
 
     page_scores = page_scores.reshape(T, num_page_cols)[:, :pages_per_seq]
+    if pages_per_seq < k_pages:
+        page_scores = jnp.pad(
+            page_scores, ((0, 0), (0, k_pages - pages_per_seq)), constant_values=-jnp.inf
+        )
     top_vals, top_idxs = jax.lax.top_k(page_scores, k_pages)
-    return jnp.where(top_vals > -jnp.inf, top_idxs, -1)
+    if dcp_size > 1:
+        top_idxs = top_idxs * dcp_size + dcp_rank
+    top_idxs = jnp.where(top_vals > -jnp.inf, top_idxs, -1)
+    if return_values:
+        return top_vals, top_idxs
+    return top_idxs
