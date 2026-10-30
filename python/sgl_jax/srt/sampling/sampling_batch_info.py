@@ -31,14 +31,21 @@ _zero_linear_penalty_cache: dict[tuple[int, int], jax.Array] = {}
 _zero_linear_penalty_lock = threading.Lock()
 
 
+# Host uploads in this module use device_array (per-shard transfers) rather than
+# jax.device_put: on multi-host meshes device_put of a host value runs a
+# cross-process assert_equal collective, and launching it from the scheduler
+# thread while the overlap thread launches the forward step lets hosts enqueue
+# programs in different orders (RuntimeUnexpectedCoreHalt, "unexpected peer").
 @cache
 def _sampler_bools(sharding):
-    return tuple(jax.device_put(np.bool_(value), sharding) for value in (False, True))
+    return tuple(device_array(np.bool_(value), sharding=sharding) for value in (False, True))
 
 
 @cache
 def _empty_vocab_mask(batch_size, vocab_size, sharding):
-    return jax.device_put(np.zeros((batch_size, (vocab_size + 31) // 32), dtype=np.int32), sharding)
+    return device_array(
+        np.zeros((batch_size, (vocab_size + 31) // 32), dtype=np.int32), sharding=sharding
+    )
 
 
 @register_pytree_node_class
@@ -76,7 +83,7 @@ class SamplingMetadata:
         self.apply_vocab_mask = _sampler_bools(sharding)[mask is not None]
         # Grammar masks are mutable: upload current contents after the grammar update.
         self.vocab_mask = (
-            jax.device_put(mask, sharding)
+            device_array(mask, sharding=sharding)
             if mask is not None
             else _empty_vocab_mask(self.temperatures.shape[0], vocab_size, sharding)
         )
