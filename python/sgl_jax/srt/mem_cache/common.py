@@ -98,6 +98,16 @@ def evict_from_tree_cache(tree_cache: BasePrefixCache | None, num_tokens: int, d
         # Standard allocator
         if allocator.available_size(dp_rank=dp_rank) < num_tokens:
             tree_cache.evict(EvictParams(num_tokens=num_tokens, dp_rank=dp_rank))
+        # With DCP every page has a fixed owner rank and available_size counts
+        # only the scarcest rank, so one eviction of num_tokens may free pages
+        # elsewhere; keep evicting (doubling) while that rank is still short.
+        if getattr(allocator, "dcp_size", 1) > 1:
+            need = num_tokens
+            for _ in range(6):
+                if allocator.available_size(dp_rank=dp_rank) >= num_tokens:
+                    break
+                need *= 2
+                tree_cache.evict(EvictParams(num_tokens=need, dp_rank=dp_rank))
 
 
 def available_and_evictable_str(tree_cache, dp_rank: int = 0) -> str:

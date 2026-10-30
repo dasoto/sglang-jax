@@ -1646,10 +1646,13 @@ class MLATokenToKVPool(KVCache):
         num_latent_layers: int,
         indexer_key_dim: int = 0,
         num_indexer_layers: int = 0,
+        dcp_size: int = 1,
     ) -> int:
         """Return the pool's conservative capacity coefficient before allocation."""
         if page_size <= 0:
             raise ValueError(f"page_size must be positive, got {page_size}")
+        if dcp_size <= 0:
+            raise ValueError(f"dcp_size must be positive, got {dcp_size}")
         if num_latent_layers < 0 or num_indexer_layers < 0:
             raise ValueError("cache layer counts must be non-negative")
         if min(kv_lora_rank, qk_rope_head_dim, indexer_key_dim) < 0:
@@ -1673,7 +1676,8 @@ class MLATokenToKVPool(KVCache):
                 indexer_key_dim=indexer_key_dim,
             )
             bytes_per_page += cls._shape_bytes(indexer_shape, dtype) * num_indexer_layers
-        return (bytes_per_page + page_size - 1) // page_size
+        denom = page_size * dcp_size
+        return max(1, (bytes_per_page + denom - 1) // denom)
 
     def __init__(
         self,
@@ -1686,6 +1690,7 @@ class MLATokenToKVPool(KVCache):
         mesh: Mesh,
         kv_partition_axis: str = "data",
         dp_size: int = 1,
+        dcp_size: int = 1,
         start_layer: int | None = None,
         end_layer: int | None = None,
         indexer_key_dim: int = 0,
@@ -1697,6 +1702,7 @@ class MLATokenToKVPool(KVCache):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.kv_partition_axis = kv_partition_axis
         self.dp_size = dp_size
+        self.dcp_size = dcp_size
         self.nope_dim, self.rope_dim = self._aligned_latent_dims(kv_lora_rank, qk_rope_head_dim)
         self.kv_dim = self.nope_dim + self.rope_dim
         self.indexer_key_dim_raw = indexer_key_dim
@@ -1716,6 +1722,7 @@ class MLATokenToKVPool(KVCache):
             "qk_rope_head_dim": self.qk_rope_head_dim,
             "kv_partition_axis": self.kv_partition_axis,
             "dp_size": self.dp_size,
+            "dcp_size": self.dcp_size,
             "kv_sharding": self.kv_sharding,
             "indexer_key_dim": self.indexer_key_dim_raw,
             "num_indexer_layers": self.num_indexer_layers,
@@ -1747,6 +1754,7 @@ class MLATokenToKVPool(KVCache):
         obj.qk_rope_head_dim = aux_data["qk_rope_head_dim"]
         obj.kv_partition_axis = aux_data["kv_partition_axis"]
         obj.dp_size = aux_data.get("dp_size", 1)
+        obj.dcp_size = aux_data.get("dcp_size", 1)
         obj.kv_sharding = aux_data["kv_sharding"]
         obj.num_indexer_layers = aux_data.get("num_indexer_layers", 0)
         obj.nope_dim, obj.rope_dim = cls._aligned_latent_dims(
@@ -1778,12 +1786,15 @@ class MLATokenToKVPool(KVCache):
         DeepSeek-V3 (lora=512, rope=64) is a coincidental match — 512+128=640
         and align(576,128)=640.
         """
-        # MLA cache has no head axis to shard; page axis is sharded by DP.
-        self.kv_sharding = NamedSharding(self.mesh, P("data", None, None, None))
+        # MLA cache has no head axis to shard; page axis is sharded by DP (and tensor when DCP > 1).
+        page_axis_spec = ("data", "tensor") if self.dcp_size > 1 else "data"
+        self.kv_sharding = NamedSharding(self.mesh, P(page_axis_spec, None, None, None))
 
         assert self.size % self.page_size == 0, "Cache size must be divisible by page size"
 
-        total_num_pages = (self.size + self.page_size * self.dp_size) // self.page_size
+        total_num_pages = (
+            self.size + self.page_size * self.dp_size * self.dcp_size
+        ) // self.page_size
         buffer_shape = self._latent_cache_shape(
             total_num_pages=total_num_pages,
             page_size=self.page_size,
@@ -1853,7 +1864,9 @@ class MLATokenToKVPool(KVCache):
 
     def _buffer_bytes(self) -> int:
         """Resident bytes for one latent paged buffer."""
-        total_num_pages = (self.size + self.page_size * self.dp_size) // self.page_size
+        total_num_pages = (
+            self.size + self.page_size * self.dp_size * self.dcp_size
+        ) // self.page_size
         shape = self._latent_cache_shape(
             total_num_pages=total_num_pages,
             page_size=self.page_size,
@@ -1865,7 +1878,9 @@ class MLATokenToKVPool(KVCache):
 
     def _indexer_buffer_bytes(self) -> int:
         """Bytes for ONE DSA indexer key buffer; 0 when none is allocated."""
-        total_num_pages = (self.size + self.page_size * self.dp_size) // self.page_size
+        total_num_pages = (
+            self.size + self.page_size * self.dp_size * self.dcp_size
+        ) // self.page_size
         shape = self._indexer_cache_shape(
             total_num_pages=total_num_pages,
             page_size=self.page_size,
@@ -1984,6 +1999,8 @@ class HybridLinearKVPool(KVCache):
         self.end_layer = self.full_kv_pool.end_layer
         self.mem_usage = self.full_kv_pool.mem_usage
         self.kv_sharding = self.full_kv_pool.kv_sharding
+        self.dp_size = getattr(self.full_kv_pool, "dp_size", 1)
+        self.dcp_size = getattr(self.full_kv_pool, "dcp_size", 1)
 
     def _to_physical(self, layer_id: int) -> int:
         if layer_id not in self.full_attention_layer_id_mapping:
