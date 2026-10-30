@@ -954,10 +954,18 @@ class EPMoE(nnx.Module):
             )
             rows = jnp.reshape(argsort_indices - start, (weights.shape[0], top_k))
             valid = (rows >= 0) & (rows < n_local)
+            # A token has at most min(top_k, experts_per_device) slots on local experts:
+            # move those to the front and gather only that many rows per token.
+            slots = min(top_k, self.experts_per_device)
+            if slots < top_k:
+                order = jnp.argsort(jnp.logical_not(valid), axis=1, stable=True)[:, :slots]
+                rows = jnp.take_along_axis(rows, order, axis=1)
+                valid = jnp.take_along_axis(valid, order, axis=1)
+                weights = jnp.take_along_axis(weights, order, axis=1)
             rows = jnp.clip(rows, 0, cap - 1)
             weights_fp32 = jnp.where(valid, weights.astype(jnp.float32), 0.0)
             output = None
-            for k in range(top_k):
+            for k in range(slots):
                 contribution = (
                     jnp.take(intermediate, indices=rows[:, k], axis=0).astype(jnp.float32)
                     * weights_fp32[:, k, None]
