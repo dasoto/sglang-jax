@@ -1,6 +1,7 @@
 """GMM-based Expert-Parallel MoE layer and weight mapping utilities."""
 
 import math
+import os
 from functools import partial
 
 import jax
@@ -29,6 +30,15 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor,
     quantize_tensor_simple,
 )
+
+
+# Local-window dispatch for EPMoE: an expert sees each token at most once, so the
+# rows routed to one shard's experts fit in M * min(top_k, experts_per_device)
+# sorted rows starting at the shard's first local row. Gathering only that window,
+# instead of all M * top_k rows, shrinks the dispatch and GEMM buffers by
+# top_k / experts_per_device with identical results (no capacity drop). Read at
+# trace time.
+MOE_LOCAL_WINDOW = os.environ.get("SGLANG_JAX_MOE_LOCAL_WINDOW", "0") == "1"
 
 
 class EPMoE(nnx.Module):
@@ -689,6 +699,19 @@ class EPMoE(nnx.Module):
                 flat_experts < group_offset + self.experts_per_device
             )
 
+        window = None
+        cap = hidden_states.shape[0] * min(self.num_experts_per_tok, self.experts_per_device)
+        if (
+            MOE_LOCAL_WINDOW
+            and self.ep_size > 1
+            and local_range is None
+            and cap < token_indices.shape[0]
+        ):
+            csum = jnp.cumsum(group_sizes)
+            start = jnp.where(group_offset == 0, 0, csum[jnp.maximum(group_offset - 1, 0)])
+            n_local = csum[group_offset + self.experts_per_device - 1] - start
+            window = (start.astype(jnp.int32), n_local.astype(jnp.int32), cap)
+
         intermediate_output = self._gmm_compute(
             inputs_2d,
             token_indices,
@@ -704,6 +727,7 @@ class EPMoE(nnx.Module):
             w1_kernel_bias,
             wo_kernel_bias,
             local_range=local_range,
+            window=window,
         )
 
         output = self._unpermute(
@@ -711,6 +735,7 @@ class EPMoE(nnx.Module):
             sorted_selected_experts,
             topk_weights,
             valid_mask=valid_mask,
+            window=window,
         )
 
         # Reduce on the "tensor" axis. RS (psum_scatter) when caller asked
@@ -742,6 +767,7 @@ class EPMoE(nnx.Module):
         w1_kernel_bias=None,
         wo_kernel_bias=None,
         local_range=None,
+        window=None,
     ):
         if token_indices.shape[0] == 0:
             return jnp.zeros((0, wo_kernel.shape[-1]), dtype=inputs_2d.dtype)
@@ -750,7 +776,25 @@ class EPMoE(nnx.Module):
         # so XLA can fuse the gather with the matmul and avoid materializing
         # the full [M*top_k, D] sorted_inputs tensor at peak memory.
         pre_gather_q = getattr(self, "pre_gather_quant_dtype", None)
-        if pre_gather_q is not None:
+        if window is not None:
+            # Rows [start, start + cap) of the expert-sorted order: the local experts'
+            # n_local rows first, then rows the GEMM leaves to a non-local group (or to
+            # the last local expert, whose extra rows _unpermute masks out).
+            start, n_local, cap = window
+            pos = jnp.minimum(start + jnp.arange(cap, dtype=jnp.int32), token_indices.shape[0] - 1)
+            if pre_gather_q is not None:
+                x_q, x_scale = quantize_tensor_simple(inputs_2d, pre_gather_q, dim=-1)
+                x = x_q[token_indices[pos]]
+                x = (x.astype(jnp.float32) * x_scale[token_indices[pos]]).astype(self.dtype)
+            else:
+                x = inputs_2d[token_indices[pos]].astype(self.dtype)
+            experts = jnp.arange(group_sizes.shape[0])
+            is_local = (experts >= group_offset) & (
+                experts < group_offset + self.experts_per_device
+            )
+            group_sizes = jnp.where(is_local, group_sizes, 0)
+            group_sizes = group_sizes.at[-1].add(cap - n_local)
+        elif pre_gather_q is not None:
             x_q, x_scale = quantize_tensor_simple(inputs_2d, pre_gather_q, dim=-1)
             x = x_q[token_indices]
             x_scale = x_scale[token_indices]
@@ -882,7 +926,9 @@ class EPMoE(nnx.Module):
             group_sizes,
         )
 
-    def _unpermute(self, intermediate, sorted_selected_experts, weights, valid_mask=None):
+    def _unpermute(
+        self, intermediate, sorted_selected_experts, weights, valid_mask=None, window=None
+    ):
         top_k = self.num_experts_per_tok
         if weights.ndim != 2 or weights.shape[1] != top_k:
             raise ValueError(
@@ -896,6 +942,28 @@ class EPMoE(nnx.Module):
                 "EPMoE._unpermute expects 1-D sorted routing indices with "
                 f"{expected_tokens} entries, got shape {sorted_selected_experts.shape}"
             )
+
+        if window is not None:
+            # intermediate holds window rows [start, start + cap) of the sorted order;
+            # each (token, slot) routed to a local expert maps to row sorted_pos - start.
+            start, n_local, cap = window
+            argsort_indices = (
+                jnp.zeros(expected_tokens, dtype=jnp.int32)
+                .at[sorted_selected_experts]
+                .set(jnp.arange(expected_tokens, dtype=jnp.int32))
+            )
+            rows = jnp.reshape(argsort_indices - start, (weights.shape[0], top_k))
+            valid = (rows >= 0) & (rows < n_local)
+            rows = jnp.clip(rows, 0, cap - 1)
+            weights_fp32 = jnp.where(valid, weights.astype(jnp.float32), 0.0)
+            output = None
+            for k in range(top_k):
+                contribution = (
+                    jnp.take(intermediate, indices=rows[:, k], axis=0).astype(jnp.float32)
+                    * weights_fp32[:, k, None]
+                )
+                output = contribution if output is None else output + contribution
+            return output.astype(self.dtype)
 
         actual_tokens = intermediate.shape[0]
 
