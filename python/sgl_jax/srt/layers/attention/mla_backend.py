@@ -89,6 +89,11 @@ class MLAAttentionMetadata:
 class MLAAttentionBackend(AttentionBackend):
     """Absorbed-MLA attention backend backed by the v2 Pallas kernel."""
 
+    # With DCP the metadata carries per-(dp, dcp) local page tables built on the
+    # host. Backends that derive local pages on device from the global page table
+    # (DSA) set this to False and keep the plain per-DP metadata.
+    dcp_host_page_tables = True
+
     def __init__(
         self,
         num_attn_heads: int,
@@ -209,7 +214,7 @@ class MLAAttentionBackend(AttentionBackend):
         else:
             raise ValueError(f"Invalid forward mode: {batch.forward_mode}")
 
-        if self.dcp_size <= 1:
+        if self.dcp_size <= 1 or not self.dcp_host_page_tables:
             page_indices = logical_pages_2d.ravel()
             cu_kv_lens = cu_kv_2d.ravel()
             (

@@ -118,7 +118,12 @@ def _run_both(c, *, query_block):
     )
     out_qb = np.asarray(
         sparse_mla_attention_qblock(
-            c["q"], c["kv"], c["indices"], c["positions"], query_block=query_block, **common
+            c["q"],
+            c["kv"],
+            c["indices"],
+            c["positions"],
+            query_block=query_block,
+            **common,
         )
     )
     out_cur = np.asarray(
@@ -198,7 +203,13 @@ def test_small_u_max_padding():
     )
     out = np.asarray(
         sparse_mla_attention_qblock(
-            c["q"], c["kv"], c["indices"], c["positions"], query_block=64, u_max=3, **common
+            c["q"],
+            c["kv"],
+            c["indices"],
+            c["positions"],
+            query_block=64,
+            u_max=3,
+            **common,
         )
     )
     err = np.abs(out - ref).max()
@@ -274,7 +285,9 @@ def _ragged_case(seq_lens_list, K, seed=0):
         loc=jnp.asarray(loc),
         seq_lens=jnp.asarray(seq_lens_list, jnp.int32),
         cu_q_lens=jnp.asarray(np.arange(num_seqs + 1) * S_pad, jnp.int32),
-        cu_kv_lens=jnp.asarray(np.arange(num_seqs + 1) * pages_per_seq * _PS, jnp.int32),
+        cu_kv_lens=jnp.asarray(
+            np.arange(num_seqs + 1) * pages_per_seq * _PS, jnp.int32
+        ),
         page_indices=jnp.asarray(phys.reshape(-1)),
         real=real,
     )
@@ -319,7 +332,9 @@ def test_ragged_qblock_vs_deployed(seq_lens_list, qb):
 
 # ── TSA (token-sharded attention): sharded slices vs one full-chunk call ────
 
-prefill_write_and_attend_ragged_qblock_tsa = qb_mod.prefill_write_and_attend_ragged_qblock_tsa
+prefill_write_and_attend_ragged_qblock_tsa = (
+    qb_mod.prefill_write_and_attend_ragged_qblock_tsa
+)
 
 
 @pytest.mark.parametrize(
@@ -379,7 +394,9 @@ def test_tsa_sharded_vs_full(seq_lens_list, shards, qb):
     o_tsa = np.concatenate(outs, 0)
     real = c["real"]
     d_o = np.abs(o_tsa[real] - np.asarray(o_full)[real]).max()
-    print(f"[tsa shards={shards} qb={qb}] |o_tsa-o_full|={d_o:.3e} |cache diff|={d_c:.3e}")
+    print(
+        f"[tsa shards={shards} qb={qb}] |o_tsa-o_full|={d_o:.3e} |cache diff|={d_c:.3e}"
+    )
     assert d_c == 0.0, "every shard must self-write the identical full-chunk cache"
     assert d_o < 2e-3, f"TSA sharded attend drifted from full-chunk qblock: {d_o}"
 
@@ -436,7 +453,57 @@ def test_umax_reduced_warns_once(caplog):
 
     caplog.clear()
     with caplog.at_level("WARNING", logger=qb_mod.__name__):
-        sparse_mla_attention_qblock(c["q"], c["kv"], c["indices"], c["positions"], **common)
+        sparse_mla_attention_qblock(
+            c["q"], c["kv"], c["indices"], c["positions"], **common
+        )
     assert not [
         r for r in caplog.records if "u_max" in r.getMessage()
     ], "default u_max must not warn"
+
+
+def test_lse_merges_disjoint_page_splits():
+    """DCP merges partial results over disjoint key sets with their LSEs: running
+    the kernel on two halves of every query's pages and LSE-combining must match
+    one run over all pages (and the masked-softmax reference)."""
+    c = _make_case(B=1, S=24, H=4, K=6, pages=8, seed=7, empty_rows=(5,))
+    common = dict(
+        kv_lora_rank=c["kv_lora_rank"],
+        read_block=c["page_size"],
+        sm_scale=c["sm_scale"],
+        interpret=True,
+        query_block=8,
+    )
+    idx = np.asarray(c["indices"])
+    owner = np.where(idx >= 0, idx % 2, -1)  # pages split by an even/odd owner rule
+    outs, lses = [], []
+    for r in range(2):
+        idx_r = jnp.asarray(np.where(owner == r, idx, -1))
+        o, lse = sparse_mla_attention_qblock(
+            c["q"], c["kv"], idx_r, c["positions"], return_lse=True, **common
+        )
+        outs.append(np.asarray(o))
+        lses.append(np.asarray(lse))
+    o_full, lse_full = sparse_mla_attention_qblock(
+        c["q"], c["kv"], c["indices"], c["positions"], return_lse=True, **common
+    )
+    lse = np.stack(lses)  # [2, B, S, H]
+    m = np.max(lse, axis=0)
+    m = np.where(np.isneginf(m), 0.0, m)
+    w = np.where(np.isneginf(lse), 0.0, np.exp(lse - m))
+    w_sum = w.sum(0)
+    merged = (np.stack(outs) * (w / np.where(w_sum > 0, w_sum, 1.0))[..., None]).sum(0)
+    ref = _reference(
+        c["q"],
+        c["kv"],
+        c["indices"],
+        c["positions"],
+        read_block=c["page_size"],
+        kv_lora_rank=c["kv_lora_rank"],
+        sm_scale=c["sm_scale"],
+    )
+    assert np.abs(merged - np.asarray(o_full)).max() < 2e-3
+    assert np.abs(merged - ref).max() < 2e-3
+    # combined LSE equals the single-run LSE; empty rows stay -inf
+    lse_comb = np.where(w_sum > 0, m + np.log(np.where(w_sum > 0, w_sum, 1.0)), -np.inf)
+    np.testing.assert_allclose(lse_comb, np.asarray(lse_full), rtol=1e-4, atol=1e-4)
+    assert np.all(np.isneginf(np.asarray(lse_full)[0, 5]))

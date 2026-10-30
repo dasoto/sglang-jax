@@ -108,6 +108,9 @@ _SPEC_AS_DECODE = os.environ.get("DSA_SPEC_AS_DECODE", "0") == "1"
 # Query block for the page-topk indexer kernel on spec batches (T = a few tokens
 # per request; the prefill default of 512 pads 4 queries to a 512 block).
 _SPEC_INDEXER_QB = int(os.environ.get("DSA_SPEC_INDEXER_QB", "16"))
+# Query block for the page-topk indexer kernel on prefill batches. Unset keeps the
+# kernel default (512, tuned on v6e/v7x); v5e's scoped VMEM needs a smaller block.
+_PREFILL_INDEXER_QB = int(os.environ.get("DSA_INDEXER_PREFILL_QB", "0")) or None
 # A/B knob (opt-in): decode-form verify tokens of one request share the last token's page list
 # (see sparse_mla_page_level page_share_group). Default 1 = per-token pages.
 _SPEC_VERIFY_PAGE_SHARE = int(os.environ.get("DSA_SPEC_VERIFY_PAGE_SHARE", "1") or "1")
@@ -156,6 +159,13 @@ _IDX_VERIFY_BATCHED_MAX_KV = int(os.environ.get("DSA_IDX_VERIFY_BATCHED_MAX_KV",
 # move ~71MB/device/layer/chunk — well under the attend time they unlock.
 _TSA_PREFILL = os.environ.get("DSA_TSA_PREFILL", "0") == "1"
 _TSA_PREFILL_QB = int(os.environ.get("DSA_TSA_PREFILL_QB", "16"))
+# Decode context parallelism (--dcp-size): every rank attends with all heads, so
+# the sparse-prefill query block holds QB x num_heads rows; 16 x 64 heads matches
+# the row count of the head-TP default (256 x 4 heads at TP16).
+_DCP_PREFILL_QB = int(os.environ.get("DSA_DCP_PREFILL_QB", "16"))
+# dtype of the DCP output reduce-scatter (each rank's softmax-weighted partial).
+# bfloat16 halves the prefill combine traffic ([T, heads, kv_lora_rank] per layer).
+_DCP_COMBINE_DTYPE = jnp.dtype(os.environ.get("DSA_DCP_COMBINE_DTYPE", "float32"))
 
 
 @register_pytree_node_class
@@ -185,7 +195,19 @@ class DSAFusedCache:
 
 @dataclass
 class DSASparseAttentionBackend(MLAAttentionBackend):
-    """Absorbed-MLA + DSA lightning-indexer top-k + IndexShare."""
+    """Absorbed-MLA + DSA lightning-indexer top-k + IndexShare.
+
+    With decode context parallelism (``dcp_size`` > 1, equal to the attention TP
+    size) the latent and indexer-key caches are sharded by page over the
+    ``tensor`` axis: page j of a sequence lives on rank j % dcp_size at local page
+    ``(page_id - 1) // dcp_size + 1``. Local page tables are derived on device
+    from the global per-DP metadata. Each rank writes the tokens it owns, scores
+    its own indexer keys (per-rank top-k merged across ranks), and attends its
+    own selected pages with all heads; partial outputs are merged with their
+    log-sum-exp and reduce-scattered back to head-TP shards.
+    """
+
+    dcp_host_page_tables = False
 
     def __init__(
         self,
@@ -236,9 +258,21 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             num_kv_pages_per_block=aux_data["num_kv_pages_per_block"],
             num_queries_per_block=aux_data["num_queries_per_block"],
             decode_batch_size=aux_data["decode_batch_size"],
+            dcp_size=aux_data.get("dcp_size", 1),
         )
         obj.forward_metadata = children[0]
         return obj
+
+    def get_max_running_reqests(self, max_context_len: int, page_size: int) -> int:
+        # The sparse kernels index the global page table even with DCP, so the
+        # scalar-prefetch budget is per global page (not per DCP-local page).
+        num_page_per_req = -(-max_context_len // page_size)
+        res = 1024 * 1024 // 2 // max(1, num_page_per_req) // 4
+        assert res > 0, (
+            f"max running requests: {res} must larger than 0, please increase page size or "
+            "decrease max context length"
+        )
+        return res
 
     @named_scope
     def __call__(
@@ -297,6 +331,27 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         # The kv cache write still happens inside the dense kernel via
         # input_output_aliases in the remaining (no-indexer) dense case.
         is_decode = forward_batch.forward_mode.is_decode()
+        if self.dcp_size > 1:
+            return self._dcp_call(
+                q,
+                q_rope,
+                new_kv_c,
+                new_k_pe,
+                kv_cache,
+                idx_cache,
+                q_idx,
+                k_idx,
+                idx_weights,
+                is_full,
+                dsa_topk_in,
+                dsa_topk_pages_in,
+                dsa_topk_reuse,
+                sm_scale,
+                dpa,
+                md,
+                forward_batch,
+                layer_id,
+            )
         if is_full and q_idx is None:
             o, kv_cache = self._run_dense(
                 q, q_rope, new_kv_c, new_k_pe, kv_cache, sm_scale, layer, dpa, md
@@ -680,7 +735,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         md,
         *,
         compute_pages=True,
-        num_queries_per_block=None,
+        num_queries_per_block=_PREFILL_INDEXER_QB,
         q_group=None,
     ):
         """Prefill page-topk: scatter ``k_idx`` into the paged indexer cache and,
@@ -1206,6 +1261,414 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             md.cu_kv_lens,
             md.distribution,
         )
+
+    # ────────────────────────────────────────────────────────────────────────
+    # decode context parallelism
+    # ────────────────────────────────────────────────────────────────────────
+
+    def _dcp_call(
+        self,
+        q,
+        q_rope,
+        new_kv_c,
+        new_k_pe,
+        kv_cache,
+        idx_cache,
+        q_idx,
+        k_idx,
+        idx_weights,
+        is_full,
+        dsa_topk_in,
+        dsa_topk_pages_in,
+        dsa_topk_reuse,
+        sm_scale,
+        dpa,
+        md,
+        forward_batch,
+        layer_id,
+    ):
+        mode = forward_batch.forward_mode
+        if mode.is_target_verify() or mode.is_draft_extend():
+            raise NotImplementedError(
+                "DSA with --dcp-size does not support speculative decoding yet"
+            )
+        if is_full and q_idx is None:
+            raise NotImplementedError("DSA with --dcp-size needs an indexer on every full layer")
+        if not (_INDEXER_KERNEL and _INDEXER_KERNEL_PREFILL and _PREFILL_SPARSE):
+            raise ValueError(
+                "DSA with --dcp-size requires DSA_INDEXER_KERNEL=1, DSA_INDEXER_KERNEL_PREFILL=1 "
+                "and DSA_PREFILL_SPARSE=1"
+            )
+        is_decode = mode.is_decode()
+        loc = forward_batch.out_cache_loc.astype(jnp.int32)
+        reuse = is_full and dsa_topk_reuse and dsa_topk_pages_in is not None
+        topk, topk_pages = None, None
+        if is_full:
+            idx_mode = "write" if reuse else ("decode" if is_decode else "prefill")
+            idx_cache, topk, topk_pages = self._dcp_index(
+                q_idx, k_idx, idx_weights, idx_cache, loc, dpa, md, mode=idx_mode
+            )
+        pages_use = topk_pages if (is_full and not reuse) else dsa_topk_pages_in
+        if pages_use is None:
+            raise ValueError(f"layer {layer_id}: no page selection to attend under DCP")
+        run = self._dcp_run_sparse_decode if is_decode else self._dcp_run_sparse_prefill
+        o, kv_cache = run(
+            q, q_rope, new_kv_c, new_k_pe, kv_cache, pages_use, sm_scale, dpa, md, forward_batch
+        )
+        fresh = is_full and not reuse
+        return o, DSAFusedCache(
+            kv=kv_cache,
+            idx=idx_cache,
+            topk=topk if (fresh and is_decode) else None,
+            topk_pages=topk_pages if fresh else None,
+        )
+
+    def _dcp_index(self, q_idx, k_idx, idx_weights, idx_cache, loc, dpa, md, *, mode):
+        """Owned indexer-key writes plus, for ``mode`` "decode" / "prefill", the
+        token top-k (and its pages) / per-query page top-k over all ranks' keys.
+        Returns ``(idx_cache, topk, topk_pages)`` (None where not computed)."""
+        dcp = self.dcp_size
+        ps = self.page_size
+        index_topk = self.index_topk
+        k_pages = (index_topk + ps - 1) // ps
+        cache_spec = P((dpa, "tensor"), None, None, None)
+        in_specs = (
+            P(dpa, None, None),  # q_idx [T, H_idx, D_idx]
+            P(dpa, None),  # k_idx [T, D_idx]
+            P(dpa, None),  # weights [T, H_idx]
+            cache_spec,  # local indexer-key pages
+            P(dpa),  # out_cache_loc
+            P(dpa),  # seq_lens
+            P(dpa),  # page_indices (global)
+            P(dpa),  # cu_q_lens
+            P(dpa),  # cu_kv_lens
+            P(dpa),  # distribution
+        )
+        if mode == "write":
+            out_specs = cache_spec
+        elif mode == "decode":
+            out_specs = (cache_spec, P(dpa, None), P(dpa, None))
+        else:
+            out_specs = (cache_spec, P(dpa, None))
+
+        def _run(q_, k_, w_, cache_, loc_, sl_, pi_, cuq_, cukv_, dist_):
+            rank = jax.lax.axis_index("tensor")
+            cache_ = _dcp_scatter_rows(cache_, k_, loc_, ps, dcp, rank)
+            if mode == "write":
+                return cache_
+            pages_per_seq = pi_.shape[0] // sl_.shape[0]
+            local_pt = _dcp_local_page_table(pi_, cukv_, ps, pages_per_seq, dcp, rank)
+            if mode == "decode":
+                vals, idx = streamindex_topk(
+                    q_,
+                    w_,
+                    cache_,
+                    sl_,
+                    local_pt,
+                    cuq_,
+                    dist_,
+                    k=index_topk,
+                    compression_ratio=1,
+                    num_kv_pages_per_block=_INDEXER_KERNEL_KV_PAGES_PER_BLOCK,
+                    num_queries_per_block=1,
+                    dcp_size=dcp,
+                    dcp_rank=rank,
+                    return_values=True,
+                )
+                topk = _dcp_merge_topk(vals, idx, index_topk)
+                topk_pages = compute_topk_pages(
+                    topk, page_size=ps, pages_per_seq=pages_per_seq, k_pages_max=511
+                )
+                return cache_, topk, topk_pages
+            qb_kw = (
+                {}
+                if _PREFILL_INDEXER_QB is None
+                else {"num_queries_per_block": _PREFILL_INDEXER_QB}
+            )
+            vals, idx = streamindex_page_topk(
+                q_,
+                w_,
+                cache_,
+                sl_,
+                local_pt,
+                cuq_,
+                dist_[2],
+                k_pages=k_pages,
+                dcp_size=dcp,
+                dcp_rank=rank,
+                return_values=True,
+                **qb_kw,
+            )
+            return cache_, _dcp_merge_topk(vals, idx, k_pages)
+
+        out = jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
+            q_idx,
+            k_idx,
+            idx_weights,
+            idx_cache,
+            loc,
+            md.seq_lens,
+            md.page_indices,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.distribution,
+        )
+        if mode == "write":
+            return out, None, None
+        if mode == "decode":
+            return out
+        return out[0], None, out[1]
+
+    def _dcp_run_sparse_decode(
+        self, ql, qpe, kvc, kpe, cache, topk_pages, sm_scale, dpa, md, forward_batch
+    ):
+        """Decode: every rank attends, with all heads, the selected pages it owns
+        (plus the new-token page if owned) through the dense kernel's attend-only
+        DCP mode; outputs are LSE-merged across ranks."""
+        dcp = self.dcp_size
+        ps = self.page_size
+        kp = 512  # 511 selected pages + the new-token page
+        sm = float(sm_scale)
+        cache_spec = P((dpa, "tensor"), None, None, None)
+        in_specs = (
+            P(dpa, "tensor", None),  # ql [T, H/tp, lkv]
+            P(dpa, "tensor", None),  # qpe [T, H/tp, rope]
+            P(dpa, None),  # kvc [T, lkv]
+            P(dpa, None),  # kpe [T, rope]
+            cache_spec,
+            P(dpa, None),  # topk_pages [T, <=511] seq-local pages
+            P(dpa),  # out_cache_loc
+            P(dpa),  # seq_lens
+            P(dpa),  # page_indices (global)
+            P(dpa),  # cu_q_lens
+            P(dpa),  # cu_kv_lens
+        )
+        out_specs = (P(dpa, "tensor", None), cache_spec)
+
+        def _run(ql_, qpe_, kvc_, kpe_, cache_, tp_, loc_, sl_, pi_, cuq_, cukv_):
+            rank = jax.lax.axis_index("tensor")
+            cache_ = _dcp_scatter_rows(
+                cache_, _fused_latent_rows(kvc_, kpe_, cache_), loc_, ps, dcp, rank
+            )
+            T = ql_.shape[0]
+            S = sl_.shape[0]
+            seq_id = jnp.clip(jnp.searchsorted(cuq_[1:], jnp.arange(T), side="right"), 0, S - 1)
+            seq_len = sl_[seq_id]
+            base = cukv_[seq_id] // ps
+            new_page = jnp.maximum(seq_len - 1, 0) // ps
+            hits = _pad_topk_pages(tp_, kp - 1)[:, : kp - 1]
+            hits = jnp.where(hits == new_page[:, None], -1, hits)
+            cand = jnp.concatenate([hits, new_page[:, None]], axis=1)  # [T, kp]
+            valid = (cand >= 0) & (seq_len > 0)[:, None]
+            phys = pi_[jnp.clip(base[:, None] + jnp.maximum(cand, 0), 0, pi_.shape[0] - 1)]
+            owned = valid & (phys > 0) & ((phys - 1) % dcp == rank)
+            # owned pages first (stable), then padding
+            key = jnp.where(owned, 0, 1).astype(jnp.int32)
+            _, cand_s, phys_s = jax.lax.sort(
+                (key, cand, phys), dimension=1, num_keys=1, is_stable=True
+            )
+            n_owned = jnp.sum(owned, axis=1)
+            col = jnp.arange(kp)[None, :]
+            keep = col < n_owned[:, None]
+            local_pages = jnp.where(keep, (phys_s - 1) // dcp + 1, 0).astype(jnp.int32)
+            page_pos = jnp.where(keep, cand_s * ps, 0x3FFFFFFF).astype(jnp.int32)
+            # at least one (fully masked) page so the kernel's KV loop runs
+            kv_len_local = (jnp.maximum(n_owned, 1) * ps).astype(jnp.int32)
+            ql_all = jax.lax.all_gather(ql_, "tensor", axis=1, tiled=True)
+            qpe_all = jax.lax.all_gather(qpe_, "tensor", axis=1, tiled=True)
+            o, cache_, lse = mla_ragged_paged_attention(
+                ql_all,
+                qpe_all,
+                kvc_,
+                kpe_,
+                cache_,
+                kv_len_local,
+                local_pages.reshape(-1),
+                jnp.arange(T + 1, dtype=jnp.int32),
+                jnp.arange(T + 1, dtype=jnp.int32) * (kp * ps),
+                jnp.array([T, T, T], dtype=jnp.int32),
+                page_seq_positions=page_pos.reshape(-1),
+                global_kv_lens=seq_len.astype(jnp.int32),
+                return_lse=True,
+                sm_scale=sm,
+                sliding_window=None,
+                soft_cap=None,
+                vmem_limit_bytes=self.vmem_limit_bytes,
+            )
+            o = _dcp_lse_combine(o[..., : self.kv_lora_rank], lse, ql_.shape[1])
+            return o.astype(ql_.dtype), cache_
+
+        return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
+            ql,
+            qpe,
+            kvc,
+            kpe,
+            cache,
+            topk_pages,
+            forward_batch.out_cache_loc.astype(jnp.int32),
+            md.seq_lens,
+            md.page_indices,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+        )
+
+    def _dcp_run_sparse_prefill(
+        self, ql, qpe, kvc, kpe, cache, topk_pages, sm_scale, dpa, md, forward_batch
+    ):
+        """Prefill/mixed: owned writes up front, then the blocked sparse-prefill
+        kernel over each query's owned selected pages with all heads (other pages
+        masked to -1, page table remapped to local ids, no in-kernel write); outputs
+        are LSE-merged across ranks."""
+        dcp = self.dcp_size
+        ps = self.page_size
+        sm = float(sm_scale)
+        kv_lora_rank = self.kv_lora_rank
+        cache_spec = P((dpa, "tensor"), None, None, None)
+        in_specs = (
+            P(dpa, "tensor", None),  # ql
+            P(dpa, "tensor", None),  # qpe
+            P(dpa, None),  # kvc
+            P(dpa, None),  # kpe
+            cache_spec,
+            P(dpa, None),  # topk_pages [T, K]
+            P(dpa),  # positions
+            P(dpa),  # out_cache_loc
+            P(dpa),  # seq_lens
+            P(dpa),  # cu_q_lens
+            P(dpa),  # cu_kv_lens
+            P(dpa),  # page_indices (global)
+        )
+        out_specs = (P(dpa, "tensor", None), cache_spec)
+
+        def _run(ql_, qpe_, kvc_, kpe_, cache_, tp_, pos_, loc_, sl_, cuq_, cukv_, pi_):
+            rank = jax.lax.axis_index("tensor")
+            cache_ = _dcp_scatter_rows(
+                cache_, _fused_latent_rows(kvc_, kpe_, cache_), loc_, ps, dcp, rank
+            )
+            T = ql_.shape[0]
+            S = sl_.shape[0]
+            seq_id = jnp.clip(jnp.searchsorted(cuq_[1:], jnp.arange(T), side="right"), 0, S - 1)
+            base = cukv_[seq_id] // ps
+            phys = pi_[jnp.clip(base[:, None] + jnp.maximum(tp_, 0), 0, pi_.shape[0] - 1)]
+            owned = (tp_ >= 0) & (phys > 0) & ((phys - 1) % dcp == rank)
+            tp_local = jnp.where(owned, tp_, -1)
+            pt_local = jnp.where((pi_ > 0) & ((pi_ - 1) % dcp == rank), (pi_ - 1) // dcp + 1, 0)
+            ql_all = jax.lax.all_gather(ql_, "tensor", axis=1, tiled=True)
+            qpe_all = jax.lax.all_gather(qpe_, "tensor", axis=1, tiled=True)
+            o, cache_, lse = prefill_write_and_attend_ragged_qblock(
+                ql_all,
+                qpe_all,
+                kvc_,
+                kpe_,
+                cache_,
+                tp_local,
+                pos_,
+                jnp.full((T,), -1, jnp.int32),  # already written above
+                sl_,
+                cuq_,
+                cukv_,
+                pt_local.astype(jnp.int32),
+                kv_lora_rank=kv_lora_rank,
+                page_size=ps,
+                sm_scale=sm,
+                query_block=_DCP_PREFILL_QB,
+                return_lse=True,
+            )
+            o = _dcp_lse_combine(o, lse, ql_.shape[1])
+            return o.astype(ql_.dtype), cache_
+
+        return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
+            ql,
+            qpe,
+            kvc,
+            kpe,
+            cache,
+            topk_pages,
+            forward_batch.positions.astype(jnp.int32),
+            forward_batch.out_cache_loc.astype(jnp.int32),
+            md.seq_lens,
+            md.cu_q_lens,
+            md.cu_kv_lens,
+            md.page_indices,
+        )
+
+
+def _fused_latent_rows(kvc: jax.Array, kpe: jax.Array, cache: jax.Array) -> jax.Array:
+    """[T, lkv] + [T, rope] -> fused cache rows [T, Dk_pad] (latent | rope | zeros)."""
+    T, lkv = kvc.shape
+    rope = kpe.shape[-1]
+    row = jnp.zeros((T, cache.shape[-1]), cache.dtype)
+    row = row.at[:, :lkv].set(kvc.astype(cache.dtype))
+    return row.at[:, lkv : lkv + rope].set(kpe.reshape(T, rope).astype(cache.dtype))
+
+
+def _dcp_scatter_rows(
+    cache: jax.Array, rows: jax.Array, loc: jax.Array, page_size: int, dcp_size: int, rank
+) -> jax.Array:
+    """Write ``rows[t]`` at global slot ``loc[t]`` into this rank's local pages.
+
+    ``cache`` is the rank-local ``[P_local, ps//pk, pk, D]`` shard. A slot's page
+    id ``g >= 1`` is owned by rank ``(g - 1) % dcp_size`` at local page
+    ``(g - 1) // dcp_size + 1``; rows of other ranks, padding (``loc < page_size``,
+    i.e. the reserved page 0) and negative slots are dropped.
+    """
+    pk = cache.shape[2]
+    if rows.shape[-1] < cache.shape[-1]:
+        rows = jnp.pad(rows, ((0, 0), (0, cache.shape[-1] - rows.shape[-1])))
+    loc = loc.astype(jnp.int32)
+    page = loc // page_size
+    off = loc % page_size
+    owned = (page >= 1) & ((page - 1) % dcp_size == rank)
+    local_page = jnp.where(owned, (page - 1) // dcp_size + 1, cache.shape[0])
+    return cache.at[local_page, off // pk, off % pk].set(rows.astype(cache.dtype), mode="drop")
+
+
+def _dcp_local_page_table(
+    page_indices: jax.Array,
+    cu_kv_lens: jax.Array,
+    page_size: int,
+    pages_per_seq: int,
+    dcp_size: int,
+    rank,
+) -> jax.Array:
+    """Fixed-stride table of this rank's pages: entry ``[s, lp]`` is the local id
+    of sequence s's page ``lp * dcp_size + rank`` (0 past the table)."""
+    fixed = _fixed_stride_pages(page_indices, cu_kv_lens, page_size, pages_per_seq)
+    fixed = fixed.reshape(-1, pages_per_seq)
+    local_pages = -(-pages_per_seq // dcp_size)
+    j = jnp.arange(local_pages) * dcp_size + rank
+    g = jnp.where(j[None, :] < pages_per_seq, fixed[:, jnp.minimum(j, pages_per_seq - 1)], 0)
+    return jnp.where(g > 0, (g - 1) // dcp_size + 1, 0).astype(jnp.int32).reshape(-1)
+
+
+def _dcp_merge_topk(vals: jax.Array, idx: jax.Array, k: int) -> jax.Array:
+    """Global top-k from each rank's local top-k: all-gather (score, index) over
+    ``tensor`` and select again. Descending order, -1 for empty slots."""
+    vals = jax.lax.all_gather(vals, "tensor", axis=1, tiled=True)
+    idx = jax.lax.all_gather(idx, "tensor", axis=1, tiled=True)
+    top_vals, pos = jax.lax.top_k(vals, k)
+    return jnp.where(top_vals > -jnp.inf, jnp.take_along_axis(idx, pos, axis=1), -1)
+
+
+def _dcp_lse_combine(o: jax.Array, lse: jax.Array, heads_local: int) -> jax.Array:
+    """Merge per-rank partial attention over disjoint key sets.
+
+    ``o`` [T, H, D] and ``lse`` [T, H] are this rank's all-head partials. Each
+    rank scales its partial by its softmax share, then a reduce-scatter over
+    ``tensor`` sums the shares (in ``DSA_DCP_COMBINE_DTYPE``) and returns this
+    rank's contiguous head block [T, heads_local, D] (fp32).
+    """
+    lse = lse.astype(jnp.float32)
+    lse_all = jax.lax.all_gather(lse, "tensor")  # [dcp, T, H]
+    m = jnp.max(lse_all, axis=0)
+    m = jnp.where(jnp.isneginf(m), 0.0, m)
+    w_all = jnp.where(jnp.isneginf(lse_all), 0.0, jnp.exp(lse_all - m))
+    w_sum = jnp.sum(w_all, axis=0)
+    w = jnp.where(jnp.isneginf(lse), 0.0, jnp.exp(lse - m)) / jnp.where(w_sum > 0, w_sum, 1.0)
+    scaled = (o.astype(jnp.float32) * w[..., None]).astype(_DCP_COMBINE_DTYPE)
+    out = jax.lax.psum_scatter(scaled, "tensor", scatter_dimension=1, tiled=True)
+    assert out.shape[1] == heads_local
+    return out.astype(jnp.float32)
 
 
 def _spec_token_slots(

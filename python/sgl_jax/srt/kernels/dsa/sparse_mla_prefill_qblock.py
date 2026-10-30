@@ -127,9 +127,7 @@ def _qblock_kernel(
     kv_hbm,  # flat: [B, T(+RBF), Dk_pad]; paged: 4D pool or [1, Pn*PS, Dk_pad] HBM
     pt_ref,  # [1, 1, 1, PTW]      SMEM  packed page table (paged only)
     o_ref,  # [1, 1, QBHp, Dv]
-    kv_scratch,  # [NBUF, RBF, Dk_pad] VMEM  DMA ring
-    sem,  # DMA semaphores (NBUF,)
-    *,
+    *rest,  # [lse_ref [1, 1, 1, QBHp] when return_lse], kv_scratch, sem
     sm_scale: float,
     Dv: int,
     RB: int,
@@ -137,7 +135,9 @@ def _qblock_kernel(
     paged: bool,
     PS: int,  # page size (paged only; == RB in v1 paged mode)
     PTW: int,
+    return_lse: bool = False,
 ):
+    lse_ref, kv_scratch, sem = rest if return_lse else (None, *rest)
     if kv_hbm.ndim == 4:
         # Paged pool passed in its native word-packed shape. Flattening the
         # HBM ref here (instead of a host-side jnp.reshape) keeps the pool's
@@ -251,6 +251,10 @@ def _qblock_kernel(
     m_i, l_i, acc = jax.lax.fori_loop(0, cnt, unit_body, (m0, l0, acc0))
     out = acc / jnp.where(l_i == 0.0, 1.0, l_i)[:, None]
     o_ref[0, 0] = out.astype(o_ref.dtype)
+    if lse_ref is not None:
+        # log-sum-exp of the row's scaled scores; -inf for rows with no key.
+        lse = jnp.where(l_i > 0.0, m_i + jnp.log(jnp.where(l_i > 0.0, l_i, 1.0)), -jnp.inf)
+        lse_ref[0, 0] = lse.reshape(1, -1)
 
 
 def sparse_mla_attention_qblock(
@@ -271,6 +275,7 @@ def sparse_mla_attention_qblock(
     seq_lens=None,  # [num_seqs] int32       per-request kv length (causal bound)
     cu_kv_lens=None,  # [num_seqs+1] int32    page-aligned kv offsets
     page_indices=None,  # [total_pages] int32 packed physical page ids
+    return_lse: bool = False,
 ):
     """Blocked sparse MLA-latent attention (query-batching kernel).
 
@@ -293,6 +298,10 @@ def sparse_mla_attention_qblock(
     union silently dropped (those keys are never attended), so outputs may
     diverge from :func:`sparse_mla_prefill.sparse_mla_attention`. A one-time
     warning is logged when such a cap is in effect.
+
+    ``return_lse`` also returns the per-(query, head) log-sum-exp of the scaled
+    scores, ``[B, S, H]`` fp32 (-inf where no key is attended), so partial
+    results over disjoint key sets can be merged.
     """
     B, S, H, Dk = q.shape
     K = indices.shape[2]
@@ -398,9 +407,15 @@ def sparse_mla_attention_qblock(
         paged=ragged,
         PS=ps,
         PTW=PTW,
+        return_lse=return_lse,
     )
     smem = pltpu.SMEM
     row_spec = pl.BlockSpec((1, 1, 1, QBHp), lambda b, n: (b, n, 0, 0))
+    out_specs = pl.BlockSpec((1, 1, QBHp, Dv), lambda b, n: (b, n, 0, 0))
+    out_shape = jax.ShapeDtypeStruct((B, nQB, QBHp, Dv), jnp.float32)
+    if return_lse:
+        out_specs = [out_specs, row_spec]
+        out_shape = [out_shape, jax.ShapeDtypeStruct((B, nQB, 1, QBHp), jnp.float32)]
     out = pl.pallas_call(
         kernel,
         grid=(B, nQB),
@@ -415,8 +430,8 @@ def sparse_mla_attention_qblock(
             pl.BlockSpec(memory_space=pltpu.HBM),  # kv (untiled, DMA-gathered)
             pl.BlockSpec((1, 1, 1, PTW), lambda b, n: (b, 0, 0, 0), memory_space=smem),
         ],
-        out_specs=pl.BlockSpec((1, 1, QBHp, Dv), lambda b, n: (b, n, 0, 0)),
-        out_shape=jax.ShapeDtypeStruct((B, nQB, QBHp, Dv), jnp.float32),
+        out_specs=out_specs,
+        out_shape=out_shape,
         scratch_shapes=[
             pltpu.VMEM((_NBUF, RBF, Dk_pad), kv2.dtype),
             pltpu.SemaphoreType.DMA((_NBUF,)),
@@ -424,7 +439,12 @@ def sparse_mla_attention_qblock(
         interpret=interpret,
     )(q4, units4, counts4, pos_rows, kvlen_rows, base_rows, memt, kv2, pt_arg)
 
+    if return_lse:
+        out, lse = out
+        lse = lse[:, :, 0, :QBH].reshape(B, Sp, H)[:, :S]
     out = out[:, :, :QBH, :].reshape(B, Sp, H, Dv)
+    if return_lse:
+        return out[:, :S], lse
     return out[:, :S]
 
 
@@ -447,12 +467,15 @@ def prefill_write_and_attend_ragged_qblock(
     sm_scale: float,
     query_block: int = 256,
     interpret: bool = False,
+    return_lse: bool = False,
 ):
     """Packed-ragged self-write + **blocked** sparse-MLA prefill.
 
     Drop-in replacement for
     :func:`sparse_mla_prefill.prefill_write_and_attend_ragged` (same signature
     plus ``query_block``); only the attend execution shape differs.
+    ``return_lse`` appends the ``[T, H]`` log-sum-exp (see
+    :func:`sparse_mla_attention_qblock`).
     """
     T, H, Dv = ql.shape
     rope = qpe.shape[-1]
@@ -503,7 +526,11 @@ def prefill_write_and_attend_ragged_qblock(
         cu_kv_lens=cu_kv_lens,
         page_indices=page_indices,
         interpret=interpret,
+        return_lse=return_lse,
     )
+    if return_lse:
+        out, lse = out
+        return out.reshape(T, H, Dv), cache_new, lse.reshape(T, H)
     return out.reshape(T, H, Dv), cache_new
 
 
