@@ -19,7 +19,7 @@ from unittest import mock
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.sharding import Mesh, NamedSharding
+from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
@@ -413,6 +413,8 @@ class TestDCPPageOwnership(unittest.TestCase):
         for _ in range(3):
             self.assertIsNotNone(alloc.alloc_extend([0], [page_size], [-1], page_size))
         self.assertEqual(alloc.available_size(), 1 * dcp * page_size)
+        # accounting (leak check, usage) still sees every free page
+        self.assertEqual(alloc.free_size(), 5 * page_size)
         self.assertIsNotNone(alloc.alloc_extend([0], [page_size], [-1], page_size))
         self.assertEqual(alloc.available_size(), 0)
         # Rank 1 still has 4 pages, but a new sequence's page 0 must be on rank 0.

@@ -33,7 +33,14 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return ""
 
     def available_size(self, dp_rank: int = 0) -> int:
-        return (len(self.free_pages[dp_rank]) + len(self.release_pages[dp_rank])) * self.page_size
+        return (
+            len(self.free_pages[dp_rank]) + len(self.release_pages[dp_rank])
+        ) * self.page_size
+
+    def free_size(self, dp_rank: int = 0) -> int:
+        """Free tokens for accounting (leak checks, usage); allocators whose
+        available_size is a conservative allocation bound override this."""
+        return self.available_size(dp_rank)
 
     def get_kvcache(self) -> KVCache:
         return self._kvcache
@@ -118,7 +125,9 @@ class TokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         if free_index.size == 0:
             return
         if self.is_not_in_free_group:
-            self.free_slots[dp_rank] = np.concatenate([self.free_slots[dp_rank], free_index])
+            self.free_slots[dp_rank] = np.concatenate(
+                [self.free_slots[dp_rank], free_index]
+            )
         else:
             self.free_group[dp_rank].append(free_index)
 
@@ -177,11 +186,15 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         # Each rank has independent [1, pages_per_rank] page indices
         self.free_pages = [
-            np.arange(1, self.pages_per_rank + 1, dtype=np.int32) for _ in range(dp_size)
+            np.arange(1, self.pages_per_rank + 1, dtype=np.int32)
+            for _ in range(dp_size)
         ]
         self.release_pages = [np.empty(0, dtype=np.int32) for _ in range(dp_size)]
         self.free_group = [[] for _ in range(dp_size)]
         self.is_not_in_free_group = True
+
+    def free_size(self, dp_rank: int = 0) -> int:
+        return super().available_size(dp_rank)
 
     def available_size(self, dp_rank: int = 0) -> int:
         if self.dcp_size <= 1:
@@ -193,7 +206,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         per_rank = np.bincount((pages - 1) % self.dcp_size, minlength=self.dcp_size)
         return int(per_rank.min()) * self.dcp_size * self.page_size
 
-    def _pop_dcp_pages(self, dp_rank: int, target_ranks: np.ndarray) -> np.ndarray | None:
+    def _pop_dcp_pages(
+        self, dp_rank: int, target_ranks: np.ndarray
+    ) -> np.ndarray | None:
         """Pop one free page per entry of ``target_ranks`` whose DCP owner,
         ``(page - 1) % dcp_size``, equals that entry. Returns None, leaving the
         free list untouched, if any DCP rank is short of pages."""
@@ -234,7 +249,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def alloc(self, need_size: int, dp_rank: int = 0) -> np.ndarray | None:
         """Page-aligned allocation."""
-        assert need_size % self.page_size == 0, "The allocation size should be page-aligned"
+        assert (
+            need_size % self.page_size == 0
+        ), "The allocation size should be page-aligned"
         num_pages = need_size // self.page_size
 
         if self.dcp_size > 1:
@@ -285,8 +302,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             part1_size = min(extend_len, current_page_capacity - pre_len)
 
             if part1_size > 0:
-                part1_indices = np.arange(last_loc + 1, last_loc + 1 + part1_size, dtype=np.int32)
-                out_indices[current_output_idx : current_output_idx + part1_size] = part1_indices
+                part1_indices = np.arange(
+                    last_loc + 1, last_loc + 1 + part1_size, dtype=np.int32
+                )
+                out_indices[current_output_idx : current_output_idx + part1_size] = (
+                    part1_indices
+                )
                 current_output_idx += part1_size
 
             remaining_tokens = extend_len - part1_size
@@ -303,9 +324,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
                     part2_indices = np.arange(
                         page_start, page_start + self.page_size, dtype=np.int32
                     )
-                    out_indices[current_output_idx : current_output_idx + self.page_size] = (
-                        part2_indices
-                    )
+                    out_indices[
+                        current_output_idx : current_output_idx + self.page_size
+                    ] = part2_indices
                     current_output_idx += self.page_size
                     page_idx += 1
 
@@ -313,10 +334,12 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             remaining_tokens -= part2_size
             if remaining_tokens > 0:
                 page_start = allocated_pages[page_idx] * self.page_size
-                part3_indices = np.arange(page_start, page_start + remaining_tokens, dtype=np.int32)
-                out_indices[current_output_idx : current_output_idx + remaining_tokens] = (
-                    part3_indices
+                part3_indices = np.arange(
+                    page_start, page_start + remaining_tokens, dtype=np.int32
                 )
+                out_indices[
+                    current_output_idx : current_output_idx + remaining_tokens
+                ] = part3_indices
                 current_output_idx += remaining_tokens
                 page_idx += 1
 
@@ -356,7 +379,11 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             if allocated_pages is None:
                 return None
             out_indices, _ = self._alloc_extend_impl(
-                allocated_pages, prefix_lens_np, extend_lens, last_loc_np, extend_num_tokens
+                allocated_pages,
+                prefix_lens_np,
+                extend_lens,
+                last_loc_np,
+                extend_num_tokens,
             )
             return out_indices
 
@@ -417,7 +444,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         total_new_pages = np.sum(needs_new_page)
 
         if self.dcp_size > 1 and total_new_pages > 0:
-            target_ranks = (num_pages_before[needs_new_page] % self.dcp_size).astype(np.int32)
+            target_ranks = (num_pages_before[needs_new_page] % self.dcp_size).astype(
+                np.int32
+            )
             allocated_pages = self._pop_dcp_pages(dp_rank, target_ranks)
             if allocated_pages is None:
                 return None
@@ -454,7 +483,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self.free_group[dp_rank].append(free_index)
 
         if self.debug_mode:
-            assert len(np.unique(self.free_pages[dp_rank])) == len(self.free_pages[dp_rank])
+            assert len(np.unique(self.free_pages[dp_rank])) == len(
+                self.free_pages[dp_rank]
+            )
 
     def free_group_begin(self):
         self.is_not_in_free_group = False
@@ -470,7 +501,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def clear(self, dp_rank: int | None = None):
         ranks = range(self.dp_size) if dp_rank is None else [dp_rank]
         for rank in ranks:
-            self.free_pages[rank] = np.arange(1, self.pages_per_rank + 1, dtype=np.int32)
+            self.free_pages[rank] = np.arange(
+                1, self.pages_per_rank + 1, dtype=np.int32
+            )
             self.release_pages[rank] = np.empty(0, dtype=np.int32)
             self.free_group[rank] = []
         self.is_not_in_free_group = True
@@ -573,7 +606,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def debug_print(self) -> str:
         msg = ""
         msg += f"#swa-available-size: {self.swa_attn_allocator.available_size()}, "
-        msg += f"#full-attn-available-size: {self.full_attn_allocator.available_size()}, "
+        msg += (
+            f"#full-attn-available-size: {self.full_attn_allocator.available_size()}, "
+        )
         return msg
 
     def get_kvcache(self):
@@ -637,7 +672,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc: list[int],
         dp_rank: int = 0,
     ) -> np.ndarray | None:
-        full_indices = self.full_attn_allocator.alloc_decode(seq_lens, last_loc, dp_rank=dp_rank)
+        full_indices = self.full_attn_allocator.alloc_decode(
+            seq_lens, last_loc, dp_rank=dp_rank
+        )
         if full_indices is None:
             return None
 
@@ -649,7 +686,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         last_loc_np = np.array(last_loc)
         swa_last_loc = mapping[last_loc_np].astype(np.int32).tolist()
 
-        swa_indices = self.swa_attn_allocator.alloc_decode(seq_lens, swa_last_loc, dp_rank=dp_rank)
+        swa_indices = self.swa_attn_allocator.alloc_decode(
+            seq_lens, swa_last_loc, dp_rank=dp_rank
+        )
         if swa_indices is None:
             self.full_attn_allocator.free(full_indices, dp_rank=dp_rank)
             return None
@@ -676,7 +715,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             unmapped = full_indices[swa_indices == 0]
             if unmapped.size:
                 raise ValueError(
-                    f"Unmapped FULL indices for dp_rank={dp_rank}: " f"{unmapped.tolist()}"
+                    f"Unmapped FULL indices for dp_rank={dp_rank}: "
+                    f"{unmapped.tolist()}"
                 )
         return swa_indices
 
@@ -702,7 +742,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         )
         source_swa_indices = mapping[source_full_indices].copy()
         if np.any(source_swa_indices == 0):
-            raise ValueError("SWA mapping transfer requires fully mapped source FULL slots")
+            raise ValueError(
+                "SWA mapping transfer requires fully mapped source FULL slots"
+            )
         if np.any(mapping[target_full_indices] != 0):
             raise ValueError("SWA mapping transfer requires unmapped target FULL slots")
 
