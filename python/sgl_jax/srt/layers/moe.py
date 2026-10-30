@@ -39,6 +39,17 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
 # top_k / experts_per_device with identical results (no capacity drop). Read at
 # trace time.
 MOE_LOCAL_WINDOW = os.environ.get("SGLANG_JAX_MOE_LOCAL_WINDOW", "0") == "1"
+# All-to-all EPMoE exchange: each shard keeps its slice of the tokens, sends every
+# routed row (int8, per-row scale) to the shard holding its expert, runs the local
+# expert over the received rows and sends the results back (bf16). Replaces the
+# dense exchange (all tokens gathered to every shard, outputs all-reduced). The
+# per-destination capacity is the smallest of a few static buckets that fits the
+# step's largest per-destination count (pmax), so no row is ever dropped.
+# Needs one expert per shard and no expert-tensor split. Read at trace time.
+MOE_A2A = os.environ.get("SGLANG_JAX_MOE_A2A", "0") == "1"
+_MOE_A2A_BUCKETS = (4, 8, 16, 32, 64, 128, 256)
+# Dispatch payload dtype: int8 (per-row scale) or bfloat16 (exact, twice the bytes).
+MOE_A2A_DISPATCH_INT8 = os.environ.get("SGLANG_JAX_MOE_A2A_DTYPE", "int8") == "int8"
 
 
 class EPMoE(nnx.Module):
@@ -525,6 +536,9 @@ class EPMoE(nnx.Module):
         if out_sharding is None:
             out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * hidden_states.ndim)))
 
+        if self._use_a2a(hidden_states.shape[0]):
+            return self._call_a2a(hidden_states, topk_weights, topk_ids, out_sharding)
+
         # Translate the caller's target sharding (on self.mesh: data,tensor)
         # into shard_map out_specs (on self.moe_mesh: expert,tensor). Only
         # 'tensor' is shared between the two meshes; everything else is
@@ -601,6 +615,144 @@ class EPMoE(nnx.Module):
         # the original mesh so downstream ops (residual add, layernorm) see a
         # consistent context.
         return jax.sharding.reshard(result, out_sharding)
+
+    def _use_a2a(self, num_tokens: int) -> bool:
+        return (
+            MOE_A2A
+            and not self.replicate_experts
+            and self.experts_per_device == 1
+            and self.tp_size == 1
+            and self.ep_size > 1
+            and num_tokens % self.ep_size == 0
+        )
+
+    def _call_a2a(self, hidden_states, topk_weights, topk_ids, out_sharding):
+        """All-to-all exchange (see MOE_A2A): tokens stay sharded over the expert axis."""
+        m_local = hidden_states.shape[0] // self.ep_size
+        buckets = tuple(
+            sorted({min(b, m_local * self.num_experts_per_tok) for b in _MOE_A2A_BUCKETS})
+        )
+        buckets = tuple(b for b in buckets if b < m_local) + (m_local,)
+        with jax.sharding.use_abstract_mesh(self.updated_mesh):
+            x = jax.sharding.reshard(hidden_states, P("expert"))
+            w = jax.sharding.reshard(topk_weights, P("expert"))
+            ids = jax.sharding.reshard(topk_ids, P("expert"))
+            w0_scale = self._normalize_scale_for_gmm(
+                self.wi_0_scale.value if self.wi_0_scale is not None else None,
+                self.wi_0.value,
+                scale_name="wi_0_scale",
+            )
+            w1_scale = self._normalize_scale_for_gmm(
+                self.wi_1_scale.value if self.wi_1_scale is not None else None,
+                self.wi_1.value,
+                scale_name="wi_1_scale",
+            )
+            wo_scale = self._normalize_scale_for_gmm(
+                self.wo_scale.value if self.wo_scale is not None else None,
+                self.wo.value,
+                scale_name="wo_scale",
+            )
+            result = shard_map(
+                partial(self._forward_a2a, buckets=buckets),
+                mesh=self.moe_mesh,
+                in_specs=(
+                    P("expert"),
+                    P("expert"),
+                    P("expert"),
+                    P("expert", None, "tensor"),
+                    P("expert", None, "tensor"),
+                    P("expert", "tensor", None),
+                    P("expert", None, None, "tensor"),
+                    P("expert", None, None, "tensor"),
+                    self._get_wo_scale_sharding(wo_scale),
+                ),
+                out_specs=P("expert"),
+                check_vma=False,
+            )(
+                x,
+                w,
+                ids,
+                self.wi_0.value,
+                self.wi_1.value,
+                self.wo.value,
+                w0_scale,
+                w1_scale,
+                wo_scale,
+            )
+        return jax.sharding.reshard(result, out_sharding)
+
+    def _forward_a2a(
+        self, x, weights, topk_ids, w0, w1, wo, w0_scale, w1_scale, wo_scale, *, buckets
+    ):
+        ep = self.ep_size
+        m, hidden = x.shape
+        top_k = self.num_experts_per_tok
+        n = m * top_k
+        dest = jnp.ravel(topk_ids).astype(jnp.int32)  # one expert per shard: expert id == shard
+        token = jnp.arange(n, dtype=jnp.int32) // top_k
+        # slot of each routed row inside its destination's send buffer
+        order = jnp.argsort(dest, stable=True)
+        counts = jnp.bincount(dest, length=ep).astype(jnp.int32)
+        starts = jnp.cumsum(counts) - counts
+        pos = (
+            jnp.zeros(n, jnp.int32)
+            .at[order]
+            .set(jnp.arange(n, dtype=jnp.int32) - starts[dest[order]])
+        )
+        if MOE_A2A_DISPATCH_INT8:
+            x_q, x_scale = quantize_tensor_simple(x, jnp.int8, dim=-1)
+            x_scale = jnp.reshape(x_scale, (m,)).astype(jnp.float32)
+        else:
+            x_q, x_scale = x.astype(self.dtype), jnp.ones((m,), jnp.float32)
+        shard = jax.lax.axis_index("expert").astype(jnp.int32)
+        group_sizes_base = jnp.zeros((self.num_experts,), jnp.int32)
+        flat_w = jnp.ravel(weights).astype(jnp.float32)
+
+        def exchange(cap):
+            def run(_):
+                send = (
+                    jnp.zeros((ep, cap, hidden), x_q.dtype)
+                    .at[dest, pos]
+                    .set(x_q[token], mode="drop")
+                )
+                send_scale = (
+                    jnp.zeros((ep, cap), jnp.float32).at[dest, pos].set(x_scale[token], mode="drop")
+                )
+                recv = jax.lax.all_to_all(send, "expert", 0, 0)
+                recv_scale = jax.lax.all_to_all(send_scale, "expert", 0, 0)
+                rows = (
+                    recv.reshape(ep * cap, hidden).astype(jnp.float32)
+                    * recv_scale.reshape(ep * cap, 1)
+                ).astype(self.dtype)
+                # every received row belongs to this shard's single expert; padding rows
+                # are zero and stay zero through the (bias-free) expert MLP.
+                group_sizes = group_sizes_base.at[shard].set(ep * cap)
+                out = self._gmm_compute(
+                    rows,
+                    jnp.arange(ep * cap, dtype=jnp.int32),
+                    group_sizes,
+                    w0,
+                    w1,
+                    wo,
+                    shard,
+                    w0_scale,
+                    w1_scale,
+                    wo_scale,
+                )
+                back = jax.lax.all_to_all(
+                    out.reshape(ep, cap, hidden).astype(self.dtype), "expert", 0, 0
+                )
+                picked = back[dest, jnp.minimum(pos, cap - 1)].astype(jnp.float32)
+                return jnp.sum((picked * flat_w[:, None]).reshape(m, top_k, hidden), axis=1)
+
+            return run
+
+        cmax = jax.lax.pmax(jnp.max(counts), "expert")
+        index = jnp.sum(jnp.asarray(buckets, jnp.int32) < cmax)
+        out = jax.lax.switch(
+            jnp.minimum(index, len(buckets) - 1), [exchange(b) for b in buckets], None
+        )
+        return out.astype(self.dtype)
 
     def _call_replicated(
         self,
