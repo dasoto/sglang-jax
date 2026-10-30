@@ -47,7 +47,8 @@ MOE_LOCAL_WINDOW = os.environ.get("SGLANG_JAX_MOE_LOCAL_WINDOW", "0") == "1"
 # step's largest per-destination count (pmax), so no row is ever dropped.
 # Needs one expert per shard and no expert-tensor split. Read at trace time.
 MOE_A2A = os.environ.get("SGLANG_JAX_MOE_A2A", "0") == "1"
-_MOE_A2A_BUCKETS = (4, 8, 16, 32, 64, 128, 256)
+# Capacity buckets: each is a lax.switch branch, so keep the list short (compile time).
+_MOE_A2A_BUCKETS = (8, 32, 128)
 # Dispatch payload dtype: int8 (per-row scale) or bfloat16 (exact, twice the bytes).
 MOE_A2A_DISPATCH_INT8 = os.environ.get("SGLANG_JAX_MOE_A2A_DTYPE", "int8") == "int8"
 
@@ -704,8 +705,6 @@ class EPMoE(nnx.Module):
             x_scale = jnp.reshape(x_scale, (m,)).astype(jnp.float32)
         else:
             x_q, x_scale = x.astype(self.dtype), jnp.ones((m,), jnp.float32)
-        shard = jax.lax.axis_index("expert").astype(jnp.int32)
-        group_sizes_base = jnp.zeros((self.num_experts,), jnp.int32)
         flat_w = jnp.ravel(weights).astype(jnp.float32)
 
         def exchange(cap):
@@ -726,19 +725,7 @@ class EPMoE(nnx.Module):
                 ).astype(self.dtype)
                 # every received row belongs to this shard's single expert; padding rows
                 # are zero and stay zero through the (bias-free) expert MLP.
-                group_sizes = group_sizes_base.at[shard].set(ep * cap)
-                out = self._gmm_compute(
-                    rows,
-                    jnp.arange(ep * cap, dtype=jnp.int32),
-                    group_sizes,
-                    w0,
-                    w1,
-                    wo,
-                    shard,
-                    w0_scale,
-                    w1_scale,
-                    wo_scale,
-                )
+                out = self._local_expert_mlp(rows, w0, w1, wo, w0_scale, w1_scale, wo_scale)
                 back = jax.lax.all_to_all(
                     out.reshape(ep, cap, hidden).astype(self.dtype), "expert", 0, 0
                 )
@@ -753,6 +740,35 @@ class EPMoE(nnx.Module):
             jnp.minimum(index, len(buckets) - 1), [exchange(b) for b in buckets], None
         )
         return out.astype(self.dtype)
+
+    def _local_expert_mlp(self, x, w0, w1, wo, w0_scale, w1_scale, wo_scale):
+        """The shard's single expert as dense XLA matmuls (no Pallas GMM, so the
+        all-to-all capacity branches stay cheap to compile). Weights [1, k, n]
+        with optional scales in GMM layout [1, k_blocks, 1, n]."""
+
+        def dequant(w, scale):
+            if scale is None:
+                return w[0].astype(self.dtype)
+            _, k, n = w.shape
+            kb = scale.shape[1]
+            w_f = w[0].astype(jnp.float32).reshape(kb, k // kb, n) * scale[0, :, 0, :][:, None, :]
+            return w_f.reshape(k, n).astype(self.dtype)
+
+        gate = jnp.dot(x, dequant(w0, w0_scale), preferred_element_type=jnp.float32)
+        up = jnp.dot(x, dequant(w1, w1_scale), preferred_element_type=jnp.float32)
+        if self.activation == "silu":
+            h = jax.nn.silu(gate) * up
+        elif self.activation == "gelu":
+            h = jax.nn.gelu(gate) * up
+        elif self.activation == "swigluoai":
+            g = jnp.clip(gate, max=self.swiglu_limit)
+            u = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
+            h = (u + 1.0) * g * jax.nn.sigmoid(g * self.swiglu_alpha)
+        else:
+            raise ValueError(f"Unsupported activation function {self.activation}")
+        return jnp.dot(
+            h.astype(self.dtype), dequant(wo, wo_scale), preferred_element_type=jnp.float32
+        ).astype(self.dtype)
 
     def _call_replicated(
         self,
