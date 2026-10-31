@@ -85,18 +85,14 @@ def _cache_loc(tokens, seq_lens):
 
 
 @functools.partial(jax.jit, static_argnames=("mode",))
-def _attend(
-    backend, kv, idx, out_loc, positions, ql, qpe, kvc, kpe, qi, ki, wi, *, mode
-):
+def _attend(backend, kv, idx, out_loc, positions, ql, qpe, kvc, kpe, qi, ki, wi, *, mode):
     layer = SimpleNamespace(
         layer_id=0,
         scaling=1.0 / np.sqrt(192 + ROPE),
         sliding_window_size=None,
         logit_cap=None,
     )
-    pool = SimpleNamespace(
-        get_fused_kv_buffer=lambda _: kv, get_indexer_key_buffer=lambda _: idx
-    )
+    pool = SimpleNamespace(get_fused_kv_buffer=lambda _: kv, get_indexer_key_buffer=lambda _: idx)
     fb = SimpleNamespace(forward_mode=mode, out_cache_loc=out_loc, positions=positions)
     o, fused = backend(
         ql,
@@ -216,3 +212,33 @@ def test_dsa_dcp4_matches_dcp1():
     o1 = _step(mesh, s1, ForwardMode.EXTEND, seq_lens, new, s1.loc, pos, x)
     o4 = _step(mesh, s4, ForwardMode.EXTEND, seq_lens, new, s4.loc, pos, x)
     _close(o4, o1, "chunked extend")
+
+
+@pytest.mark.parametrize("recall", [0.0, 0.95])
+def test_dcp_merge_topk_exact_and_approx(recall):
+    """Cross-rank top-k merge: exact by default; with DSA_DCP_MERGE_RECALL the
+    approx_max_k pre-selection keeps most of the true top-k."""
+    from sgl_jax.srt.layers.attention.dsa_sparse_backend import _dcp_merge_topk
+
+    mesh = Mesh(np.array(jax.devices()[:4]), ("tensor",))
+    t, k = 8, 2048
+    rng = np.random.default_rng(3)
+    vals = jnp.asarray(rng.standard_normal((t, 4 * k)).astype(np.float32))
+    idx = jnp.asarray(np.arange(4 * k, dtype=np.int32)[None].repeat(t, 0))
+    merge = jax.jit(
+        jax.shard_map(
+            functools.partial(_dcp_merge_topk, k=k, recall=recall),
+            mesh=mesh,
+            in_specs=(P(None, "tensor"), P(None, "tensor")),
+            out_specs=P(None, None),
+            check_vma=False,
+        )
+    )
+    got = np.asarray(merge(vals, idx))
+    want = np.argsort(-np.asarray(vals), axis=1)[:, :k]
+    if recall == 0.0:
+        np.testing.assert_array_equal(np.sort(got, axis=1), np.sort(want, axis=1))
+    else:
+        hits = np.mean([len(set(g) & set(w)) / k for g, w in zip(got, want)])
+        assert hits >= 0.9, hits
+        assert (got >= 0).all()
