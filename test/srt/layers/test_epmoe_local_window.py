@@ -128,3 +128,39 @@ def test_gather_rs_matches_dense_dispatch(monkeypatch, int8, window):
     scale = np.abs(outs[0]).max()
     tol = 2e-2 * scale if int8 else 1e-5
     np.testing.assert_allclose(outs[1], outs[0], rtol=0, atol=tol)
+
+
+def test_gather_rs_with_dp_sharded_output(monkeypatch):
+    """The model passes its DP token layout as out_sharding so the reduce-scatter
+    combine is followed by a gather inside each DP group, not a global all-reduce."""
+    mesh = create_device_mesh(
+        ici_parallelism=[2, 4], dcn_parallelism=[1, 1], devices=jax.devices()[:8]
+    )
+    with jax.set_mesh(mesh):
+        layer = moe.EPMoE(
+            hidden_size=32,
+            num_experts=8,
+            num_experts_per_tok=4,
+            ep_size=8,
+            mesh=mesh,
+            intermediate_dim=16,
+            weight_dtype=jnp.float32,
+            dtype=jnp.float32,
+        )
+    rng = np.random.default_rng(11)
+    ids, w = _route(rng, 64, 8, 4, 1.0)
+    dp = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None))
+    with jax.set_mesh(mesh):
+        x = jax.device_put(
+            jnp.asarray(rng.standard_normal((64, 32)) * 0.1, jnp.float32), dp
+        )
+        wd = jax.device_put(jnp.asarray(w), dp)
+        idd = jax.device_put(jnp.asarray(ids), dp)
+    outs = []
+    for flag in (False, True):
+        monkeypatch.setattr(moe, "MOE_GATHER_RS", flag)
+        with jax.set_mesh(mesh):
+            y = layer(x, wd, idd, out_sharding=jax.typeof(x).sharding)
+        assert y.sharding.spec[0] == "data"
+        outs.append(np.asarray(y))
+    np.testing.assert_allclose(outs[1], outs[0], rtol=0, atol=1e-5)

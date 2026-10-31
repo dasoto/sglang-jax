@@ -14,6 +14,7 @@ from sgl_jax.srt.configs.model_config import ModelConfig, MoEBackend
 from sgl_jax.srt.environ import envs
 from sgl_jax.srt.eplb.expert_location import ExpertLocationMetadata
 from sgl_jax.srt.kernels.fused_mlp import apply_fused_mlp_with_padding
+from sgl_jax.srt.layers import moe as moe_layers
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead, RotaryEmbedding
 from sgl_jax.srt.layers.layernorm import RMSNorm
 from sgl_jax.srt.layers.linear import LinearBase, prepad_replicated_quantized_linears
@@ -956,7 +957,13 @@ class Glm5DecoderLayer(nnx.Module):
                 dispatch_info=dispatch_info,
             )
 
-            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids)
+            moe_kwargs = {}
+            if isinstance(self.mlp, EPMoE) and moe_layers.MOE_GATHER_RS:
+                # Keep the MoE output in the attention's token layout (DP-sharded):
+                # the default fully replicated output turns the reduce-scatter
+                # combine back into an all-reduce over every expert shard.
+                moe_kwargs["out_sharding"] = jax.typeof(hidden_states).sharding
+            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids, **moe_kwargs)
 
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
