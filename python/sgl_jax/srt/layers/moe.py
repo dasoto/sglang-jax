@@ -62,6 +62,15 @@ MOE_A2A_DISPATCH_INT8 = os.environ.get("SGLANG_JAX_MOE_A2A_DTYPE", "int8") == "i
 # a multiple of the expert-shard count. Read at trace time.
 MOE_GATHER_RS = os.environ.get("SGLANG_JAX_MOE_GATHER_RS", "0") == "1"
 MOE_GATHER_INT8 = os.environ.get("SGLANG_JAX_MOE_GATHER_INT8", "0") == "1"
+# Expert-parallel replicas: split the devices into R groups that each hold every
+# expert (ep_size = devices / R) and keep the dense exchange inside a group, so the
+# token all-gather and the combine reduce-scatter span 1/R of the devices and move
+# 1/R of the tokens, for R x the expert weights per device. Replica r holds the
+# r-th contiguous block of devices (whole DP groups), i.e. the r-th block of tokens.
+# The gather/RS exchange is used when the token count is a multiple of the device
+# count; other batches gather all tokens and every replica computes all of them.
+# Read when the layer is built.
+MOE_REPLICAS = int(os.environ.get("SGLANG_JAX_MOE_REPLICAS", "1"))
 
 
 class EPMoE(nnx.Module):
@@ -124,6 +133,7 @@ class EPMoE(nnx.Module):
             getattr(quantization_config, "weight_block_size", None) if quantization_config else None
         )
 
+        self.moe_replicas = 1 if self.replicate_experts else MOE_REPLICAS
         if self.moe_dp_size < 1:
             raise ValueError(f"moe_dp_size must be at least 1, got {self.moe_dp_size}")
         if self.replicate_experts and self.ep_size != 1:
@@ -157,20 +167,44 @@ class EPMoE(nnx.Module):
             wo_sharding = P(None, "tensor", None)
         else:
             world_size = math.prod(self.mesh.shape.values())
-            self.tp_size = world_size // self.ep_size
+            replicas = self.moe_replicas
+            if replicas < 1 or world_size % (self.ep_size * replicas):
+                raise ValueError(
+                    f"SGLANG_JAX_MOE_REPLICAS={replicas} x ep_size={self.ep_size} must divide "
+                    f"the {world_size} devices"
+                )
+            self.tp_size = world_size // (self.ep_size * replicas)
+            if replicas > 1 and self.tp_size != 1:
+                raise ValueError(
+                    f"MoE replicas need ep_size * replicas == devices; got ep_size={self.ep_size}, "
+                    f"replicas={replicas}, devices={world_size}"
+                )
             self.experts_per_device = self.num_experts // self.ep_size
 
             devices = self.mesh.devices.flatten()
-            self.moe_mesh = jax.sharding.Mesh(
-                devices.reshape(self.ep_size, self.tp_size),
-                axis_names=("expert", "tensor"),
-                axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
-            )
-
             abstract_mesh = self.mesh.abstract_mesh
-            self.updated_mesh = abstract_mesh.update(
-                axis_sizes=(self.ep_size, self.tp_size), axis_names=("expert", "tensor")
-            )
+            if replicas > 1:
+                # Weights are sharded over "expert" only, so every replica holds them all.
+                axis_types = (jax.sharding.AxisType.Explicit,) * 3
+                self.moe_mesh = jax.sharding.Mesh(
+                    devices.reshape(replicas, self.ep_size, 1),
+                    axis_names=("replica", "expert", "tensor"),
+                    axis_types=axis_types,
+                )
+                self.updated_mesh = abstract_mesh.update(
+                    axis_sizes=(replicas, self.ep_size, 1),
+                    axis_names=("replica", "expert", "tensor"),
+                    axis_types=axis_types,
+                )
+            else:
+                self.moe_mesh = jax.sharding.Mesh(
+                    devices.reshape(self.ep_size, self.tp_size),
+                    axis_names=("expert", "tensor"),
+                    axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
+                )
+                self.updated_mesh = abstract_mesh.update(
+                    axis_sizes=(self.ep_size, self.tp_size), axis_names=("expert", "tensor")
+                )
             wi_sharding = P("expert", None, "tensor")
             wo_sharding = P("expert", "tensor", None)
 
@@ -562,15 +596,18 @@ class EPMoE(nnx.Module):
             ]
         )
         scatter_on_tensor = "tensor" in out_specs
+        replicas = self.moe_replicas
         gather_rs = (
             MOE_GATHER_RS
             and self.tp_size == 1
             and self.ep_size > 1
-            and hidden_states.shape[0] % self.ep_size == 0
+            and hidden_states.shape[0] % (self.ep_size * replicas) == 0
         )
         gather_int8 = gather_rs and MOE_GATHER_INT8
+        # With replicas each one gathers only its own block of tokens.
+        token_spec = P("replica") if gather_rs and replicas > 1 else P(None)
         if gather_rs:
-            out_specs = P("expert")
+            out_specs = P(("replica", "expert")) if replicas > 1 else P("expert")
             scatter_on_tensor = False
         token_scale = None
         if gather_int8:
@@ -578,11 +615,11 @@ class EPMoE(nnx.Module):
 
         # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
-            hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
-            topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
-            topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
+            hidden_states_reshard = jax.sharding.reshard(hidden_states, token_spec)
+            topk_weights_reshard = jax.sharding.reshard(topk_weights, token_spec)
+            topk_ids_reshard = jax.sharding.reshard(topk_ids, token_spec)
             if token_scale is not None:
-                token_scale = jax.sharding.reshard(token_scale, P(None))
+                token_scale = jax.sharding.reshard(token_scale, token_spec)
 
             # Normalize scales to GMM's 4D layout [E, k_blocks, 1, out_dim]
             w0_scale = self._normalize_scale_for_gmm(
@@ -610,9 +647,9 @@ class EPMoE(nnx.Module):
                 ),
                 mesh=self.moe_mesh,
                 in_specs=(
-                    P(None),
-                    P(None),
-                    P(None),
+                    token_spec,
+                    token_spec,
+                    token_spec,
                     # weights [g, k, n]
                     P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
@@ -626,7 +663,7 @@ class EPMoE(nnx.Module):
                     P("expert", None, "tensor"),
                     P("expert", None, None),
                     # per-token int8 scale of the gathered tokens (or None)
-                    P(None),
+                    token_spec,
                 ),
                 out_specs=out_specs,
                 check_vma=False,
@@ -655,6 +692,7 @@ class EPMoE(nnx.Module):
         return (
             MOE_A2A
             and not self.replicate_experts
+            and self.moe_replicas == 1
             and self.experts_per_device == 1
             and self.tp_size == 1
             and self.ep_size > 1
