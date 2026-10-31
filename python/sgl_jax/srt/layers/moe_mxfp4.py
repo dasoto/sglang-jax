@@ -178,6 +178,13 @@ class MXFP4EPMoE(EPMoE):
             os.environ.get("SGLANG_JAX_MOE_LOCAL_WINDOW_CF", "4.0")
         )
         self.local_window_capacity = None  # fixed window rows (tests); None = derive from load
+        # SGLANG_JAX_MOE_LOCAL_WINDOW_ALIGN=1: each local expert's rows start on a row-tile
+        # boundary of the window, so every GMM visit holds one expert's rows (one visit per
+        # expert with up to tm rows) instead of tm-row tiles straddling group boundaries, each
+        # of which pushes that expert's whole weight through the MXU again for a few rows.
+        self.local_window_align = os.environ.get(
+            "SGLANG_JAX_MOE_LOCAL_WINDOW_ALIGN", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
         # Per-chip accumulator of the local-window path. f32 by default; with
         # SGLANG_JAX_MOE_BF16_ACC=1 it is the activation dtype: a token rarely gets more than
         # one contribution from one chip's experts, the output is cast to bf16 before the
@@ -1006,11 +1013,24 @@ class MXFP4EPMoE(EPMoE):
         # here, so a shard with hundreds of local rows runs them as 16-row matmuls.
         tm_env = os.environ.get("SGLANG_JAX_MOE_LOCAL_WINDOW_TM", "").strip().lower()
         tm, cache = None, None
-        if tm_env == "auto":
+        if self.local_window_align:
+            # Aligned layout: tm rows per visit (default 64, ~1.7x a prefill window's mean rows
+            # per local expert), the window widened by half a tile of padding per expert.
+            tm, cache = (int(tm_env) if tm_env.isdigit() else 64), True
+            unit = math.lcm(tm, 128)  # every window starts on a row-tile boundary
+            cap = -(-(cap + e_l * tm // 2) // unit) * unit
+            pad_sizes = (local_sizes + (tm - 1)) // tm * tm
+            pad_cum = jnp.concatenate(
+                [jnp.zeros((1,), jnp.int32), jnp.cumsum(pad_sizes).astype(jnp.int32)]
+            )
+            span_rows = pad_cum[-1]
+        elif tm_env == "auto":
             # A loaded expert spans several row tiles: keep its decoded weights in VMEM.
             tm, cache = pick_row_tile(cap, e_l, hi=256), True
         elif tm_env.isdigit():
             tm, cache = int(tm_env), True
+        if not self.local_window_align:
+            pad_cum, span_rows = local_cum, local_rows
 
         combine = self.local_combine
         if combine == "onehot" and num_tokens > self.onehot_max_tokens:
@@ -1020,13 +1040,24 @@ class MXFP4EPMoE(EPMoE):
         def window(w, acc):  # acc None: the first window, whose sum is the accumulator
             base = w * cap
             rel = base + jnp.arange(cap, dtype=jnp.int32)
-            valid = rel < local_rows
-            pos = sorted_pos[jnp.clip(start + rel, 0, rows - 1)]  # flat (token, k) slot
+            if self.local_window_align:
+                # Row rel of the padded layout: local expert j, its off-th row (padding past
+                # its rows is masked), i.e. entry local_cum[j] + off of the local order.
+                j = jnp.minimum(
+                    jnp.sum((rel[:, None] >= pad_cum[None, 1:]).astype(jnp.int32), axis=1), e_l - 1
+                )
+                off = rel - pad_cum[j]
+                valid = (rel < span_rows) & (off < local_sizes[j])
+                src = local_cum[j] + off
+            else:
+                valid = rel < local_rows
+                src = rel
+            pos = sorted_pos[jnp.clip(start + src, 0, rows - 1)]  # flat (token, k) slot
             tok = pos // top_k
             x = hidden_states[tok].astype(self.dtype)
-            # Local experts' row counts inside this window; non-local groups stay empty,
-            # so the local rows start at row 0 of x.
-            sizes = jnp.clip(local_cum[1:] - base, 0, cap) - jnp.clip(local_cum[:-1] - base, 0, cap)
+            # Local experts' row counts (padded spans when aligned) inside this window;
+            # non-local groups stay empty, so the local rows start at row 0 of x.
+            sizes = jnp.clip(pad_cum[1:] - base, 0, cap) - jnp.clip(pad_cum[:-1] - base, 0, cap)
             win_group_sizes = jax.lax.dynamic_update_slice_in_dim(
                 no_groups, sizes.astype(jnp.int32), group_offset, 0
             )
@@ -1077,7 +1108,7 @@ class MXFP4EPMoE(EPMoE):
                 )
             return acc.at[tok].add(contrib.astype(acc.dtype))
 
-        n_windows = (local_rows + cap - 1) // cap
+        n_windows = (span_rows + cap - 1) // cap
         # Window 0 runs unconditionally (an empty one contributes zeros): with the one-hot
         # combine its matmul output is the accumulator, without a zero fill and an add of the
         # whole [T, H] (~55 us per MoE layer at T = 2304 on v6e).
