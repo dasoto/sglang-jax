@@ -430,6 +430,50 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         adder.add_chunked_req.assert_not_called()
         self.assertIs(scheduler.chunked_reqs[0], req)
 
+    def test_pending_abort_owner_is_not_counted_when_other_ranks_schedule(self):
+        """A chunked owner held back by a pending abort has no chunk in this batch: its count
+        stays at the one chunk still in flight while another rank's request is scheduled, so
+        that chunk's result finalizes the abort (is_chunked back to 0)."""
+        req = self._make_req("inflight", [1, 2, 3, 4], [10, 11], dp_rank=0)
+        other = self._make_req("other", [5, 6], [], dp_rank=1)
+        scheduler, _ = self._make_scheduler([[req], []], active_reqs=[req, None])
+        scheduler.per_dp_max_running_requests = 64
+        scheduler.tree_cache.supports_recurrent = lambda: False
+        req.is_chunked = 1  # the previous batch's chunk, result not processed yet
+        req.to_finish = FINISH_ABORT()
+        scheduler._pending_chunked_abort_reqs[0] = req
+        req.init_next_round_input = Mock()
+        other.init_next_round_input = Mock()
+        scheduler.waiting_queue = [other]
+        adder = SimpleNamespace(
+            can_run_list={0: [], 1: []},
+            pending_h2d=[],
+            new_chunked_reqs=[None, None],
+            add_chunked_req=Mock(),
+        )
+
+        def add_one_req(r):
+            adder.can_run_list[r.dp_rank].append(r)
+            return AddReqResult.CONTINUE
+
+        adder.add_one_req = Mock(side_effect=add_one_req)
+        scheduler.log_prefill_stats = Mock()
+        for name in ("req_to_token_pool", "model_config", "mesh", "embedding_pool"):
+            setattr(scheduler, name, None)
+        with (
+            patch("sgl_jax.srt.managers.scheduler.PrefillAdder", return_value=adder),
+            patch(
+                "sgl_jax.srt.managers.scheduler.ScheduleBatch.init_new",
+                side_effect=_StopAfterScheduling,
+            ),
+            self.assertRaises(_StopAfterScheduling),
+        ):
+            scheduler.get_new_batch_prefill()
+        adder.add_chunked_req.assert_not_called()
+        self.assertEqual(adder.can_run_list, {0: [], 1: [other]})
+        self.assertEqual(req.is_chunked, 1)
+        self.assertIs(scheduler.chunked_reqs[0], req)
+
     def test_abort_finalizes_when_inflight_overlap_chunk_returns(self):
         req = self._make_req("inflight", [1, 2], [10, 11], return_logprob=True)
         scheduler, _ = self._make_scheduler(req, active_reqs=req)

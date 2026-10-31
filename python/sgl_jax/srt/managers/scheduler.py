@@ -2659,9 +2659,13 @@ class Scheduler(
                 ), f"Chunked request already exists for DP rank {dp_rank} when adding new chunked req"
                 self.chunked_reqs[dp_rank] = adder.new_chunked_reqs[dp_rank]
             # Increment for any chunked req (new OR continuing) to keep
-            # process_batch_result_prefill from sampling on intermediate chunks.
-            if self.chunked_reqs[dp_rank] is not None:
-                self.chunked_reqs[dp_rank].is_chunked += 1
+            # process_batch_result_prefill from sampling on intermediate chunks -- only when
+            # this batch carries one of its chunks: an owner held back this round (pending
+            # abort) has no result coming, and counting one made its abort finalize with a
+            # chunk still in flight (assert in _finalize_chunked_abort) or never.
+            owner = self.chunked_reqs[dp_rank]
+            if owner is not None and any(r is owner for r in adder.can_run_list.get(dp_rank, ())):
+                owner.is_chunked += 1
 
         self.log_prefill_stats(adder, all_can_run_reqs, running_bs)
 
