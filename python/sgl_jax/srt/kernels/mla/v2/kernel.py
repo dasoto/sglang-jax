@@ -51,6 +51,18 @@ def _vector_dcp_mask() -> bool:
     )
 
 
+# P @ V with the softmax weights in the KV dtype (SGLANG_JAX_MLA_BF16_PV=1; read when the kernel is
+# traced), as flash attention usually does: an f32 P against bf16 V promotes the matmul to f32,
+# which the MXU runs as several bf16 passes. The accumulation and the row sums stay f32.
+def _bf16_pv() -> bool:
+    return os.environ.get("SGLANG_JAX_MLA_BF16_PV", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 def cdiv_on_kv_packing(a, kv_packing):
     assert kv_packing == 1 or kv_packing == 2 or kv_packing == 4
     exponent = int(math.log2(kv_packing))
@@ -518,7 +530,8 @@ def _mla_ragged_paged_attention_kernel(
         if page_seq_positions_ref is not None:
             p = jnp.where(mask, 0.0, p)
 
-        pv = jnp.einsum("bnm,bmd->bnd", p, kv_c, preferred_element_type=jnp.float32)
+        p_mm = p.astype(kv_c.dtype) if _bf16_pv() and kv_c.dtype != jnp.float32 else p
+        pv = jnp.einsum("bnm,bmd->bnd", p_mm, kv_c, preferred_element_type=jnp.float32)
         if v_scale is not None:
             pv *= v_scale
 

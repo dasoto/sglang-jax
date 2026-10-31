@@ -1192,7 +1192,9 @@ if __name__ == "__main__":
     unittest.main()
 
 
-def _dcp_rank_inputs(lens, *, page_size, num_heads, kv_lora_rank, qk_rope_dim, dcp, rank, seed):
+def _dcp_rank_inputs(
+    lens, *, page_size, num_heads, kv_lora_rank, qk_rope_dim, dcp, rank, seed, dtype=jnp.float32
+):
     """One DCP rank's view: every dcp-th page of each sequence (positions page * page_size),
     local KV lengths and page tables, the global lengths, and a random cache holding them."""
     rng = np.random.default_rng(seed)
@@ -1206,15 +1208,18 @@ def _dcp_rank_inputs(lens, *, page_size, num_heads, kv_lora_rank, qk_rope_dim, d
         local_lens.append(sum(min(page_size, kv_len - m * page_size) for m in pages))
         positions.extend(m * page_size for m in pages)
     total_pages = sum(local_pages) + 2
-    cache_kv = rng.standard_normal((total_pages, page_size, 1, nope_dim + rope_dim)) * 0.25
+    packing = kmod.get_dtype_packing(dtype)
+    cache_kv = (
+        rng.standard_normal((total_pages, page_size // packing, packing, nope_dim + rope_dim))
+        * 0.25
+    )
     cache_kv[..., nope_dim + qk_rope_dim :] = 0
-    f32 = jnp.float32
     return (
-        jnp.asarray(rng.standard_normal((total_q, num_heads, kv_lora_rank)) * 0.25, f32),
-        jnp.asarray(rng.standard_normal((total_q, num_heads, qk_rope_dim)) * 0.25, f32),
-        jnp.zeros((total_q, kv_lora_rank), f32),  # DCP: the backend writes new KV itself
-        jnp.zeros((total_q, qk_rope_dim), f32),
-        jnp.asarray(cache_kv, f32),
+        jnp.asarray(rng.standard_normal((total_q, num_heads, kv_lora_rank)) * 0.25, dtype),
+        jnp.asarray(rng.standard_normal((total_q, num_heads, qk_rope_dim)) * 0.25, dtype),
+        jnp.zeros((total_q, kv_lora_rank), dtype),  # DCP: the backend writes new KV itself
+        jnp.zeros((total_q, qk_rope_dim), dtype),
+        jnp.asarray(cache_kv, dtype),
         jnp.asarray(local_lens, jnp.int32),
         jnp.arange(sum(local_pages), dtype=jnp.int32),
         jnp.asarray(np.r_[0, np.cumsum(q_lens)], jnp.int32),
@@ -1266,3 +1271,39 @@ class TestMLAV2DcpMixedMask(unittest.TestCase):
                 np.testing.assert_allclose(
                     out[:total_q], np.asarray(ref)[:total_q], rtol=1e-4, atol=1e-5
                 )
+
+    def test_bf16_pv_kernel_body_close_to_cpu_path(self):
+        """SGLANG_JAX_MLA_BF16_PV: bf16 KV, softmax weights rounded to bf16 for P @ V (f32
+        accumulation); outputs within bf16 rounding of the CPU path."""
+        lens = [(8, 37), (5, 21), (12, 28), (3, 50)]
+        common = dict(
+            sm_scale=0.1,
+            num_kv_pages_per_block=(2, 1, 2),
+            num_queries_per_block=(1, 1, 4),
+            decode_batch_size=1,
+        )
+        env = {"SGLANG_JAX_MLA_VECTOR_DCP_MASK": "1", "SGLANG_JAX_MLA_BF16_PV": "1"}
+        for rank in (0, 1):
+            with self.subTest(rank=rank), mock.patch.dict(os.environ, env):
+                args, dcp_kw = _dcp_rank_inputs(
+                    lens,
+                    page_size=16,
+                    num_heads=6,
+                    kv_lora_rank=128,
+                    qk_rope_dim=64,
+                    dcp=2,
+                    rank=rank,
+                    seed=rank + 7,
+                    dtype=jnp.bfloat16,
+                )
+                cache = np.asarray(args[4])
+                with mock.patch.object(jax, "default_backend", return_value="tpu"):
+                    out, _, _, _ = run_v2_kernel_with_capture(*args, **dcp_kw, **common)
+                args = args[:4] + (jnp.asarray(cache),) + args[5:]
+                ref, _ = kmod.mla_ragged_paged_attention(*args, **dcp_kw, **common)
+                total_q = sum(q for q, _ in lens)
+                out = np.asarray(out[:total_q], np.float32)
+                ref = np.asarray(ref, np.float32)[:total_q]
+                scale = float(np.abs(ref).max())
+                np.testing.assert_allclose(out, ref, rtol=0, atol=2e-2 * scale)
+                self.assertLess(float(np.abs(out - ref).mean()), 5e-3 * float(np.abs(ref).mean()))
