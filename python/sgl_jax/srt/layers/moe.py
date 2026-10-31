@@ -39,6 +39,13 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
 # top_k / experts_per_device with identical results (no capacity drop). Read at
 # trace time.
 MOE_LOCAL_WINDOW = os.environ.get("SGLANG_JAX_MOE_LOCAL_WINDOW", "0") == "1"
+# Small local window: when a shard's routed rows fit in CF x their expected count
+# (rounded up to 256), gather only that many rows and add them into token order
+# with one scatter, instead of gathering every (token, local slot) from the full
+# window. A shard whose experts got more rows takes the full window, so no row is
+# ever dropped. 0 disables it. Read at trace time.
+MOE_WINDOW_CF = float(os.environ.get("SGLANG_JAX_MOE_WINDOW_CF", "0"))
+_SMALL_WINDOW_ALIGN = 256
 # All-to-all EPMoE exchange: each shard keeps its slice of the tokens, sends every
 # routed row (int8, per-row scale) to the shard holding its expert, runs the local
 # expert over the received rows and sends the results back (bf16). Replaces the
@@ -964,31 +971,48 @@ class EPMoE(nnx.Module):
             n_local = csum[group_offset + self.experts_per_device - 1] - start
             window = (start.astype(jnp.int32), n_local.astype(jnp.int32), cap)
 
-        intermediate_output = self._gmm_compute(
-            inputs_2d,
-            token_indices,
-            group_sizes,
-            w0_weights,
-            w1_weights,
-            wo_weights,
-            group_offset,
-            w0_kernel_scale,
-            w1_kernel_scale,
-            wo_kernel_scale,
-            w0_kernel_bias,
-            w1_kernel_bias,
-            wo_kernel_bias,
-            local_range=local_range,
-            window=window,
-        )
+        def compute(win, scatter_combine=False):
+            intermediate_output = self._gmm_compute(
+                inputs_2d,
+                token_indices,
+                group_sizes,
+                w0_weights,
+                w1_weights,
+                wo_weights,
+                group_offset,
+                w0_kernel_scale,
+                w1_kernel_scale,
+                wo_kernel_scale,
+                w0_kernel_bias,
+                w1_kernel_bias,
+                wo_kernel_bias,
+                local_range=local_range,
+                window=win,
+            )
+            if scatter_combine:
+                return self._combine_window_rows(
+                    intermediate_output, sorted_selected_experts, topk_weights, win
+                )
+            return self._unpermute(
+                intermediate_output,
+                sorted_selected_experts,
+                topk_weights,
+                valid_mask=valid_mask,
+                window=win,
+            )
 
-        output = self._unpermute(
-            intermediate_output,
-            sorted_selected_experts,
-            topk_weights,
-            valid_mask=valid_mask,
-            window=window,
+        small_cap = (
+            self._small_window_cap(hidden_states.shape[0], cap) if window is not None else None
         )
+        if small_cap is not None:
+            start, n_local, _ = window
+            output = jax.lax.cond(
+                n_local <= small_cap,
+                lambda: compute((start, n_local, small_cap), scatter_combine=True),
+                lambda: compute(window),
+            )
+        else:
+            output = compute(window)
 
         # Reduce on the "tensor" axis. RS (psum_scatter) when caller asked
         # for SP layout on the token dim, AR (psum) otherwise. The matching
@@ -1007,6 +1031,34 @@ class EPMoE(nnx.Module):
                 output = self._combine(output)
 
         return output
+
+    def _small_window_cap(self, num_tokens: int, cap: int) -> int | None:
+        """Rows of the small local window (SGLANG_JAX_MOE_WINDOW_CF), or None."""
+        if MOE_WINDOW_CF <= 0:
+            return None
+        expected = (
+            num_tokens * self.num_experts_per_tok * self.experts_per_device / self.num_experts
+        )
+        align = _SMALL_WINDOW_ALIGN
+        small = max(align, int(math.ceil(MOE_WINDOW_CF * expected / align)) * align)
+        return small if small < cap else None
+
+    def _combine_window_rows(self, intermediate, sorted_selected_experts, weights, window):
+        """Weighted scatter-add of the window's local rows into token order.
+
+        Row i of the window is sorted position start + i, i.e. flat routing slot
+        sorted_selected_experts[start + i]; rows past n_local belong to other shards.
+        """
+        start, n_local, cap = window
+        num_tokens, top_k = weights.shape
+        i = jnp.arange(cap, dtype=jnp.int32)
+        flat = sorted_selected_experts[jnp.minimum(start + i, num_tokens * top_k - 1)]
+        valid = i < n_local
+        tokens = jnp.where(valid, flat // top_k, num_tokens)
+        w = jnp.where(valid, jnp.ravel(weights)[flat].astype(jnp.float32), 0.0)
+        contrib = intermediate.astype(jnp.float32) * w[:, None]
+        out = jnp.zeros((num_tokens, intermediate.shape[1]), jnp.float32)
+        return out.at[tokens].add(contrib, mode="drop").astype(self.dtype)
 
     def _combine_replicas(self, output, *, tokens_split: bool):
         """Combine with replicas.
@@ -1196,7 +1248,14 @@ class EPMoE(nnx.Module):
         # avoiding a full [M*top_k, D] materialization in _permute.
         token_indices = sorted_selected_experts // self.num_experts_per_tok
 
-        group_sizes = jnp.bincount(flatten_selected_experts, length=self.num_experts)
+        # Compare-and-sum rather than bincount: bincount lowers to a scatter-add that
+        # serializes on the 256 bins (0.6 ms per MoE layer at 64K routed slots on v5e).
+        group_sizes = jnp.sum(
+            flatten_selected_experts[:, None]
+            == jnp.arange(self.num_experts, dtype=flatten_selected_experts.dtype)[None, :],
+            axis=0,
+            dtype=jnp.int32,
+        )
 
         return (
             inputs,

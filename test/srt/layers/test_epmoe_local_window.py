@@ -233,3 +233,61 @@ def test_replicas_reject_bad_layout(monkeypatch):
             weight_dtype=jnp.float32,
             dtype=jnp.float32,
         )
+
+
+@pytest.mark.parametrize("skew", [0.0, 4.0])
+@pytest.mark.parametrize("replicas", [1, 2])
+def test_small_window_matches_full_window(monkeypatch, skew, replicas):
+    """SGLANG_JAX_MOE_WINDOW_CF: shards whose rows fit the small window use the
+    scatter combine, overloaded shards (skew) fall back to the full window; the
+    result matches the full window either way."""
+    mesh = create_device_mesh(
+        ici_parallelism=[2, 4], dcn_parallelism=[1, 1], devices=jax.devices()[:8]
+    )
+    monkeypatch.setattr(moe, "MOE_LOCAL_WINDOW", True)
+    monkeypatch.setattr(moe, "MOE_GATHER_RS", True)
+    monkeypatch.setattr(moe, "MOE_REPLICAS", replicas)
+    monkeypatch.setattr(moe, "_SMALL_WINDOW_ALIGN", 16)
+    ep = 8 // replicas
+    with jax.set_mesh(mesh):
+        layer = moe.EPMoE(
+            hidden_size=32,
+            num_experts=8,
+            num_experts_per_tok=4,
+            ep_size=ep,
+            mesh=mesh,
+            intermediate_dim=16,
+            weight_dtype=jnp.float32,
+            dtype=jnp.float32,
+        )
+    m = 256
+    rng = np.random.default_rng(23)
+    ids, w = _route(rng, m, 8, 4, skew)
+    x = jnp.asarray(rng.standard_normal((m, 32)) * 0.1, jnp.float32)
+    outs = []
+    for cf in (0.0, 1.25):
+        monkeypatch.setattr(moe, "MOE_WINDOW_CF", cf)
+        with jax.set_mesh(mesh):
+            outs.append(np.asarray(layer(x, jnp.asarray(w), jnp.asarray(ids))))
+    assert np.abs(outs[0]).max() > 0
+    np.testing.assert_allclose(outs[1], outs[0], rtol=1e-5, atol=1e-5)
+
+
+def test_group_sizes_match_bincount():
+    mesh = create_device_mesh(
+        ici_parallelism=[1, 8], dcn_parallelism=[1, 1], devices=jax.devices()[:8]
+    )
+    with jax.set_mesh(mesh):
+        layer = moe.EPMoE(
+            hidden_size=32,
+            num_experts=8,
+            num_experts_per_tok=4,
+            ep_size=8,
+            mesh=mesh,
+            intermediate_dim=16,
+            weight_dtype=jnp.float32,
+            dtype=jnp.float32,
+        )
+    ids, _ = _route(np.random.default_rng(5), 37, 8, 4, 2.0)
+    _, _, _, group_sizes = layer._permute(jnp.zeros((37, 32), jnp.float32), jnp.asarray(ids))
+    np.testing.assert_array_equal(np.asarray(group_sizes), np.bincount(ids.ravel(), minlength=8))
