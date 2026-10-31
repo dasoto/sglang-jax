@@ -167,12 +167,14 @@ def test_gather_rs_with_dp_sharded_output(monkeypatch):
 @pytest.mark.parametrize("m", [64, 60])
 @pytest.mark.parametrize("window", [False, True])
 @pytest.mark.parametrize("int8", [False, True])
-def test_replicas_match_single_expert_group(monkeypatch, m, window, int8):
+@pytest.mark.parametrize("dp", [2, 4])
+def test_replicas_match_single_expert_group(monkeypatch, m, window, int8, dp):
     """SGLANG_JAX_MOE_REPLICAS=2 (EP4 x 2, each replica holding all 8 experts and
     exchanging only its own half of the tokens) matches EP8 on the DP token layout.
-    m=60 is not a multiple of the device count: every replica computes all tokens."""
+    m=60 is not a multiple of the device count: every replica computes all tokens.
+    dp=4 splits the data axis between replica and expert, as on the TPU slice."""
     mesh = create_device_mesh(
-        ici_parallelism=[2, 4], dcn_parallelism=[1, 1], devices=jax.devices()[:8]
+        ici_parallelism=[dp, 8 // dp], dcn_parallelism=[1, 1], devices=jax.devices()[:8]
     )
     monkeypatch.setattr(moe, "MOE_LOCAL_WINDOW", window)
     monkeypatch.setattr(moe, "MOE_GATHER_RS", True)

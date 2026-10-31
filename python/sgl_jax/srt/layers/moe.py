@@ -1019,16 +1019,26 @@ class EPMoE(nnx.Module):
         """
         replicas = self.moe_replicas
         r = jax.lax.axis_index("replica")
+        # The reductions list "expert" before "replica": in the slice mesh "replica"
+        # is the leading factor of "data" and "expert" the rest of it (plus the
+        # other axes), and XLA rejects a replica group that names two adjacent
+        # factors of one axis in order ("Adjacent axes ... can be merged").
         if tokens_split:
-            rows = output.shape[0]
-            full = jnp.zeros((rows * replicas, output.shape[1]), output.dtype)
+            rows, dim = output.shape
+            full = jnp.zeros((rows * replicas, dim), output.dtype)
             full = jax.lax.dynamic_update_slice_in_dim(full, output, r * rows, axis=0)
+            # Reorder the token blocks from (replica, expert) to (expert, replica)
+            # major so that device (r, e) still receives block (r, e).
+            blocks = full.reshape(replicas, self.ep_size, -1, dim).transpose(1, 0, 2, 3)
             return jax.lax.psum_scatter(
-                full, ("replica", "expert"), scatter_dimension=0, tiled=True
+                blocks.reshape(rows * replicas, dim),
+                ("expert", "replica"),
+                scatter_dimension=0,
+                tiled=True,
             )
         owner = (jnp.arange(output.shape[0]) * replicas) // output.shape[0]
         output = jnp.where((owner == r)[:, None], output, jnp.zeros_like(output))
-        return jax.lax.psum(output, ("replica", "expert"))
+        return jax.lax.psum(output, ("expert", "replica"))
 
     def _gmm_compute(
         self,
