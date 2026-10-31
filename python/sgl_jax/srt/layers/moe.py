@@ -1009,33 +1009,23 @@ class EPMoE(nnx.Module):
         return output
 
     def _combine_replicas(self, output, *, tokens_split: bool):
-        """Combine with replicas through a reduction over every device.
+        """Combine with replicas.
 
-        On v5e a reduction over a replica's device subgroup runs far slower than
-        the same reduction over the whole slice, so each replica zero-fills the
-        rows of the tokens the other replicas own and the sum spans all devices.
-        ``tokens_split``: this replica holds only its own block of tokens (the
-        gather/RS path), else every replica computed all tokens.
+        ``tokens_split`` (the gather/RS path, large batches): this replica holds only
+        its own block of tokens, and a reduce-scatter inside the replica returns each
+        device its rows, moving 1/R of the bytes of a full-slice combine. Otherwise
+        every replica computed all tokens; small (decode) batches are latency-bound,
+        and on v5e a small all-reduce over a replica's device subgroup is far slower
+        than over the whole slice, so each replica zero-fills the rows of the tokens
+        other replicas own and the sum spans all devices. The axes are named as
+        (expert, replica): in the slice mesh "replica" is the leading factor of
+        "data" and "expert" the rest of it, and XLA rejects a replica group that
+        names two adjacent factors of one axis in order.
         """
+        if tokens_split:
+            return jax.lax.psum_scatter(output, "expert", scatter_dimension=0, tiled=True)
         replicas = self.moe_replicas
         r = jax.lax.axis_index("replica")
-        # The reductions list "expert" before "replica": in the slice mesh "replica"
-        # is the leading factor of "data" and "expert" the rest of it (plus the
-        # other axes), and XLA rejects a replica group that names two adjacent
-        # factors of one axis in order ("Adjacent axes ... can be merged").
-        if tokens_split:
-            rows, dim = output.shape
-            full = jnp.zeros((rows * replicas, dim), output.dtype)
-            full = jax.lax.dynamic_update_slice_in_dim(full, output, r * rows, axis=0)
-            # Reorder the token blocks from (replica, expert) to (expert, replica)
-            # major so that device (r, e) still receives block (r, e).
-            blocks = full.reshape(replicas, self.ep_size, -1, dim).transpose(1, 0, 2, 3)
-            return jax.lax.psum_scatter(
-                blocks.reshape(rows * replicas, dim),
-                ("expert", "replica"),
-                scatter_dimension=0,
-                tiled=True,
-            )
         owner = (jnp.arange(output.shape[0]) * replicas) // output.shape[0]
         output = jnp.where((owner == r)[:, None], output, jnp.zeros_like(output))
         return jax.lax.psum(output, ("expert", "replica"))
