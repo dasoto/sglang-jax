@@ -28,7 +28,6 @@ from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, get_disagg_transp
 from sgl_jax.srt.mem_cache.memory_pool import (
     write_all_mla_kv_layers,
     write_kv_layer,
-    write_mla_kv_layer,
 )
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
@@ -871,6 +870,8 @@ class SchedulerDisaggregationDecodeMixin:
             _local_scalar_int32_spec,
             _mla_kv_transfer_shardings,
             _pad_to_page_bucket,
+            _pd_indexer_buffers,
+            _pd_sends_first_token,
             local_kv_spec_for_pool,
             local_spec_for_global,
         )
@@ -897,26 +898,51 @@ class SchedulerDisaggregationDecodeMixin:
                 for _ in range(kv_pool.layer_num)
             ]
 
-        rpool = getattr(getattr(self, "req_to_token_pool", None), "recurrent_state_pool", None)
-        if not isinstance(rpool, RecurrentStatePool):
+        # Every key must match P's ``_build_prefill_payload``.
+        extra: dict[str, object] = {}
+        idx_bufs = _pd_indexer_buffers(kv_pool)
+        if idx_bufs:
+            if jax.process_count() > 1:
+                extra["idx"] = local_kv_spec_for_pool(
+                    kv_pool, len(idx_bufs), padded_pages, buffers=idx_bufs
+                )
+            else:
+                idx_tail = idx_bufs[0].shape[1:]
+                idx_sharding, _ = _mla_kv_transfer_shardings(kv_pool, padded_pages, idx_tail)
+                extra["idx"] = [
+                    jax.ShapeDtypeStruct(
+                        (padded_pages, *idx_tail),
+                        idx_bufs[0].dtype,
+                        sharding=idx_sharding,
+                    )
+                    for _ in idx_bufs
+                ]
+        req_to_token_pool = getattr(self, "req_to_token_pool", None)
+        rpool = getattr(req_to_token_pool, "recurrent_state_pool", None)
+        if isinstance(rpool, RecurrentStatePool):
+            t_spec, c_spec = rpool.slot_transfer_specs()
+            if jax.process_count() > 1:
+                extra["kda_temporal"] = local_spec_for_global(
+                    t_spec.shape, t_spec.dtype, t_spec.sharding
+                )
+                extra["kda_conv"] = local_spec_for_global(
+                    c_spec.shape, c_spec.dtype, c_spec.sharding
+                )
+            else:
+                extra["kda_temporal"] = t_spec
+                extra["kda_conv"] = c_spec
+        if _pd_sends_first_token(kv_pool, req_to_token_pool):
+            if jax.process_count() > 1:
+                extra["first_token"] = _local_scalar_int32_spec()
+            else:
+                extra["first_token"] = jax.ShapeDtypeStruct(
+                    (1,),
+                    jnp.int32,
+                    sharding=NamedSharding(kv_pool.mesh, PartitionSpec(None)),
+                )
+        if not extra:
             return kv_spec
-
-        t_spec, c_spec = rpool.slot_transfer_specs()
-        if jax.process_count() > 1:
-            return {
-                "kv": kv_spec,
-                "kda_temporal": local_spec_for_global(t_spec.shape, t_spec.dtype, t_spec.sharding),
-                "kda_conv": local_spec_for_global(c_spec.shape, c_spec.dtype, c_spec.sharding),
-                "first_token": _local_scalar_int32_spec(),
-            }
-        return {
-            "kv": kv_spec,
-            "kda_temporal": t_spec,
-            "kda_conv": c_spec,
-            "first_token": jax.ShapeDtypeStruct(
-                (1,), jnp.int32, sharding=NamedSharding(rpool.mesh, PartitionSpec(None))
-            ),
-        }
+        return {"kv": kv_spec, **extra}
 
     def _install_received_kv(self: Scheduler, req: Req, kv_indices, kv) -> None:
         if isinstance(kv, dict):
@@ -925,15 +951,16 @@ class SchedulerDisaggregationDecodeMixin:
             self._maybe_log_decode_pull_debug(req, kv_arr)
             self._write_kv_to_pool(req, kv_indices, kv_arr)
             self._record_decode_transfer_bytes(kv_arr)
+            if "idx" in payload:
+                self._write_kv_to_pool(req, kv_indices, payload["idx"], indexer=True)
+                self._record_decode_transfer_bytes(payload["idx"])
             if "kda_temporal" in payload and "kda_conv" in payload:
                 self._install_received_recurrent_state(
                     req, payload["kda_temporal"], payload["kda_conv"]
                 )
             if "first_token" in payload:
                 first_tok_arr = payload["first_token"]
-                req._pd_first_token_id = int(
-                    np.asarray(first_tok_arr.addressable_data(0)).flat[0]
-                )
+                req._pd_first_token_id = int(np.asarray(first_tok_arr.addressable_data(0)).flat[0])
             return
 
         self._maybe_log_decode_pull_debug(req, kv)
@@ -986,8 +1013,13 @@ class SchedulerDisaggregationDecodeMixin:
             PD_TRANSFER_BYTES_TOTAL.labels(direction="h2d", role="decode").inc(total)
         self._maybe_verify_direct_receive_debug(req, kv_indices, expected_debug)
 
-    def _write_kv_to_pool(self: Scheduler, req: Req, kv_indices, kv: jax.Array) -> None:
-        """Write pulled KV into the local paged pool (in place)."""
+    def _write_kv_to_pool(
+        self: Scheduler, req: Req, kv_indices, kv: jax.Array, *, indexer: bool = False
+    ) -> None:
+        """Write pulled KV into the local paged pool (in place).
+
+        ``indexer`` writes the DSA indexer-key buffers instead of the latent KV.
+        """
 
         if kv_indices is None:
             raise RuntimeError(
@@ -996,11 +1028,13 @@ class SchedulerDisaggregationDecodeMixin:
             )
 
         from sgl_jax.srt.disaggregation.prefill import (
+            _MLA_KV_CHUNK_LAYERS,
             _globalize_rank_local_page_ids,
             _is_mla_kv_pool,
             _local_to_global_shard,
             _mla_kv_transfer_shardings,
             _pad_to_page_bucket,
+            _pd_indexer_buffers,
         )
 
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
@@ -1008,21 +1042,28 @@ class SchedulerDisaggregationDecodeMixin:
         seqlen = len(req.origin_input_ids)
         num_pages = (seqlen + page_size - 1) // page_size
         is_mla = _is_mla_kv_pool(kv_pool)
+        if indexer:
+            # The pool's own list: the forward reads it on the next step.
+            target_buffers = getattr(kv_pool, "full_kv_pool", kv_pool).indexer_key_buffer
+            if not _pd_indexer_buffers(kv_pool):
+                raise RuntimeError("received DSA indexer keys but the pool has none")
+        else:
+            target_buffers = kv_pool.kv_buffer
         if jax.process_count() > 1 and isinstance(kv, jax.Array) and kv.is_fully_addressable:
             # Pulled KV is this host's local shard on a 1-D local mesh.
             # Assemble it into the global pool sharding.
-            per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
+            per_layer_tail = target_buffers[0].shape[1:]
             if is_mla:
                 padded_pages = _pad_to_page_bucket(
                     num_pages, min_pages=int(getattr(kv_pool, "dp_size", 1))
                 )
-                _, gsh = _mla_kv_transfer_shardings(kv_pool, padded_pages)
+                _, gsh = _mla_kv_transfer_shardings(kv_pool, padded_pages, per_layer_tail)
             else:
                 padded_pages = kv.shape[1]
                 pool_pspec = kv_pool.kv_sharding.spec
                 stacked_spec = PartitionSpec(None, None, *pool_pspec[1:])
                 gsh = NamedSharding(kv_pool.mesh, stacked_spec)
-            gshape = (kv_pool.layer_num, padded_pages) + per_layer_tail
+            gshape = (len(target_buffers), padded_pages) + per_layer_tail
             kv = _local_to_global_shard(kv, gshape, gsh)
 
         kv_indices_np = (
@@ -1041,19 +1082,21 @@ class SchedulerDisaggregationDecodeMixin:
                 dcp_size=int(getattr(kv_pool, "dcp_size", 1)),
             )
             if padded_pages > num_pages:
-                pad = np.full(
-                    padded_pages - num_pages, total_pages, dtype=dst_global_ids.dtype
-                )
+                pad = np.full(padded_pages - num_pages, total_pages, dtype=dst_global_ids.dtype)
                 dst_global_ids = np.concatenate([dst_global_ids, pad])
             dst_indices = jax.device_put(
                 jnp.asarray(dst_global_ids, dtype=jnp.int32),
                 NamedSharding(kv_pool.mesh, PartitionSpec(None)),
             )
-            kv_pool.kv_buffer[:] = write_all_mla_kv_layers(
-                kv,
-                dst_indices,
-                list(kv_pool.kv_buffer),
-            )
+            # Chunk the layers: each scatter block all-gathers every chunk layer.
+            n_layers = len(target_buffers)
+            for start in range(0, n_layers, _MLA_KV_CHUNK_LAYERS):
+                end = min(n_layers, start + _MLA_KV_CHUNK_LAYERS)
+                target_buffers[start:end] = write_all_mla_kv_layers(
+                    kv[start:end],
+                    dst_indices,
+                    list(target_buffers[start:end]),
+                )
             return
         # page_ids_padded is only consumed by the debug verifier below, which is
         # a no-op unless SGL_JAX_PD_DEBUG_KV is set. The write itself is

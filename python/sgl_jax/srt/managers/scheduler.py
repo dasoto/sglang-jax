@@ -2753,7 +2753,7 @@ class Scheduler(
                     )
                 elif self.dp_size > 1:
                     # In multi-host DP, next_token_ids may span non-addressable
-                    # devices.  Replicate via cached JIT gather so device_get can proceed.
+                    # devices.  Replicate first so device_get can proceed.
                     from jax.experimental.multihost_utils import process_allgather
 
                     next_token_ids_device = process_allgather(

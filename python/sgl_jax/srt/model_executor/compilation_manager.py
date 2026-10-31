@@ -81,7 +81,11 @@ class CompilationPool:
                     compiled = CompilationManager.get_executable(lowered, compiler_options=options)
                 else:
                     future = self._executor.submit(
-                        copy_context().run, self._compile, lowered, options, jax.sharding.get_mesh()
+                        copy_context().run,
+                        self._compile,
+                        lowered,
+                        options,
+                        jax.sharding.get_mesh(),
                     )
                     self._pending.append((item, lowered, future))
             if self._executor is None:
@@ -232,7 +236,7 @@ class CompilationManager:
             else None
         )
         return [
-            min(bs * pages_per_req, pool_aligned) if pool_aligned else bs * pages_per_req
+            (min(bs * pages_per_req, pool_aligned) if pool_aligned else bs * pages_per_req)
             for bs in self.bs_buckets
         ]
 
@@ -250,7 +254,11 @@ class CompilationManager:
         manifest = json.loads(path.read_text())
         if manifest["status"] != "complete":
             raise ValueError(f"AOT serving export is incomplete: {path}")
-        for name in ("max_running_requests", "max_total_tokens", "max_recurrent_state_size"):
+        for name in (
+            "max_running_requests",
+            "max_total_tokens",
+            "max_recurrent_state_size",
+        ):
             if getattr(server_args, name) is None:
                 setattr(server_args, name, manifest[name])
 
@@ -431,8 +439,17 @@ class CompilationManager:
     ):
         skip_unused = os.environ.get("SGLANG_JAX_PD_SKIP_UNUSED_PRECOMPILE", "0") == "1"
         disagg_mode = getattr(model_runner.server_args, "disaggregation_mode", "null")
+        # D runs no extend when P ships the first token (recurrent and DSA models).
+        pure_decode = self.has_recurrent_state
+        if skip_unused and disagg_mode == "decode" and not pure_decode:
+            from sgl_jax.srt.disaggregation.prefill import _pd_sends_first_token
+
+            pure_decode = _pd_sends_first_token(
+                getattr(model_runner, "token_to_kv_pool", None),
+                getattr(model_runner, "req_to_token_pool", None),
+            )
         self._precompile_encode(model_runner)
-        if not (skip_unused and disagg_mode == "decode" and self.has_recurrent_state):
+        if not (skip_unused and disagg_mode == "decode" and pure_decode):
             self._precompile_extend(
                 forward_fn,
                 model_runner,
@@ -472,7 +489,9 @@ class CompilationManager:
         from sgl_jax.srt.sampling.sampling_batch_info import SamplingMetadata
 
         logger.info(
-            "[%s] Compiling buckets with %d XLA workers", mode.name, self.precompile_num_threads
+            "[%s] Compiling buckets with %d XLA workers",
+            mode.name,
+            self.precompile_num_threads,
         )
 
         def batches():

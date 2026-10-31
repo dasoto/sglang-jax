@@ -18,11 +18,7 @@ from jax.sharding import Mesh
 from sgl_jax.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sgl_jax.srt.disaggregation.prefill import (
     SchedulerDisaggregationPrefillMixin,
-    _global_to_local_shard,
     _globalize_rank_local_page_ids,
-    _local_to_global_shard,
-    local_kv_spec_for_pool,
-    local_spec_for_global,
 )
 from sgl_jax.srt.managers.schedule_batch import Req, ScheduleBatch
 from sgl_jax.srt.mem_cache.allocator import PagedTokenToKVPoolAllocator
@@ -31,6 +27,7 @@ from sgl_jax.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
     MLATokenToKVPool,
+    ReqToTokenPool,
 )
 from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
@@ -292,7 +289,6 @@ def test_mla_dcp_and_kda_roundtrip_and_pure_decode_admission():
     assert decode_sched.running_batch.reqs_info[0].reqs[0].rid == "req-k3-2"
 
 
-
 def test_multihost_sync_63bit_bootstrap_room_without_x64():
     """Verify synced_terminal_rooms preserves 63-bit rooms when jax_enable_x64 is False."""
     from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
@@ -399,9 +395,11 @@ def test_pd_prefill_chunked_unified_radix_cache():
 
 def test_mla_kv_multi_block_gather_and_write():
     """Verify >32-page (64-page) multi-block fori_loop MLA KV gather & write bit-exactness."""
-    from jax.sharding import NamedSharding, PartitionSpec as P
-    from sgl_jax.srt.disaggregation.prefill import _jit_gather_mla_kv_chunk
-    from sgl_jax.srt.mem_cache.memory_pool import _jit_write_all_mla_kv_layers_shard_map
+    from jax.sharding import NamedSharding
+    from jax.sharding import PartitionSpec as P
+
+    from sgl_jax.srt.disaggregation.prefill import _jit_gather_all_layers
+    from sgl_jax.srt.mem_cache.memory_pool import write_all_mla_kv_layers
 
     mesh = _make_mesh()
     dp_size = 2
@@ -409,72 +407,242 @@ def test_mla_kv_multi_block_gather_and_write():
     page_size = 8
     # 40 pages per (dp, dcp) shard => 160 pages total
     size = 40 * page_size * dp_size * dcp_size
-    p_pool = MLATokenToKVPool(
-        size=size,
-        page_size=page_size,
-        dtype=jnp.bfloat16,
-        layer_num=3,
-        mesh=mesh,
-        kv_lora_rank=64,
-        qk_rope_head_dim=32,
-        dp_size=dp_size,
-        dcp_size=dcp_size,
-    )
-    d_pool = MLATokenToKVPool(
-        size=size,
-        page_size=page_size,
-        dtype=jnp.bfloat16,
-        layer_num=3,
-        mesh=mesh,
-        kv_lora_rank=64,
-        qk_rope_head_dim=32,
-        dp_size=dp_size,
-        dcp_size=dcp_size,
-    )
+    pools = [
+        MLATokenToKVPool(
+            size=size,
+            page_size=page_size,
+            dtype=jnp.bfloat16,
+            layer_num=3,
+            mesh=mesh,
+            kv_lora_rank=64,
+            qk_rope_head_dim=32,
+            dp_size=dp_size,
+            dcp_size=dcp_size,
+        )
+        for _ in range(2)
+    ]
+    p_pool, d_pool = pools
     rng = np.random.default_rng(777)
     for l_idx in range(3):
         arr = jnp.asarray(rng.standard_normal(p_pool.kv_buffer[l_idx].shape), dtype=jnp.bfloat16)
-        p_pool.kv_buffer[l_idx] = jax.device_put(arr, p_pool.kv_buffer[l_idx].sharding)
+        p_pool.kv_buffer[l_idx] = jax.device_put(arr, p_pool.kv_sharding)
 
-    # 30 valid pages on P's dp_rank=1 (global pages 41..70), padded to 64 pages (>32 block size)
+    # 30 valid pages (global 41..70), padded to 64 pages (> the 32-page block).
     valid_pages = 30
     padded_pages = 64
     p_global_pages = np.arange(41, 41 + valid_pages, dtype=np.int32)
     padded_src = np.zeros(padded_pages, dtype=np.int32)
     padded_src[:valid_pages] = p_global_pages
 
-    in_spec = p_pool.kv_spec
-    out_spec = P("data", "tensor", None, None, None)
-    idx_sharding = NamedSharding(mesh, P())
+    out_sharding = NamedSharding(mesh, P("data", "tensor", None, None))
+    idx_sharding = NamedSharding(mesh, P(None))
     dev_idx = jax.device_put(jnp.asarray(padded_src, dtype=jnp.int32), idx_sharding)
-
-    stacked = _jit_gather_mla_kv_chunk(
-        tuple(p_pool.kv_buffer),
+    gathered = _jit_gather_all_layers(
+        list(p_pool.kv_buffer),
         dev_idx,
-        mesh,
-        in_spec,
-        out_spec,
+        out_sharding,
+        mla_buf_sharding=p_pool.kv_sharding,
     )
-    # Write to D's dp_rank=0 (global pages 3..32), with dummy page 0 for padding
+
+    # Write to global pages 3..32; padding targets an out-of-range page and is dropped.
+    total_pages = int(d_pool.kv_buffer[0].shape[0])
     d_global_pages = np.arange(3, 3 + valid_pages, dtype=np.int32)
-    padded_dst = np.zeros(padded_pages, dtype=np.int32)
+    padded_dst = np.full(padded_pages, total_pages, dtype=np.int32)
     padded_dst[:valid_pages] = d_global_pages
     dev_dst = jax.device_put(jnp.asarray(padded_dst, dtype=jnp.int32), idx_sharding)
+    before = [np.asarray(jax.device_get(b)) for b in d_pool.kv_buffer]
+    d_pool.kv_buffer[:] = write_all_mla_kv_layers(gathered, dev_dst, list(d_pool.kv_buffer))
 
-    d_pool.kv_buffer = list(
-        _jit_write_all_mla_kv_layers_shard_map(
-            tuple(d_pool.kv_buffer),
-            stacked,
-            dev_dst,
-            mesh=mesh,
-            buf_spec=d_pool.kv_spec,
-            val_spec=out_spec,
-        )
-    )
+    untouched = np.setdiff1d(np.arange(total_pages), d_global_pages)
     for l_idx in range(3):
         p_np = np.asarray(jax.device_get(p_pool.kv_buffer[l_idx]))
         d_np = np.asarray(jax.device_get(d_pool.kv_buffer[l_idx]))
         np.testing.assert_array_equal(d_np[d_global_pages], p_np[p_global_pages])
+        np.testing.assert_array_equal(d_np[untouched], before[l_idx][untouched])
 
 
+class _DummyDsaScheduler(
+    SchedulerDisaggregationPrefillMixin,
+    SchedulerDisaggregationDecodeMixin,
+):
+    """GLM-5 style DSA pools: MLA latent + indexer keys, DCP=2, no recurrent state."""
 
+    def __init__(self, mesh: Mesh, *, page_size: int = 8):
+        dp_size = 2
+        dcp_size = 2
+        size = 16 * page_size * dp_size * dcp_size
+        self.kv_pool = MLATokenToKVPool(
+            size=size,
+            page_size=page_size,
+            dtype=jnp.bfloat16,
+            kv_lora_rank=128,
+            qk_rope_head_dim=64,
+            layer_num=3,
+            mesh=mesh,
+            dp_size=dp_size,
+            dcp_size=dcp_size,
+            indexer_key_dim=128,
+            num_indexer_layers=2,
+        )
+        self.req_to_token_pool = ReqToTokenPool(size=8, max_context_len=128, dtype=np.int32)
+        self.token_to_kv_pool_allocator = PagedTokenToKVPoolAllocator(
+            size=size,
+            page_size=page_size,
+            kvcache=self.kv_pool,
+            dp_size=dp_size,
+        )
+        self.tree_cache = ChunkCache(
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            page_size=page_size,
+        )
+        self.mesh = mesh
+        self.dp_size = dp_size
+        self.page_size = page_size
+        self.enable_overlap = False
+        self.spec_algorithm = None
+        self.embedding_pool = None
+        self.per_dp_max_running_requests = 2
+        self.model_config = SimpleNamespace(vocab_size=1024)
+        self.server_args = SimpleNamespace(
+            disaggregation_enable_overlap_schedule=False,
+            enable_request_time_stats_logging=False,
+            disaggregation_mode="decode",
+        )
+        self.streamed: list[tuple[str, list[int]]] = []
+        self.waiting_queue = []
+        self.running_batch = ScheduleBatch.init_new(
+            reqs=[[] for _ in range(dp_size)],
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            model_config=self.model_config,
+            enable_overlap=False,
+            dp_size=dp_size,
+            spec_algorithm=None,
+            mesh=mesh,
+        )
+
+    def stream_output(self, reqs, return_logprob, return_output_logprob_only):
+        for r in reqs:
+            self.streamed.append((r.rid, list(r.output_ids)))
+
+
+def _fill_pages(buffers, global_pages, sharding, base):
+    for l_idx in range(len(buffers)):
+        buf = np.asarray(jax.device_get(buffers[l_idx])).copy()
+        for k, gp in enumerate(global_pages):
+            buf[gp] = base + (l_idx + 1) * 10 + (k + 1)
+        buffers[l_idx] = jax.device_put(jnp.asarray(buf, dtype=jnp.bfloat16), sharding)
+
+
+def test_dsa_mla_dcp_roundtrip_with_indexer_and_first_token():
+    """GLM-5 DSA: P ships latent KV, indexer keys and its first token; D starts decoding."""
+    mesh = _make_mesh()
+    prefill_sched = _DummyDsaScheduler(mesh)
+    decode_sched = _DummyDsaScheduler(mesh)
+    page_size = 8
+
+    # 20 prompt tokens = 3 pages on P's dp_rank=1.
+    prompt_ids = list(range(10, 30))
+    p_req = Req(
+        rid="req-glm5-1",
+        origin_input_text="",
+        origin_input_ids=prompt_ids,
+        sampling_params=SamplingParams(max_new_tokens=4, temperature=0.0),
+        dp_rank=1,
+    )
+    p_req.sampling_params.normalize(None)
+    prefill_sched.req_to_token_pool.alloc([p_req])
+    p_kv_indices = prefill_sched.token_to_kv_pool_allocator.alloc(24, dp_rank=1)
+    assert p_kv_indices is not None
+    prefill_sched.req_to_token_pool.write(
+        (p_req.req_pool_idx, slice(0, 20)), p_kv_indices[:20].astype(np.int32)
+    )
+    p_req._pd_first_token_id = 777
+
+    p_pool = prefill_sched.kv_pool
+    total_pages = int(p_pool.kv_buffer[0].shape[0])
+    p_global_pages = _globalize_rank_local_page_ids(
+        p_kv_indices[:24:page_size] // page_size,
+        dp_rank=1,
+        dp_size=2,
+        total_pages=total_pages,
+        dcp_size=2,
+    )
+    _fill_pages(p_pool.kv_buffer, p_global_pages, p_pool.kv_sharding, base=0)
+    _fill_pages(p_pool.indexer_key_buffer, p_global_pages, p_pool.kv_sharding, base=100)
+
+    d_req = Req(
+        rid="req-glm5-1",
+        origin_input_text="",
+        origin_input_ids=prompt_ids,
+        sampling_params=SamplingParams(max_new_tokens=4, temperature=0.0),
+        dp_rank=0,
+    )
+    d_req.sampling_params.normalize(None)
+    with patch("jax.process_count", return_value=2):
+        payload = prefill_sched._build_prefill_payload(p_req)
+        specs = decode_sched._build_kv_spec_for_req(d_req)
+        assert set(specs) == {"kv", "idx", "first_token"}
+        assert set(payload) == set(specs)
+        for key in specs:
+            assert payload[key].shape == specs[key].shape, key
+            assert payload[key].dtype == specs[key].dtype, key
+            assert payload[key].is_fully_addressable, key
+        d_kv_indices = decode_sched.token_to_kv_pool_allocator.alloc(24, dp_rank=0)
+        assert d_kv_indices is not None
+        decode_sched._install_received_kv(d_req, d_kv_indices, payload)
+
+    assert d_req._pd_first_token_id == 777
+    d_pool = decode_sched.kv_pool
+    d_global_pages = _globalize_rank_local_page_ids(
+        d_kv_indices[:24:page_size] // page_size,
+        dp_rank=0,
+        dp_size=2,
+        total_pages=total_pages,
+        dcp_size=2,
+    )
+    for p_bufs, d_bufs in (
+        (p_pool.kv_buffer, d_pool.kv_buffer),
+        (p_pool.indexer_key_buffer, d_pool.indexer_key_buffer),
+    ):
+        for l_idx in range(len(p_bufs)):
+            p_np = np.asarray(jax.device_get(p_bufs[l_idx]))
+            d_np = np.asarray(jax.device_get(d_bufs[l_idx]))
+            np.testing.assert_array_equal(d_np[d_global_pages], p_np[p_global_pages])
+            others = np.setdiff1d(np.arange(total_pages), d_global_pages)
+            assert not np.any(d_np[others]), "transfer wrote outside the request's pages"
+
+    # D streams P's token, then admits the request straight into decode.
+    decode_sched._enqueue_hybrid_pure_decode(d_req, d_kv_indices, d_req._pd_first_token_id)
+    assert decode_sched.streamed == [("req-glm5-1", [777])]
+    assert decode_sched.waiting_queue == []
+    decode_sched._drain_ready_pure_decode()
+    assert decode_sched._pd_ready_pure_decode_queue == []
+    assert len(decode_sched.running_batch.reqs_info[0].reqs) == 1
+    decode_sched.running_batch.prepare_for_decode()
+    info0 = decode_sched.running_batch.reqs_info[0]
+    assert decode_sched.running_batch.forward_mode == ForwardMode.DECODE
+    assert info0.input_ids.tolist() == [777]
+    assert info0.seq_lens.tolist() == [21]
+    assert info0.out_cache_loc.tolist() == [int(d_kv_indices[20])]
+
+
+def test_dsa_first_token_opt_out(monkeypatch):
+    """SGLANG_JAX_PD_FIRST_TOKEN_FROM_P=0 restores the D-side last-token recompute."""
+    from sgl_jax.srt.disaggregation.prefill import _pd_sends_first_token
+
+    sched = _DummyDsaScheduler(_make_mesh())
+    assert _pd_sends_first_token(sched.kv_pool, sched.req_to_token_pool)
+    monkeypatch.setenv("SGLANG_JAX_PD_FIRST_TOKEN_FROM_P", "0")
+    assert not _pd_sends_first_token(sched.kv_pool, sched.req_to_token_pool)
+    d_req = Req(
+        rid="req-glm5-2",
+        origin_input_text="",
+        origin_input_ids=list(range(20)),
+        sampling_params=SamplingParams(max_new_tokens=4, temperature=0.0),
+        dp_rank=0,
+    )
+    specs = sched._build_kv_spec_for_req(d_req)
+    assert set(specs) == {"kv", "idx"}

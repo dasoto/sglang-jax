@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from collections import deque
 from contextlib import suppress
@@ -100,8 +101,33 @@ def _is_mla_kv_pool(kv_pool) -> bool:
     return isinstance(inner, MLATokenToKVPool)
 
 
+def _pd_indexer_buffers(kv_pool) -> list:
+    """DSA indexer-key buffers that travel with the latent KV (empty without DSA)."""
+    if not _is_mla_kv_pool(kv_pool):
+        return []
+    inner = getattr(kv_pool, "full_kv_pool", kv_pool)
+    return list(getattr(inner, "indexer_key_buffer", None) or [])
+
+
+def _pd_sends_first_token(kv_pool, req_to_token_pool) -> bool:
+    """Whether P ships its sampled first token so D starts with a pure decode.
+
+    Recurrent (KDA) states cannot be rewound to recompute the last prompt token on
+    D. DSA models opt in by default (``SGLANG_JAX_PD_FIRST_TOKEN_FROM_P``) so D
+    never runs an extend and needs no prefill programs.
+    """
+    from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
+
+    rpool = getattr(req_to_token_pool, "recurrent_state_pool", None)
+    if isinstance(rpool, RecurrentStatePool):
+        return True
+    if not _pd_indexer_buffers(kv_pool):
+        return False
+    return os.environ.get("SGLANG_JAX_PD_FIRST_TOKEN_FROM_P", "1") == "1"
+
+
 def _mla_kv_transfer_shardings(
-    kv_pool, padded_pages: int
+    kv_pool, padded_pages: int, per_layer_tail: tuple[int, ...] | None = None
 ) -> tuple[jax.sharding.NamedSharding, jax.sharding.NamedSharding]:
     from jax.sharding import NamedSharding as _NamedSharding
     from jax.sharding import PartitionSpec as _P
@@ -109,7 +135,8 @@ def _mla_kv_transfer_shardings(
     mesh = kv_pool.mesh
     dp_size = mesh.shape.get("data", 1)
     tp_size = mesh.shape.get("tensor", 1)
-    per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
+    if per_layer_tail is None:
+        per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
     page_axis = "data" if (dp_size > 1 and padded_pages % dp_size == 0) else None
     s1_axis = None
     s3_axis = None
@@ -283,16 +310,20 @@ def _jit_gather_mla_kv_chunk(
     )(buf_chunk, page_indices)
 
 
-_MLA_KV_GATHER_CHUNK_SIZE = 24
+# Layers per MLA KV gather/scatter program. 26 splits GLM-5's 78 latent layers
+# into three equal programs and keeps the DSA indexer keys (21 slots) in one.
+_MLA_KV_CHUNK_LAYERS = int(os.environ.get("SGLANG_JAX_PD_KV_CHUNK_LAYERS", "26"))
 
 
 def _jit_gather_all_layers(buffers, page_indices, out_sharding, *, mla_buf_sharding=None):
     """Gather ``page_indices`` from every per-layer KV buffer."""
     if mla_buf_sharding is not None:
         out: list[jax.Array] = []
-        for start in range(0, len(buffers), _MLA_KV_GATHER_CHUNK_SIZE):
-            chunk = buffers[start : start + _MLA_KV_GATHER_CHUNK_SIZE]
-            out.extend(_jit_gather_mla_kv_chunk(chunk, page_indices, mla_buf_sharding, out_sharding))
+        for start in range(0, len(buffers), _MLA_KV_CHUNK_LAYERS):
+            chunk = buffers[start : start + _MLA_KV_CHUNK_LAYERS]
+            out.extend(
+                _jit_gather_mla_kv_chunk(chunk, page_indices, mla_buf_sharding, out_sharding)
+            )
         return out
     return [_jit_gather_one_layer(buf, page_indices, out_sharding) for buf in buffers]
 
@@ -417,26 +448,31 @@ def _local_scalar_int32_spec() -> jax.ShapeDtypeStruct:
 
     ldev = jax.local_devices()
     lmesh = _Mesh(_np.asarray(ldev), ("_local",))
-    return jax.ShapeDtypeStruct((len(ldev),), jnp.int32, sharding=_NamedSharding(lmesh, _P("_local")))
+    return jax.ShapeDtypeStruct(
+        (len(ldev),), jnp.int32, sharding=_NamedSharding(lmesh, _P("_local"))
+    )
 
 
-def local_kv_spec_for_pool(kv_pool, layer_num: int, padded_pages: int) -> jax.ShapeDtypeStruct:
+def local_kv_spec_for_pool(
+    kv_pool, layer_num: int, padded_pages: int, buffers: list | None = None
+) -> jax.ShapeDtypeStruct:
     """Build the ShapeDtypeStruct that D should pull on a multi-host process:
     this host's 1/nproc slice of the stacked KV, on a 1-D local mesh.
+
+    ``buffers`` selects another MLA buffer family (the DSA indexer keys).
     """
     from jax.sharding import NamedSharding as _NamedSharding
     from jax.sharding import PartitionSpec as _P
 
-    per_layer_tail = kv_pool.kv_buffer[0].shape[1:]
+    buffers = kv_pool.kv_buffer if buffers is None else buffers
+    per_layer_tail = buffers[0].shape[1:]
     gshape = (layer_num, padded_pages) + per_layer_tail
     if _is_mla_kv_pool(kv_pool):
-        _, stacked_sharding = _mla_kv_transfer_shardings(kv_pool, padded_pages)
-        return local_spec_for_global(gshape, kv_pool.dtype, stacked_sharding)
+        _, stacked_sharding = _mla_kv_transfer_shardings(kv_pool, padded_pages, per_layer_tail)
+        return local_spec_for_global(gshape, buffers[0].dtype, stacked_sharding)
     pool_pspec = kv_pool.kv_sharding.spec
     gspec = _P(None, None, *pool_pspec[1:])
-    return local_spec_for_global(
-        gshape, kv_pool.dtype, _NamedSharding(kv_pool.mesh, gspec)
-    )
+    return local_spec_for_global(gshape, kv_pool.dtype, _NamedSharding(kv_pool.mesh, gspec))
 
 
 @dataclass
@@ -546,7 +582,13 @@ class SchedulerDisaggregationPrefillMixin:
                 error = str(exc)
             handoffs.append(
                 PrefillHandoff(
-                    req, get_disagg_transport_id(req), start, end, tuple(pages), is_final, error
+                    req,
+                    get_disagg_transport_id(req),
+                    start,
+                    end,
+                    tuple(pages),
+                    is_final,
+                    error,
                 )
             )
         return tuple(handoffs)
@@ -688,7 +730,11 @@ class SchedulerDisaggregationPrefillMixin:
             )
 
     def process_prefill_chunk(
-        self: Scheduler, batch, result, *, handoffs: tuple[PrefillHandoff, ...] | None = None
+        self: Scheduler,
+        batch,
+        result,
+        *,
+        handoffs: tuple[PrefillHandoff, ...] | None = None,
     ) -> None:
         """Extract KV for PD reqs and hand off to sender."""
 
@@ -919,7 +965,11 @@ class SchedulerDisaggregationPrefillMixin:
         return list(slots_to_page_ids(slot_source, page_size, end - start))
 
     def _raiden_handoff_chunk(
-        self: Scheduler, req: Req, *, is_final: bool, snapshot: PrefillHandoff | None = None
+        self: Scheduler,
+        req: Req,
+        *,
+        is_final: bool,
+        snapshot: PrefillHandoff | None = None,
     ) -> None:
         """Register exactly the KV pages produced by the current prefill round."""
 
@@ -1049,7 +1099,10 @@ class SchedulerDisaggregationPrefillMixin:
         dp_rank = int(req.dp_rank)
         if self.chunked_reqs[dp_rank] is req:
             self.chunked_reqs[dp_rank] = None
-        for batch in (getattr(self, "last_batch", None), getattr(self, "cur_batch", None)):
+        for batch in (
+            getattr(self, "last_batch", None),
+            getattr(self, "cur_batch", None),
+        ):
             if batch is not None and batch.forward_mode.is_extend():
                 info = batch.reqs_info[dp_rank]
                 if info.chunked_req is req:
@@ -1064,9 +1117,13 @@ class SchedulerDisaggregationPrefillMixin:
     def _build_prefill_payload(self: Scheduler, req: Req) -> dict[str, object]:
         from jax.sharding import NamedSharding as _NamedSharding
         from jax.sharding import PartitionSpec as _P
+
         from sgl_jax.srt.mem_cache.recurrent_state_pool import RecurrentStatePool
 
+        kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
         payload: dict[str, object] = {"kv": self._extract_req_kv(req)}
+        if _pd_indexer_buffers(kv_pool):
+            payload["idx"] = self._extract_req_kv(req, indexer=True)
         rpool = getattr(getattr(self, "req_to_token_pool", None), "recurrent_state_pool", None)
         if (
             isinstance(rpool, RecurrentStatePool)
@@ -1074,26 +1131,30 @@ class SchedulerDisaggregationPrefillMixin:
         ):
             dp_rank = int(getattr(req, "dp_rank", 0) or 0)
             kda_temporal, kda_conv = rpool.extract_slot(dp_rank, int(req.recurrent_pool_idx))
-            first_tok_id = int(getattr(req, "_pd_first_token_id", 0) or 0)
             if jax.process_count() > 1:
                 kda_temporal.block_until_ready()
                 kda_conv.block_until_ready()
                 payload["kda_temporal"] = _global_to_local_shard(kda_temporal)
                 payload["kda_conv"] = _global_to_local_shard(kda_conv)
-                payload["first_token"] = _make_local_scalar_int32(first_tok_id)
             else:
                 payload["kda_temporal"] = kda_temporal
                 payload["kda_conv"] = kda_conv
+        if _pd_sends_first_token(kv_pool, getattr(self, "req_to_token_pool", None)):
+            first_tok_id = int(getattr(req, "_pd_first_token_id", 0) or 0)
+            if jax.process_count() > 1:
+                payload["first_token"] = _make_local_scalar_int32(first_tok_id)
+            else:
                 payload["first_token"] = jax.device_put(
                     jnp.asarray([first_tok_id], dtype=jnp.int32),
-                    _NamedSharding(rpool.mesh, _P(None)),
+                    _NamedSharding(kv_pool.mesh, _P(None)),
                 )
         return payload
 
-    def _extract_req_kv(self: Scheduler, req: Req):
+    def _extract_req_kv(self: Scheduler, req: Req, *, indexer: bool = False):
         """Gather prefilled KV from the paged pool for ``req``.
 
         Returns a per-layer list of ``(padded_pages, page_size, ...)`` arrays.
+        ``indexer`` gathers the DSA indexer-key buffers instead of the latent KV.
         """
 
         # Raiden normally uses raw page IDs. Optional debug extraction uses
@@ -1128,7 +1189,9 @@ class SchedulerDisaggregationPrefillMixin:
             page_ids = _np.concatenate(
                 [page_ids, _np.zeros(padded_pages - num_pages, dtype=page_ids.dtype)]
             )
-        if is_mla:
+        if indexer:
+            layer_buffers = _pd_indexer_buffers(kv_pool)
+        elif is_mla:
             layer_buffers = list(kv_pool.kv_buffer)
         else:
             layer_buffers = [
@@ -1150,7 +1213,9 @@ class SchedulerDisaggregationPrefillMixin:
         idx_sharding = _NamedSharding(kv_pool.mesh, _P(None))
         page_indices = jax.device_put(page_ids, idx_sharding)
         if is_mla:
-            gather_out_sharding, _ = _mla_kv_transfer_shardings(kv_pool, padded_pages)
+            gather_out_sharding, _ = _mla_kv_transfer_shardings(
+                kv_pool, padded_pages, layer_buffers[0].shape[1:]
+            )
         else:
             # Page indices are replicated; preserve pool sharding on the remaining axes.
             pool_pspec = kv_pool.kv_sharding.spec
