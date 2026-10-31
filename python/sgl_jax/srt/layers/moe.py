@@ -999,12 +999,36 @@ class EPMoE(nnx.Module):
             else:
                 output = jax.lax.psum(output, "tensor")
         if self.ep_size > 1:
-            if scatter_on_expert:
+            if self.moe_replicas > 1:
+                output = self._combine_replicas(output, tokens_split=scatter_on_expert)
+            elif scatter_on_expert:
                 output = jax.lax.psum_scatter(output, "expert", scatter_dimension=0, tiled=True)
             else:
                 output = self._combine(output)
 
         return output
+
+    def _combine_replicas(self, output, *, tokens_split: bool):
+        """Combine with replicas through a reduction over every device.
+
+        On v5e a reduction over a replica's device subgroup runs far slower than
+        the same reduction over the whole slice, so each replica zero-fills the
+        rows of the tokens the other replicas own and the sum spans all devices.
+        ``tokens_split``: this replica holds only its own block of tokens (the
+        gather/RS path), else every replica computed all tokens.
+        """
+        replicas = self.moe_replicas
+        r = jax.lax.axis_index("replica")
+        if tokens_split:
+            rows = output.shape[0]
+            full = jnp.zeros((rows * replicas, output.shape[1]), output.dtype)
+            full = jax.lax.dynamic_update_slice_in_dim(full, output, r * rows, axis=0)
+            return jax.lax.psum_scatter(
+                full, ("replica", "expert"), scatter_dimension=0, tiled=True
+            )
+        owner = (jnp.arange(output.shape[0]) * replicas) // output.shape[0]
+        output = jnp.where((owner == r)[:, None], output, jnp.zeros_like(output))
+        return jax.lax.psum(output, ("replica", "expert"))
 
     def _gmm_compute(
         self,
