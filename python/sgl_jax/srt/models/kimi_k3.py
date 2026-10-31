@@ -160,19 +160,21 @@ def _rms_norm_from_sumsq(x: jax.Array, sumsq: jax.Array, norm: RMSNorm) -> jax.A
 def _gather_routing(mesh, topk_weights: jax.Array, topk_ids: jax.Array):
     """Token-sharded [T, k] router outputs -> P("data", None), the layout the MoE paths take.
 
-    f32 weights and int32 ids are bit-packed into one [T, 2k] array, so the gather over
-    "tensor" is one small collective instead of two.
+    The f32 weights are bit-packed into int32 next to the int32 ids, so the gather over
+    "tensor" is one small collective instead of two. The buffer must stay integer: expert ids
+    bitcast to f32 are denormals, and XLA lowers the concatenate to a maximum of -inf-padded
+    operands, a float op that flushes denormals to zero on TPU (ids -> 0).
     """
     k = topk_ids.shape[1]
     packed = jnp.concatenate(
         [
-            topk_weights.astype(jnp.float32),
-            jax.lax.bitcast_convert_type(topk_ids.astype(jnp.int32), jnp.float32),
+            jax.lax.bitcast_convert_type(topk_weights.astype(jnp.float32), jnp.int32),
+            topk_ids.astype(jnp.int32),
         ],
         axis=1,
     )
     packed = jax.sharding.reshard(packed, NamedSharding(mesh, P("data", None)))
-    return packed[:, :k], jax.lax.bitcast_convert_type(packed[:, k:], jnp.int32)
+    return jax.lax.bitcast_convert_type(packed[:, :k], jnp.float32), packed[:, k:]
 
 
 def _row_parallel_sum(mesh, x1, w1, x2, w2) -> jax.Array:

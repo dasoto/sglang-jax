@@ -110,3 +110,42 @@ def test_token_sharded_routing_matches_replicated(T):
     np.testing.assert_array_equal(w_new, w_ref)
     # The remap used both replicas of the redundant experts.
     assert np.any(ids_ref >= E)
+
+
+def _eqns(jaxpr):
+    """Every equation of ``jaxpr``, nested jaxprs included."""
+    for eqn in jaxpr.eqns:
+        yield eqn
+        for v in eqn.params.values():
+            for sub in v if isinstance(v, (list, tuple)) else (v,):
+                inner = getattr(sub, "jaxpr", sub)
+                if hasattr(inner, "eqns"):
+                    yield from _eqns(inner)
+
+
+@pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (CPU) devices")
+def test_gather_routing_keeps_ids_integer():
+    """The packed router outputs stay integer on their way through the gather.
+
+    Expert ids bitcast to f32 are denormals, and XLA lowers the concatenate to a maximum of
+    -inf-padded operands, a float op that flushes denormals to zero on TPU (every id -> 0).
+    CPU keeps denormals, so the round trip alone cannot catch that; check the bitcasts.
+    """
+    mesh = _mesh()
+    T = 64
+    rng = np.random.default_rng(0)
+    with jax.set_mesh(mesh):
+        token_sharded = NamedSharding(mesh, P(("data", "tensor"), None))
+        w = jax.device_put(jnp.asarray(rng.random((T, TOPK)), jnp.float32), token_sharded)
+        ids = jax.device_put(jnp.asarray(rng.integers(1, 896, (T, TOPK)), jnp.int32), token_sharded)
+        jaxpr = jax.make_jaxpr(lambda a, b: _gather_routing(mesh, a, b))(w, ids).jaxpr
+        packed = [e for e in _eqns(jaxpr) if e.primitive.name in ("concatenate", "reshard")]
+        assert {e.primitive.name for e in packed} == {"concatenate", "reshard"}
+        for e in packed:
+            dtype = e.outvars[0].aval.dtype
+            assert jnp.issubdtype(dtype, jnp.integer), f"{e.primitive.name} carries {dtype}"
+        w_out, ids_out = jax.jit(lambda a, b: _gather_routing(mesh, a, b))(w, ids)
+        assert ids_out.sharding.spec == w_out.sharding.spec == P("data", None)
+        assert ids_out.dtype == jnp.int32 and w_out.dtype == jnp.float32
+    np.testing.assert_array_equal(np.asarray(ids_out), np.asarray(ids))
+    np.testing.assert_array_equal(np.asarray(w_out), np.asarray(w))
