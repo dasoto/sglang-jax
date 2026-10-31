@@ -276,13 +276,15 @@ def sparse_mla_attention_qblock(
     cu_kv_lens=None,  # [num_seqs+1] int32    page-aligned kv offsets
     page_indices=None,  # [total_pages] int32 packed physical page ids
     return_lse: bool = False,
+    out_dtype=jnp.float32,
 ):
     """Blocked sparse MLA-latent attention (query-batching kernel).
 
     Semantics match :func:`sparse_mla_prefill.sparse_mla_attention` (same
     masked-softmax math); the difference is purely execution shape: queries are
     processed ``query_block`` at a time and each block DMAs its selected-page
-    *union* once instead of per query. Returns ``[B, S, H, kv_lora_rank]`` fp32.
+    *union* once instead of per query. Returns ``[B, S, H, kv_lora_rank]`` in
+    ``out_dtype`` (fp32 by default; the kernel accumulates in fp32 either way).
 
     Modes:
     * flat (default): ``kv`` is ``[B, T, Dk]``; ``indices`` are unit ids over it.
@@ -412,7 +414,7 @@ def sparse_mla_attention_qblock(
     smem = pltpu.SMEM
     row_spec = pl.BlockSpec((1, 1, 1, QBHp), lambda b, n: (b, n, 0, 0))
     out_specs = pl.BlockSpec((1, 1, QBHp, Dv), lambda b, n: (b, n, 0, 0))
-    out_shape = jax.ShapeDtypeStruct((B, nQB, QBHp, Dv), jnp.float32)
+    out_shape = jax.ShapeDtypeStruct((B, nQB, QBHp, Dv), out_dtype)
     if return_lse:
         out_specs = [out_specs, row_spec]
         out_shape = [out_shape, jax.ShapeDtypeStruct((B, nQB, 1, QBHp), jnp.float32)]
@@ -470,6 +472,7 @@ def prefill_write_and_attend_ragged_qblock(
     return_lse: bool = False,
     q_sparse=None,
     skip_write: bool = False,
+    out_dtype=jnp.float32,
 ):
     """Packed-ragged self-write + **blocked** sparse-MLA prefill.
 
@@ -478,8 +481,10 @@ def prefill_write_and_attend_ragged_qblock(
     plus ``query_block``); only the attend execution shape differs.
     ``return_lse`` appends the ``[T, H]`` log-sum-exp (see
     :func:`sparse_mla_attention_qblock`). ``q_sparse`` passes the query already
-    concatenated as ``[T, H, kv_lora_rank + rope]`` (``ql``/``qpe`` unused), and
-    ``skip_write`` skips the self-write for callers that wrote the rows already.
+    concatenated as ``[T, H, kv_lora_rank + rope]`` (``ql``/``qpe`` unused; it
+    may carry zero features up to the cache's padded width, which skips the
+    kernel's query pad copy), ``skip_write`` skips the self-write for callers that
+    wrote the rows already, and ``out_dtype`` is the attention output dtype.
     """
     if q_sparse is None:
         q_sparse = jnp.concatenate([ql, qpe], axis=-1)  # [T, H, Dv+rope]
@@ -535,6 +540,7 @@ def prefill_write_and_attend_ragged_qblock(
         page_indices=page_indices,
         interpret=interpret,
         return_lse=return_lse,
+        out_dtype=out_dtype,
     )
     if return_lse:
         out, lse = out

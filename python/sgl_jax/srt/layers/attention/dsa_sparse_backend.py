@@ -171,6 +171,10 @@ _DCP_MERGE_APPROX_MIN = 4096
 # dtype of the DCP output reduce-scatter (each rank's softmax-weighted partial).
 # bfloat16 halves the prefill combine traffic ([T, heads, kv_lora_rank] per layer).
 _DCP_COMBINE_DTYPE = jnp.dtype(os.environ.get("DSA_DCP_COMBINE_DTYPE", "float32"))
+# DCP prefill gathers the query with zero features up to the cache's padded width
+# (576 -> 640): the sparse-prefill kernel then skips its pad copy of the gathered
+# [T, heads, 640] query, for 11% more all-gather bytes.
+_DCP_PREFILL_QPAD = os.environ.get("DSA_DCP_PREFILL_QPAD", "0") == "1"
 
 
 @register_pytree_node_class
@@ -1560,11 +1564,12 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             pt_local = jnp.where((pi_ > 0) & ((pi_ - 1) % dcp == rank), (pi_ - 1) // dcp + 1, 0)
             # Concatenate this rank's heads before the all-gather: concatenating
             # the gathered [T, H, 576] query cost a full extra pass per layer.
+            q_parts = [ql_, qpe_.astype(ql_.dtype)]
+            q_pad = cache_.shape[-1] - ql_.shape[-1] - qpe_.shape[-1]
+            if _DCP_PREFILL_QPAD and q_pad > 0:
+                q_parts.append(jnp.zeros(ql_.shape[:2] + (q_pad,), ql_.dtype))
             q_all = jax.lax.all_gather(
-                jnp.concatenate([ql_, qpe_.astype(ql_.dtype)], axis=-1),
-                "tensor",
-                axis=1,
-                tiled=True,
+                jnp.concatenate(q_parts, axis=-1), "tensor", axis=1, tiled=True
             )
             o, cache_, lse = prefill_write_and_attend_ragged_qblock(
                 None,
@@ -1586,6 +1591,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 return_lse=True,
                 q_sparse=q_all,
                 skip_write=True,  # owned rows were written above
+                # the combine casts to this dtype anyway; bf16 halves the output pass
+                out_dtype=_DCP_COMBINE_DTYPE,
             )
             o = _dcp_lse_combine(o, lse, ql_.shape[1])
             return o.astype(ql_.dtype), cache_

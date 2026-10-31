@@ -357,6 +357,54 @@ def test_ragged_qblock_preconcatenated_query_and_skip_write():
     np.testing.assert_array_equal(np.asarray(o_pre)[real], np.asarray(o_ref)[real])
 
 
+def test_ragged_qblock_padded_query_and_out_dtype():
+    """A query zero-padded to the cache width (DSA_DCP_PREFILL_QPAD) and a bf16
+    output (DCP combine in bf16) match the default path exactly."""
+    c = _ragged_case([200, 129], K=4, seed=19)
+    kw = dict(kv_lora_rank=_KV_LORA, page_size=_PS, sm_scale=_SC, interpret=True, query_block=16)
+    tail = (c["topk_pages"], c["positions"], c["loc"], c["seq_lens"], c["cu_q_lens"])
+    tail += (c["cu_kv_lens"], c["page_indices"])
+    o_ref, cache, lse_ref = prefill_write_and_attend_ragged_qblock(
+        c["ql"], c["qpe"], c["kvc"], c["kpe"], c["cache"], *tail, return_lse=True, **kw
+    )
+    q = jnp.concatenate([c["ql"], c["qpe"]], axis=-1)
+    q_pad = jnp.pad(q, ((0, 0), (0, 0), (0, _DK_PAD - q.shape[-1])))
+    o_pad, _, lse_pad = prefill_write_and_attend_ragged_qblock(
+        None,
+        None,
+        c["kvc"],
+        c["kpe"],
+        cache,
+        *tail,
+        return_lse=True,
+        q_sparse=q_pad,
+        skip_write=True,
+        **kw,
+    )
+    o_bf, _, lse_bf = prefill_write_and_attend_ragged_qblock(
+        None,
+        None,
+        c["kvc"],
+        c["kpe"],
+        cache,
+        *tail,
+        return_lse=True,
+        q_sparse=q,
+        skip_write=True,
+        out_dtype=jnp.bfloat16,
+        **kw,
+    )
+    real = c["real"]
+    np.testing.assert_array_equal(np.asarray(o_pad)[real], np.asarray(o_ref)[real])
+    np.testing.assert_array_equal(np.asarray(lse_pad)[real], np.asarray(lse_ref)[real])
+    assert o_bf.dtype == jnp.bfloat16 and lse_bf.dtype == jnp.float32
+    np.testing.assert_array_equal(
+        np.asarray(o_bf.astype(jnp.float32))[real],
+        np.asarray(o_ref.astype(jnp.bfloat16).astype(jnp.float32))[real],
+    )
+    np.testing.assert_array_equal(np.asarray(lse_bf)[real], np.asarray(lse_ref)[real])
+
+
 # ── TSA (token-sharded attention): sharded slices vs one full-chunk call ────
 
 prefill_write_and_attend_ragged_qblock_tsa = qb_mod.prefill_write_and_attend_ragged_qblock_tsa
