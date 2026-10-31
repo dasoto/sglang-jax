@@ -175,6 +175,12 @@ _DCP_COMBINE_DTYPE = jnp.dtype(os.environ.get("DSA_DCP_COMBINE_DTYPE", "float32"
 # (576 -> 640): the sparse-prefill kernel then skips its pad copy of the gathered
 # [T, heads, 640] query, for 11% more all-gather bytes.
 _DCP_PREFILL_QPAD = os.environ.get("DSA_DCP_PREFILL_QPAD", "0") == "1"
+# DCP prefill absorbs the MLA up-projections itself (see absorbs_mla_in_prefill): the
+# query all-gather carries nope + rope (192 + 64 for GLM-5) instead of the absorbed
+# 512 + 64 features per head, and W_UV is applied to each rank's softmax-weighted
+# partial so the output reduce-scatter carries v_head_dim (256) instead of 512. The
+# head-sharded W_UK / W_UV are all-gathered per layer (no activation dependency).
+_DCP_PREFILL_ABSORB = os.environ.get("DSA_DCP_PREFILL_ABSORB", "0") == "1"
 
 
 @register_pytree_node_class
@@ -307,6 +313,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         # asked to reuse a threaded selection skips its own top-k (still writes
         # its indexer-key cache) and attends over the caller's indices instead.
         dsa_topk_reuse: bool = bool(kwargs.get("dsa_topk_reuse", False))
+        # (W_UK, W_UV) when the caller passes the pre-absorption query (see
+        # absorbs_mla_in_prefill); the output is then W_UV-projected.
+        mla_absorb = kwargs.get("mla_absorb")
 
         layer_id = layer.layer_id
         is_full = indexer_type == "full"
@@ -360,7 +369,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 md,
                 forward_batch,
                 layer_id,
+                mla_absorb=mla_absorb,
             )
+        if mla_absorb is not None:
+            raise ValueError("mla_absorb is only supported on the DCP prefill path")
         if is_full and q_idx is None:
             o, kv_cache = self._run_dense(
                 q, q_rope, new_kv_c, new_k_pe, kv_cache, sm_scale, layer, dpa, md
@@ -1275,6 +1287,20 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
     # decode context parallelism
     # ────────────────────────────────────────────────────────────────────────
 
+    def absorbs_mla_in_prefill(self, forward_batch: ForwardBatch) -> bool:
+        """True when this batch's attention takes the pre-absorption MLA query
+        (``q`` = q_nope [T, H, qk_nope_head_dim]) plus ``mla_absorb=(W_UK, W_UV)``
+        and returns the W_UV-projected output [T, H, v_head_dim]
+        (DSA_DCP_PREFILL_ABSORB, DCP prefill / mixed batches only)."""
+        mode = forward_batch.forward_mode
+        return (
+            _DCP_PREFILL_ABSORB
+            and self.dcp_size > 1
+            and not mode.is_decode()
+            and not mode.is_target_verify()
+            and not mode.is_draft_extend()
+        )
+
     def _dcp_call(
         self,
         q,
@@ -1295,6 +1321,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         md,
         forward_batch,
         layer_id,
+        mla_absorb=None,
     ):
         mode = forward_batch.forward_mode
         if mode.is_target_verify() or mode.is_draft_extend():
@@ -1320,10 +1347,24 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         pages_use = topk_pages if (is_full and not reuse) else dsa_topk_pages_in
         if pages_use is None:
             raise ValueError(f"layer {layer_id}: no page selection to attend under DCP")
-        run = self._dcp_run_sparse_decode if is_decode else self._dcp_run_sparse_prefill
-        o, kv_cache = run(
-            q, q_rope, new_kv_c, new_k_pe, kv_cache, pages_use, sm_scale, dpa, md, forward_batch
+        args = (
+            q,
+            q_rope,
+            new_kv_c,
+            new_k_pe,
+            kv_cache,
+            pages_use,
+            sm_scale,
+            dpa,
+            md,
+            forward_batch,
         )
+        if is_decode:
+            if mla_absorb is not None:
+                raise ValueError("mla_absorb is only supported on the DCP prefill path")
+            o, kv_cache = self._dcp_run_sparse_decode(*args)
+        else:
+            o, kv_cache = self._dcp_run_sparse_prefill(*args, mla_absorb=mla_absorb)
         fresh = is_full and not reuse
         return o, DSAFusedCache(
             kv=kv_cache,
@@ -1522,12 +1563,27 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         )
 
     def _dcp_run_sparse_prefill(
-        self, ql, qpe, kvc, kpe, cache, topk_pages, sm_scale, dpa, md, forward_batch
+        self,
+        ql,
+        qpe,
+        kvc,
+        kpe,
+        cache,
+        topk_pages,
+        sm_scale,
+        dpa,
+        md,
+        forward_batch,
+        mla_absorb=None,
     ):
         """Prefill/mixed: owned writes up front, then the blocked sparse-prefill
         kernel over each query's owned selected pages with all heads (other pages
         masked to -1, page table remapped to local ids, no in-kernel write); outputs
-        are LSE-merged across ranks."""
+        are LSE-merged across ranks.
+
+        With ``mla_absorb=(W_UK, W_UV)`` (see absorbs_mla_in_prefill) ``ql`` is the
+        pre-absorption q_nope: the gathered query is absorbed here and W_UV is
+        applied before the cross-rank sum, returning [T, heads_local, v_head_dim]."""
         dcp = self.dcp_size
         ps = self.page_size
         sm = float(sm_scale)
@@ -1548,8 +1604,11 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             P(dpa),  # page_indices (global)
         )
         out_specs = (P(dpa, "tensor", None), cache_spec)
+        absorb = mla_absorb is not None
+        if absorb:
+            in_specs += (P(None, "tensor", None), P(None, "tensor", None))  # W_UK, W_UV
 
-        def _run(ql_, qpe_, kvc_, kpe_, cache_, tp_, pos_, loc_, sl_, cuq_, cukv_, pi_):
+        def _run(ql_, qpe_, kvc_, kpe_, cache_, tp_, pos_, loc_, sl_, cuq_, cukv_, pi_, *w_):
             rank = jax.lax.axis_index("tensor")
             cache_ = _dcp_scatter_rows(
                 cache_, _fused_latent_rows(kvc_, kpe_, cache_), loc_, ps, dcp, rank
@@ -1562,18 +1621,29 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             owned = (tp_ >= 0) & (phys > 0) & ((phys - 1) % dcp == rank)
             tp_local = jnp.where(owned, tp_, -1)
             pt_local = jnp.where((pi_ > 0) & ((pi_ - 1) % dcp == rank), (pi_ - 1) // dcp + 1, 0)
-            # Concatenate this rank's heads before the all-gather: concatenating
-            # the gathered [T, H, 576] query cost a full extra pass per layer.
-            q_parts = [ql_, qpe_.astype(ql_.dtype)]
-            q_pad = cache_.shape[-1] - ql_.shape[-1] - qpe_.shape[-1]
-            if _DCP_PREFILL_QPAD and q_pad > 0:
-                q_parts.append(jnp.zeros(ql_.shape[:2] + (q_pad,), ql_.dtype))
-            q_all = jax.lax.all_gather(
-                jnp.concatenate(q_parts, axis=-1), "tensor", axis=1, tiled=True
-            )
+            q_lat, q_pe, q_all = None, None, None
+            if absorb:
+                # Gather the pre-absorption query and the head-sharded W_UK, then
+                # absorb every head here: [T, H, nope] x [lkv, H, nope] -> [T, H, lkv].
+                q_nope = jax.lax.all_gather(ql_, "tensor", axis=1, tiled=True)
+                q_pe = jax.lax.all_gather(qpe_.astype(ql_.dtype), "tensor", axis=1, tiled=True)
+                w_uk = jax.lax.all_gather(w_[0], "tensor", axis=1, tiled=True)
+                q_lat = jnp.einsum(
+                    "thd,rhd->thr", q_nope, w_uk, preferred_element_type=jnp.float32
+                ).astype(ql_.dtype)
+            else:
+                # Concatenate this rank's heads before the all-gather: concatenating
+                # the gathered [T, H, 576] query cost a full extra pass per layer.
+                q_parts = [ql_, qpe_.astype(ql_.dtype)]
+                q_pad = cache_.shape[-1] - ql_.shape[-1] - qpe_.shape[-1]
+                if _DCP_PREFILL_QPAD and q_pad > 0:
+                    q_parts.append(jnp.zeros(ql_.shape[:2] + (q_pad,), ql_.dtype))
+                q_all = jax.lax.all_gather(
+                    jnp.concatenate(q_parts, axis=-1), "tensor", axis=1, tiled=True
+                )
             o, cache_, lse = prefill_write_and_attend_ragged_qblock(
-                None,
-                None,
+                q_lat,
+                q_pe,
                 kvc_,
                 kpe_,
                 cache_,
@@ -1593,8 +1663,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 skip_write=True,  # owned rows were written above
                 # the combine casts to this dtype anyway; bf16 halves the output pass
                 out_dtype=_DCP_COMBINE_DTYPE,
+                split_query=absorb,
             )
-            o = _dcp_lse_combine(o, lse, ql_.shape[1])
+            w_uv = jax.lax.all_gather(w_[1], "tensor", axis=1, tiled=True) if absorb else None
+            o = _dcp_lse_combine(o, lse, ql_.shape[1], w_uv=w_uv)
             return o.astype(ql_.dtype), cache_
 
         return jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
@@ -1610,6 +1682,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             md.cu_q_lens,
             md.cu_kv_lens,
             md.page_indices,
+            *(mla_absorb if absorb else ()),
         )
 
 
@@ -1685,13 +1758,17 @@ def _dcp_merge_topk(
     return jnp.where(top_vals > -jnp.inf, jnp.take_along_axis(idx, pos, axis=1), -1)
 
 
-def _dcp_lse_combine(o: jax.Array, lse: jax.Array, heads_local: int) -> jax.Array:
+def _dcp_lse_combine(
+    o: jax.Array, lse: jax.Array, heads_local: int, w_uv: jax.Array | None = None
+) -> jax.Array:
     """Merge per-rank partial attention over disjoint key sets.
 
     ``o`` [T, H, D] and ``lse`` [T, H] are this rank's all-head partials. Each
     rank scales its partial by its softmax share, then a reduce-scatter over
     ``tensor`` sums the shares (in ``DSA_DCP_COMBINE_DTYPE``) and returns this
-    rank's contiguous head block [T, heads_local, D] (fp32).
+    rank's contiguous head block [T, heads_local, D] (fp32). ``w_uv`` [D, H, Dv]
+    projects each rank's scaled partial before the sum (the projection is linear),
+    returning [T, heads_local, Dv].
     """
     lse = lse.astype(jnp.float32)
     lse_all = jax.lax.all_gather(lse, "tensor")  # [dcp, T, H]
@@ -1700,7 +1777,12 @@ def _dcp_lse_combine(o: jax.Array, lse: jax.Array, heads_local: int) -> jax.Arra
     w_all = jnp.where(jnp.isneginf(lse_all), 0.0, jnp.exp(lse_all - m))
     w_sum = jnp.sum(w_all, axis=0)
     w = jnp.where(jnp.isneginf(lse), 0.0, jnp.exp(lse - m)) / jnp.where(w_sum > 0, w_sum, 1.0)
-    scaled = (o.astype(jnp.float32) * w[..., None]).astype(_DCP_COMBINE_DTYPE)
+    scaled = o.astype(jnp.float32) * w[..., None]
+    if w_uv is not None:
+        scaled = jnp.einsum(
+            "thr,rhd->thd", scaled.astype(w_uv.dtype), w_uv, preferred_element_type=jnp.float32
+        )
+    scaled = scaled.astype(_DCP_COMBINE_DTYPE)
     out = jax.lax.psum_scatter(scaled, "tensor", scatter_dimension=1, tiled=True)
     assert out.shape[1] == heads_local
     return out.astype(jnp.float32)

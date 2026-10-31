@@ -416,6 +416,23 @@ class Glm5Attention(nnx.Module):
         token_to_kv_pool: KVCache,
         **dsa_kwargs,
     ) -> tuple[jax.Array, jax.Array]:
+        c_kv_3d = compressed[:, None, :]
+        absorbs = getattr(forward_batch.attn_backend, "absorbs_mla_in_prefill", None)
+        if absorbs is not None and absorbs(forward_batch):
+            # The backend absorbs W_UK into the query and applies W_UV itself
+            # (DSA_DCP_PREFILL_ABSORB), returning [T, H, v_head_dim].
+            attn_output, kv_fused = self.attn_mqa(
+                q_nope,
+                c_kv_3d,
+                c_kv_3d,
+                forward_batch=forward_batch,
+                token_to_kv_pool=token_to_kv_pool,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                mla_absorb=(self.w_uk.value, self.w_uv.value),
+                **dsa_kwargs,
+            )
+            return attn_output.reshape(-1, self.num_heads * self.v_head_dim), kv_fused
         # "thd,rhd->thr" — fp32 accumulate: on v7x the default bf16
         # accumulator drops enough precision on this small batched dot
         # (per-device [T, H/tp, 128]) that decode drifts into repetition
@@ -429,7 +446,6 @@ class Glm5Attention(nnx.Module):
         ).astype(q_nope.dtype)
         ql_nope = ql_nope.transpose(1, 0, 2)
 
-        c_kv_3d = compressed[:, None, :]
         attn_output, kv_fused = self.attn_mqa(
             ql_nope,
             c_kv_3d,

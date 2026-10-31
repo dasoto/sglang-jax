@@ -85,7 +85,7 @@ def _cache_loc(tokens, seq_lens):
 
 
 @functools.partial(jax.jit, static_argnames=("mode",))
-def _attend(backend, kv, idx, out_loc, positions, ql, qpe, kvc, kpe, qi, ki, wi, *, mode):
+def _attend(backend, kv, idx, out_loc, positions, ql, qpe, kvc, kpe, qi, ki, wi, absorb, *, mode):
     layer = SimpleNamespace(
         layer_id=0,
         scaling=1.0 / np.sqrt(192 + ROPE),
@@ -107,11 +107,12 @@ def _attend(backend, kv, idx, out_loc, positions, ql, qpe, kvc, kpe, qi, ki, wi,
         q_idx=qi,
         k_idx=ki,
         idx_weights=wi,
+        **({} if absorb is None else {"mla_absorb": absorb}),
     )
     return o, fused.kv, fused.idx
 
 
-def _step(mesh, st, mode, seq_lens, ext_lens, out_loc, positions, inputs):
+def _step(mesh, st, mode, seq_lens, ext_lens, out_loc, positions, inputs, absorb=None):
     batch = SimpleNamespace(
         dp_size=1,
         per_dp_bs_size=len(seq_lens),
@@ -139,6 +140,11 @@ def _step(mesh, st, mode, seq_lens, ext_lens, out_loc, positions, inputs):
             jax.device_put(qi, NamedSharding(mesh, P("data", None, None))),
             jax.device_put(ki, row),
             jax.device_put(wi, row),
+            (
+                None
+                if absorb is None
+                else jax.device_put(absorb, NamedSharding(mesh, P(None, "tensor")))
+            ),
             mode=mode,
         )
     st.pool.replace_buffer(([kv], [idx]))
@@ -212,6 +218,54 @@ def test_dsa_dcp4_matches_dcp1():
     o1 = _step(mesh, s1, ForwardMode.EXTEND, seq_lens, new, s1.loc, pos, x)
     o4 = _step(mesh, s4, ForwardMode.EXTEND, seq_lens, new, s4.loc, pos, x)
     _close(o4, o1, "chunked extend")
+
+
+def test_dsa_dcp4_prefill_absorb_matches_dcp1():
+    """DSA_DCP_PREFILL_ABSORB path: dcp=4 prefill given the pre-absorption q_nope and
+    mla_absorb=(W_UK, W_UV) returns the W_UV-projected output of the dcp=1 path fed
+    the absorbed query (fresh extend, then a chunked extend over the cached prefix)."""
+    mesh = Mesh(np.array(jax.local_devices()[:4]).reshape(1, 4), ("data", "tensor"))
+    rng = np.random.default_rng(20261031)
+    s1, s4 = Setup(mesh, 1), Setup(mesh, 4)
+    w_uk = jnp.asarray(rng.standard_normal((LKV, HEADS, 192)) / np.sqrt(192), jnp.bfloat16)
+    w_uv = jnp.asarray(rng.standard_normal((LKV, HEADS, 256)) / np.sqrt(LKV), jnp.bfloat16)
+
+    def both(seq_lens, ext_lens, prefix, pos):
+        x = _inputs(rng, int(np.sum(ext_lens)))
+        q_nope = jnp.asarray(rng.standard_normal((x[0].shape[0], HEADS, 192)) * 0.3, jnp.bfloat16)
+        q_lat = jnp.einsum("thd,rhd->thr", q_nope, w_uk, preferred_element_type=jnp.float32)
+        x1 = (q_lat.astype(jnp.bfloat16),) + x[1:]
+        x4 = (q_nope,) + x[1:]
+        outs = []
+        for st, xi, absorb in ((s1, x1, None), (s4, x4, (w_uk, w_uv))):
+            last = [t[-1] for t in st.tokens] if prefix else [-1] * len(seq_lens)
+            loc = st.alloc.alloc_extend(
+                prefix or [0] * len(seq_lens), seq_lens, last, sum(ext_lens)
+            )
+            c = np.cumsum([0] + list(ext_lens))
+            if prefix:
+                for i in range(len(seq_lens)):
+                    st.tokens[i].extend(int(v) for v in loc[c[i] : c[i + 1]])
+            else:
+                st.tokens = [list(loc[c[i] : c[i + 1]]) for i in range(len(seq_lens))]
+            outs.append(
+                _step(mesh, st, ForwardMode.EXTEND, seq_lens, ext_lens, loc, pos, xi, absorb)
+            )
+        o1 = np.einsum("thr,rhd->thd", outs[0], np.asarray(w_uv, np.float32))
+        assert outs[1].shape == o1.shape, (outs[1].shape, o1.shape)
+        return outs[1], o1
+
+    seq_lens = [700, 128, 1000]
+    pos = np.concatenate([np.arange(n) for n in seq_lens])
+    o4, o1 = both(seq_lens, seq_lens, None, pos)
+    _close(o4, o1, "absorb extend")
+
+    new = [300, 64, 129]
+    prefix = list(seq_lens)
+    seq_lens = [p + n for p, n in zip(prefix, new)]
+    pos = np.concatenate([np.arange(p, p + n) for p, n in zip(prefix, new)])
+    o4, o1 = both(seq_lens, new, prefix, pos)
+    _close(o4, o1, "absorb chunked extend")
 
 
 @pytest.mark.parametrize("recall", [0.0, 0.95])
