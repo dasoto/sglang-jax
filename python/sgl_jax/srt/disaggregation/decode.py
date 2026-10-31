@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import random
 import threading
 import time
 from collections import deque
@@ -60,6 +62,27 @@ def _batch_req_count_for_dp(batch, dp_rank: int) -> int:
         if (getattr(req, "dp_rank", None) if getattr(req, "dp_rank", None) is not None else 0)
         == dp_rank
     )
+
+
+def _list_prefills_with_retry(client, attempts: int | None = None, delay_s: float = 0.5):
+    """``list_prefills`` retried on transient errors: all D hosts query the one
+    bootstrap server in the same tick, and some connections get reset."""
+    if attempts is None:
+        attempts = int(os.environ.get("SGLANG_JAX_PD_BOOTSTRAP_LIST_ATTEMPTS", "60"))
+    for attempt in range(attempts):
+        try:
+            return client.list_prefills()
+        except Exception as exc:  # noqa: BLE001
+            if attempt + 1 >= attempts:
+                raise
+            logger.warning(
+                "bootstrap list_prefills attempt %d/%d failed (%s); retrying",
+                attempt + 1,
+                attempts,
+                exc,
+            )
+            time.sleep(delay_s * (1.0 + random.random()))
+    raise AssertionError("unreachable")
 
 
 def _request_dp_rank(req, dp_size: int, *, prefill: bool = False) -> int:
@@ -603,6 +626,11 @@ class SchedulerDisaggregationDecodeMixin:
         """Multi-host: find the P host whose jax_process_index matches ours.
         That host's local KV shard is exactly the slice this D host needs.
         Requires P/D to have the same nproc (same-TP constraint).
+
+        Every NP runs this lookup in the same tick. An NP whose lookup fails
+        while the others succeed drops the request alone and wedges the
+        cross-NP transfer sync, so transient bootstrap errors are retried and
+        one listing caches this host's peer for every DP rank.
         """
         peers = getattr(self, "_disagg_prefill_peers", None)
         if peers is None:
@@ -611,19 +639,18 @@ class SchedulerDisaggregationDecodeMixin:
             return peers[dp_rank]
         my_pidx = jax.process_index()
         my_nproc = jax.process_count()
-        all_p = self.disagg_bootstrap_client.list_prefills()
+        all_p = _list_prefills_with_retry(self.disagg_bootstrap_client)
         for p in all_p:
-            if (
-                int(p.get("jax_process_index", -1)) == my_pidx
-                and int(p.get("system_dp_rank", 0)) == dp_rank
-            ):
-                if int(p.get("jax_process_count", 0)) != my_nproc:
-                    raise RuntimeError(
-                        f"P/D process_count mismatch: P={p.get('jax_process_count')} "
-                        f"D={my_nproc}. Per-host shard transfer requires same nproc."
-                    )
-                peers[dp_rank] = p
-                return p
+            if int(p.get("jax_process_index", -1)) != my_pidx:
+                continue
+            if int(p.get("jax_process_count", 0)) != my_nproc:
+                raise RuntimeError(
+                    f"P/D process_count mismatch: P={p.get('jax_process_count')} "
+                    f"D={my_nproc}. Per-host shard transfer requires same nproc."
+                )
+            peers.setdefault(int(p.get("system_dp_rank", 0)), p)
+        if dp_rank in peers:
+            return peers[dp_rank]
         raise RuntimeError(
             f"no prefill host with jax_process_index={my_pidx}, dp_rank={dp_rank} "
             "registered (got "

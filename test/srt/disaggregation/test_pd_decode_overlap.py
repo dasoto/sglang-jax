@@ -203,6 +203,41 @@ def test_multihost_transfer_drain_joins_sync_with_empty_queue(monkeypatch, sync_
     assert calls == ([[]] if sync_tick else [])
 
 
+def test_peer_lookup_retries_reset_connections_and_caches_every_dp_rank(monkeypatch):
+    """All D NPs query the bootstrap server in the same tick; a reset connection on
+    one NP must be retried (not abort the request on that NP alone), and one
+    listing must serve every DP rank so later ranks need no network I/O."""
+    monkeypatch.setattr(decode.jax, "process_index", lambda: 3)
+    monkeypatch.setattr(decode.jax, "process_count", lambda: 4)
+    monkeypatch.setattr(decode.time, "sleep", lambda _: None)
+    listing = [
+        {"host": f"p{pidx}", "jax_process_index": pidx, "jax_process_count": 4, "system_dp_rank": r}
+        for pidx in range(4)
+        for r in range(2)
+    ]
+    calls = []
+
+    class _Client:
+        def list_prefills(self):
+            calls.append(1)
+            if len(calls) < 3:
+                raise ConnectionResetError("Connection reset by peer")
+            return listing
+
+    scheduler = SimpleNamespace(disagg_bootstrap_client=_Client())
+    pick = decode.SchedulerDisaggregationDecodeMixin._pick_prefill_peer_for_this_host
+    assert pick(scheduler, 1) == {
+        "host": "p3",
+        "jax_process_index": 3,
+        "jax_process_count": 4,
+        "system_dp_rank": 1,
+    }
+    assert pick(scheduler, 0)["host"] == "p3"
+    assert len(calls) == 3
+    with pytest.raises(RuntimeError, match="dp_rank=5"):
+        pick(scheduler, 5)
+
+
 @pytest.mark.parametrize("role", ["prefill", "decode"])
 def test_pause_drains_role_before_retracting_running_requests(role):
     events = []
