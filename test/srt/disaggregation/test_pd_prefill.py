@@ -793,3 +793,80 @@ def test_path_a_rollback_releases_only_registered_sub_uuids_no_double_free():
     assert w.released == ["uuid-1:a"]
     # pool slot was NEVER released (scheduler prefill-terminal callback owns it)
     assert pool.released == []
+
+
+# ---- multi-host synced prefill drain ----
+from sgl_jax.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin  # noqa: E402
+
+
+class _PollSender:
+    def __init__(self, state):
+        self.state = state
+        self.failed = False
+        self.cleared = False
+
+    def poll(self):
+        return self.state
+
+    def fail(self, *, reason="x"):
+        self.failed = True
+
+    def clear(self):
+        self.cleared = True
+
+
+def _synced_scheduler(states):
+    queue = PrefillBootstrapQueue()
+    for room, state in states.items():
+        req = SimpleNamespace(bootstrap_room=room, disagg_synced_state=None)
+        queue.add(f"req-{room}", _PollSender(state), on_terminal=None, req=req)
+    return SimpleNamespace(disagg_prefill_queue=queue, _pd_sync_prefill_this_tick=True)
+
+
+def test_synced_prefill_drain_releases_only_agreed_rooms(monkeypatch):
+    import sgl_jax.srt.disaggregation.common.multihost_sync as sync
+
+    sched = _synced_scheduler({1: KVPoll.SUCCESS, 2: KVPoll.SUCCESS, 3: KVPoll.FAILED})
+    # Another NP has not finished room 2 yet: only 1 (all SUCCESS) and 3 (a FAILED) agree.
+    monkeypatch.setattr(sync, "synced_terminal_rooms", lambda entries, poll_fn, room_fn: ({1}, {3}))
+    out = SchedulerDisaggregationPrefillMixin._drain_prefill_queue_synced(sched)
+    got = {e.req.bootstrap_room: e.req.disagg_synced_state for e in out}
+    assert got == {1: KVPoll.SUCCESS, 3: KVPoll.FAILED}
+    assert list(sched.disagg_prefill_queue._entries) == ["req-2"]
+
+    sched._pd_sync_prefill_this_tick = False  # off-tick: every NP skips the allgather
+    assert SchedulerDisaggregationPrefillMixin._drain_prefill_queue_synced(sched) == []
+    assert len(sched.disagg_prefill_queue) == 1
+
+
+def test_synced_prefill_drain_holds_success_until_compute_released():
+    sched = _synced_scheduler({1: KVPoll.SUCCESS, 2: KVPoll.SUCCESS})
+    out = SchedulerDisaggregationPrefillMixin._drain_prefill_queue_synced(
+        sched, can_release=lambda req: req.bootstrap_room != 2
+    )
+    assert [e.req.bootstrap_room for e in out] == [1]
+    assert list(sched.disagg_prefill_queue._entries) == ["req-2"]
+
+
+def test_transfer_terminal_follows_agreed_failure():
+    calls = []
+    sched = SimpleNamespace(
+        server_args=SimpleNamespace(enable_request_time_stats_logging=False),
+        _retire_chunk_producer_ownership=lambda req: None,
+        _finish_prefill_only_success=lambda req: calls.append("success"),
+        _finish_prefill_only_failure=lambda req, sender: calls.append("failure"),
+        _pd_mark_time=lambda req, name: None,
+        _release_prefill_req_resources=lambda req: calls.append("release"),
+        _stream_prefill_req=lambda req: None,
+    )
+    sender = _PollSender(KVPoll.SUCCESS)  # this NP saw SUCCESS, another NP failed
+    req = SimpleNamespace(
+        rid="r",
+        disagg_chunk_sender=None,
+        to_finish=None,
+        pd_time_stats=None,
+        disagg_synced_state=KVPoll.FAILED,
+    )
+    SchedulerDisaggregationPrefillMixin._on_prefill_transfer_terminal(sched, req, sender)
+    assert calls == ["failure", "release"]
+    assert sender.failed and sender.cleared and req.disagg_synced_state is None

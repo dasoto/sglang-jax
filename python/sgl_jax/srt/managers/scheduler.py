@@ -119,14 +119,16 @@ from sgl_jax.utils import TypeBasedDispatcher, get_exception_traceback
 
 logger = logging.getLogger(__name__)
 _PREFILL_SUF_SCHEDULE = os.environ.get("SGLANG_JAX_PREFILL_SUF_SCHEDULE", "1").strip().lower() in (
-    "1", "true", "yes", "on")
+    "1",
+    "true",
+    "yes",
+    "on",
+)
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 TEST_RETRACT_INTERVAL = int(os.environ.get("SGLANG_TEST_RETRACT_INTERVAL", "3"))
-TEST_RETRACT_NO_PREFILL_BS = int(
-    os.environ.get("SGLANG_TEST_RETRACT_NO_PREFILL_BS", str(2**31))
-)
+TEST_RETRACT_NO_PREFILL_BS = int(os.environ.get("SGLANG_TEST_RETRACT_NO_PREFILL_BS", str(2**31)))
 RECORD_STEP_TIME = get_bool_env_var("SGLANG_RECORD_STEP_TIME")
 GRAMMAR_TIMEOUT = float(os.environ.get("SGLANG_GRAMMAR_TIMEOUT", 300))
 
@@ -249,9 +251,7 @@ class Scheduler(
         self.stream_interval = server_args.stream_interval
         self.max_seq_len = server_args.max_seq_len
         self.page_size = server_args.page_size
-        self.spec_algorithm = SpeculativeAlgorithm.from_string(
-            server_args.speculative_algorithm
-        )
+        self.spec_algorithm = SpeculativeAlgorithm.from_string(server_args.speculative_algorithm)
 
         # PD disaggregation runtime attributes. They are populated by
         # install_disaggregation_wiring() when disaggregation_mode != "null".
@@ -309,9 +309,7 @@ class Scheduler(
                     context, zmq.DEALER, port_args.rpc_ipc_name, False
                 )
                 if self.nnodes > 1:
-                    self.publisher = get_zmq_socket(
-                        context, zmq.PUB, self.pub_sub_addr, bind=True
-                    )
+                    self.publisher = get_zmq_socket(context, zmq.PUB, self.pub_sub_addr, bind=True)
                     self.publisher_sync = get_zmq_socket(
                         context, zmq.REP, self.pub_sub_sync_addr, bind=True
                     )
@@ -322,9 +320,7 @@ class Scheduler(
             self.send_to_tokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             self.send_to_detokenizer = SimpleNamespace(send_pyobj=lambda x: None)
             if self.nnodes > 1:
-                self.subscriber = get_zmq_socket(
-                    context, zmq.SUB, self.pub_sub_addr, bind=False
-                )
+                self.subscriber = get_zmq_socket(context, zmq.SUB, self.pub_sub_addr, bind=False)
                 self.subscriber.setsockopt(zmq.SUBSCRIBE, b"")
                 self.subscriber.setsockopt(zmq.RCVTIMEO, 5000)
                 self.subscriber_sync = get_zmq_socket(
@@ -344,9 +340,7 @@ class Scheduler(
         # generic overlap flag without an architecture allowlist.
         if server_args.multimodal:
             self.enable_overlap = False
-            logger.info(
-                "Overlap scheduler is disabled for the multimodal stage pipeline."
-            )
+            logger.info("Overlap scheduler is disabled for the multimodal stage pipeline.")
         if server_args.disaggregation_mode != "null":
             self.enable_overlap = server_args.disaggregation_enable_overlap_schedule
             logger.info("PD scheduler overlap enabled=%s", self.enable_overlap)
@@ -373,13 +367,9 @@ class Scheduler(
         # init distribution
         if self.nnodes > 1:
             if not jax.distributed.is_initialized():
-                jax.distributed.initialize(
-                    server_args.dist_init_addr, self.nnodes, self.node_rank
-                )
+                jax.distributed.initialize(server_args.dist_init_addr, self.nnodes, self.node_rank)
             else:
-                logger.info(
-                    "JAX distributed already initialized, skipping re-initialization"
-                )
+                logger.info("JAX distributed already initialized, skipping re-initialization")
 
         platform = os.getenv("JAX_PLATFORMS", None)
         if platform == "proxy":
@@ -401,9 +391,7 @@ class Scheduler(
             )
 
         if server_args.moe_backend in ("fused", "fused_v2"):
-            mesh_ep_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get(
-                "tensor", 1
-            )
+            mesh_ep_size = self.mesh.shape.get("data", 1) * self.mesh.shape.get("tensor", 1)
             if server_args.ep_size != mesh_ep_size:
                 logger.warning(
                     "moe_backend='fused' uses EP size = mesh(data*tensor)=%d, but --ep-size=%d. "
@@ -419,9 +407,7 @@ class Scheduler(
 
         self.tp_worker_p = None
         if self.pd:
-            self._pd_init_workers(
-                server_args, model_class, precompile_params, TpWorkerClass
-            )
+            self._pd_init_workers(server_args, model_class, precompile_params, TpWorkerClass)
         else:
             self.tp_worker = TpWorkerClass(
                 server_args=server_args,
@@ -439,9 +425,7 @@ class Scheduler(
             # DeepSeek-style configs expose num_nextn_predict_layers; MiMo-style
             # configs don't, so fall back to --speculative-num-steps under NEXTN
             # (one MTP weight set per step).
-            n_mtp = getattr(
-                self.tp_worker.model_config.hf_config, "num_nextn_predict_layers", None
-            )
+            n_mtp = getattr(self.tp_worker.model_config.hf_config, "num_nextn_predict_layers", None)
             if n_mtp is None and self.spec_algorithm.is_nextn():
                 n_mtp = server_args.speculative_num_steps
             self._spec_multi_layer = n_mtp is not None and n_mtp > 1
@@ -458,9 +442,7 @@ class Scheduler(
                 server_args=server_args,
                 target_worker=self.tp_worker,
             )
-            if self.enable_overlap and hasattr(
-                self.draft_worker, "init_spec_relay_buffers"
-            ):
+            if self.enable_overlap and hasattr(self.draft_worker, "init_spec_relay_buffers"):
                 self.draft_worker.init_spec_relay_buffers()
         elif self.spec_algorithm is not None and self.spec_algorithm.is_dflash_family():
             if self.spec_algorithm.is_dspark():
@@ -497,9 +479,7 @@ class Scheduler(
 
         # Adjust max_running_requests to be divisible by dp_size
         if self.max_running_requests % self.dp_size != 0:
-            self.max_running_requests = (
-                self.max_running_requests // self.dp_size
-            ) * self.dp_size
+            self.max_running_requests = (self.max_running_requests // self.dp_size) * self.dp_size
         self.per_dp_max_running_requests = self.max_running_requests // self.dp_size
 
         self.is_hybrid = self.tp_worker.is_hybrid
@@ -590,17 +570,13 @@ class Scheduler(
             self.schedule_policy,
             self.tree_cache,
         )
-        assert (
-            server_args.schedule_conservativeness >= 0
-        ), "Invalid schedule_conservativeness"
+        assert server_args.schedule_conservativeness >= 0, "Invalid schedule_conservativeness"
         self.init_new_token_ratio = min(
-            global_config.default_init_new_token_ratio
-            * server_args.schedule_conservativeness,
+            global_config.default_init_new_token_ratio * server_args.schedule_conservativeness,
             1.0,
         )
         self.min_new_token_ratio = min(
-            self.init_new_token_ratio
-            * global_config.default_min_new_token_ratio_factor,
+            self.init_new_token_ratio * global_config.default_min_new_token_ratio_factor,
             1.0,
         )
         self.new_token_ratio_decay = (
@@ -677,7 +653,9 @@ class Scheduler(
             from jax.experimental.compilation_cache import compilation_cache as cc
 
             cc.reset_cache()
-            cache_status = f"disabled for non-zero-base device subset: device_indexes={device_indexes}"
+            cache_status = (
+                f"disabled for non-zero-base device subset: device_indexes={device_indexes}"
+            )
         if jit_cache_dir is not None:
             jax.config.update("jax_compilation_cache_dir", jit_cache_dir)
             # Default the compile-time write threshold to 0 (cache every compile) for
@@ -695,9 +673,7 @@ class Scheduler(
 
             cc.set_cache_dir(jit_cache_dir)
             min_compile_time = jax.config.jax_persistent_cache_min_compile_time_secs
-            cache_status = (
-                f"enabled, dir={jit_cache_dir}, min_compile_time={min_compile_time}s"
-            )
+            cache_status = f"enabled, dir={jit_cache_dir}, min_compile_time={min_compile_time}s"
 
         if cache_status is None:
             cache_status = "not configured (JAX_COMPILATION_CACHE_DIR unset)"
@@ -727,9 +703,7 @@ class Scheduler(
                 else:
                     self.publisher_sync.send_string("NACK")
         except zmq.Again:
-            logger.error(
-                "[Publisher %s] Fails to synchronize due to timeout", self.node_rank
-            )
+            logger.error("[Publisher %s] Fails to synchronize due to timeout", self.node_rank)
             return False
         except Exception as e:
             logger.error("[Publisher %s] Encounters error: %s", self.node_rank, e)
@@ -753,9 +727,7 @@ class Scheduler(
                 )
                 return False
         except Exception as e:
-            logger.error(
-                "[Subscriber %s] Fails to synchronize with error: %s", self.node_rank, e
-            )
+            logger.error("[Subscriber %s] Fails to synchronize with error: %s", self.node_rank, e)
             return False
 
     def sync_pub_sub(self):
@@ -767,9 +739,7 @@ class Scheduler(
         server_args = self.server_args
         self.model_config = ModelConfig.from_server_args(server_args)
         apply_multimodal_model_defaults(server_args, self.model_config)
-        self.model_config.hf_config.vision_encoder_parallel = (
-            server_args.vision_encoder_parallel
-        )
+        self.model_config.hf_config.vision_encoder_parallel = server_args.vision_encoder_parallel
         self.is_generation = self.model_config.is_generation
         if server_args.skip_tokenizer_init:
             self.tokenizer = self.processor = None
@@ -791,9 +761,7 @@ class Scheduler(
     def init_memory_pool_and_cache(self):
         from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool
 
-        self.req_to_token_pool, self.token_to_kv_pool_allocator = (
-            self.tp_worker.get_memory_pool()
-        )
+        self.req_to_token_pool, self.token_to_kv_pool_allocator = self.tp_worker.get_memory_pool()
         self.embedding_pool = self.tp_worker.get_embedding_pool()
         self.tree_cache = build_kv_cache(
             server_args=self.server_args,
@@ -802,18 +770,14 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             page_size=self.page_size,
             is_hybrid=self.is_hybrid,
-            is_hybrid_recurrent=isinstance(
-                self.req_to_token_pool, HybridReqToTokenPool
-            ),
+            is_hybrid_recurrent=isinstance(self.req_to_token_pool, HybridReqToTokenPool),
             sliding_window_size=self.sliding_window_size,
             tp_size=self.tp_size,
             spec_algorithm=self.spec_algorithm,
             mesh=self.mesh,
         )
         if isinstance(self.tree_cache, UnifiedRadixCache):
-            components = [
-                component.name for component in self.tree_cache.tree_components
-            ]
+            components = [component.name for component in self.tree_cache.tree_components]
             logger.info(
                 "KV cache initialized: implementation=%s components=%s "
                 "sliding_window=%s page_size=%s hybrid=%s recurrent=%s",
@@ -1139,9 +1103,7 @@ class Scheduler(
                 # Process the results of the last batch
                 tmp_batch, tmp_result = self.result_queue.popleft()
                 tmp_batch.next_batch_sampling_info = (
-                    self._current_sampling_info_owner().cur_sampling_info
-                    if batch
-                    else None
+                    self._current_sampling_info_owner().cur_sampling_info if batch else None
                 )
                 # NOTE: we should use current launched batch's launch_done event Instead of the last batch's
                 self.process_batch_result(
@@ -1206,9 +1168,7 @@ class Scheduler(
         else:
             recv_reqs = self.run_subscriber()
             if recv_reqs is None:
-                raise ReceiveDataError(
-                    f"[Subscriber {self.node_rank}] Fails to receive data"
-                )
+                raise ReceiveDataError(f"[Subscriber {self.node_rank}] Fails to receive data")
         return recv_reqs
 
     def _wait_for_requests_if_idle(self) -> None:
@@ -1269,16 +1229,38 @@ class Scheduler(
                             pass
                     if any_terminal or self._pd_sync_tick_counter % 64 == 0:
                         recv_reqs.append("_PD_SYNC_TRANSFERS")
+            prefill_queue = getattr(self, "disagg_prefill_queue", None)
+            if self.nnodes > 1 and prefill_queue is not None:
+                # Prefill NPs release finished transfers together (see
+                # _drain_prefill_queue_synced); rank 0 marks the ticks to sync on.
+                with prefill_queue._lock:
+                    p_entries = list(prefill_queue._entries.values())
+                if p_entries:
+                    from sgl_jax.srt.disaggregation.base.kv_manager import KVPoll
+
+                    self._pd_prefill_sync_counter = getattr(self, "_pd_prefill_sync_counter", 0) + 1
+                    any_terminal = False
+                    for e in p_entries:
+                        try:
+                            if e.sender.poll() in (KVPoll.SUCCESS, KVPoll.FAILED):
+                                any_terminal = True
+                        except Exception:
+                            pass
+                    if any_terminal or self._pd_prefill_sync_counter % 64 == 0:
+                        recv_reqs.append("_PD_SYNC_PREFILL")
         else:
             recv_reqs = None
 
         if self.nnodes > 1:
             recv_reqs = self.broadcast_pyobj(recv_reqs)
+            self._pd_sync_prefill_this_tick = False
+            self._pd_sync_transfers_this_tick = False
+            if recv_reqs and recv_reqs[-1] == "_PD_SYNC_PREFILL":
+                recv_reqs.pop()
+                self._pd_sync_prefill_this_tick = True
             if recv_reqs and recv_reqs[-1] == "_PD_SYNC_TRANSFERS":
                 recv_reqs.pop()
                 self._pd_sync_transfers_this_tick = True
-            else:
-                self._pd_sync_transfers_this_tick = False
         return recv_reqs
 
     def process_input_requests(self, recv_reqs: list):
@@ -1325,9 +1307,7 @@ class Scheduler(
                 "verify rows require accepted-token selection."
             )
             req.check_finished()
-            self.stream_output(
-                [req], req.return_logprob, req.return_output_logprob_only
-            )
+            self.stream_output([req], req.return_logprob, req.return_output_logprob_only)
             return
         # PD disaggregation routing keys.
         req.bootstrap_host = recv_req.bootstrap_host
@@ -1346,15 +1326,11 @@ class Scheduler(
             return
         if hasattr(recv_req, "mm_inputs") and recv_req.mm_inputs:
             req.mm_inputs = recv_req.mm_inputs
-            multimodal_embedding = _extract_mm_value(
-                recv_req.mm_inputs, "multimodal_embedding"
-            )
+            multimodal_embedding = _extract_mm_value(recv_req.mm_inputs, "multimodal_embedding")
             req.multimodal_embedding = multimodal_embedding
             if (
-                _extract_mm_value(recv_req.mm_inputs, "deepstack_visual_pos_mask")
-                is not None
-                and _extract_mm_value(recv_req.mm_inputs, "deepstack_visual_embedding")
-                is not None
+                _extract_mm_value(recv_req.mm_inputs, "deepstack_visual_pos_mask") is not None
+                and _extract_mm_value(recv_req.mm_inputs, "deepstack_visual_embedding") is not None
             ):
                 req.apply_for_deepstack = True
                 req.deepstack_visual_pos_mask = _extract_mm_value(
@@ -1468,17 +1444,13 @@ class Scheduler(
                 # Cache the compiled grammar
                 if self.grammar_backend and req.grammar_key:
                     cached_grammar = (
-                        req.grammar
-                        if req.grammar is INVALID_GRAMMAR_OBJ
-                        else req.grammar.copy()
+                        req.grammar if req.grammar is INVALID_GRAMMAR_OBJ else req.grammar.copy()
                     )
                     self.grammar_backend.set_cache(req.grammar_key, cached_grammar)
 
                 # Check if compilation resulted in invalid grammar
                 if req.grammar is INVALID_GRAMMAR_OBJ:
-                    req.set_finish_with_abort(
-                        f"Invalid grammar request: key={req.grammar_key}"
-                    )
+                    req.set_finish_with_abort(f"Invalid grammar request: key={req.grammar_key}")
 
                 num_ready_reqs += 1
             except futures._base.TimeoutError:
@@ -1510,9 +1482,7 @@ class Scheduler(
             self.cum_spec_accept_length, self.cum_spec_accept_count
         )
         ret["memory_usage"] = {
-            "kvcache": round(
-                self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2
-            ),
+            "kvcache": round(self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 2),
             "token_capacity": int(self.max_total_num_tokens),
         }
 
@@ -1523,27 +1493,16 @@ class Scheduler(
         ret["running_batch_size"] = (
             0 if self.running_batch.is_empty() else self.running_batch.batch_size()
         )
-        ret["prefill_decode_size"] = (
-            ret["waiting_queue_size"] + ret["running_batch_size"]
-        )
+        ret["prefill_decode_size"] = ret["waiting_queue_size"] + ret["running_batch_size"]
         ret["waiting_queue_rids"] = [req.rid for req in self.waiting_queue]
-        all_reqs = [
-            req
-            for info in self.running_batch.reqs_info
-            for req in info.reqs
-            if info.reqs
-        ]
-        ret["running_batch_rids"] = (
-            [req.rid for req in all_reqs] if len(all_reqs) != 0 else []
-        )
+        all_reqs = [req for info in self.running_batch.reqs_info for req in info.reqs if info.reqs]
+        ret["running_batch_rids"] = [req.rid for req in all_reqs] if len(all_reqs) != 0 else []
 
         # scheduling state
         ret["cur_batch_is_none"] = self.cur_batch is None
         ret["last_batch_is_none"] = self.last_batch is None
         ret["chunked_req_is_none"] = all(r is None for r in self.chunked_reqs)
-        ret["chunked_req_rids"] = [
-            r.rid if r is not None else None for r in self.chunked_reqs
-        ]
+        ret["chunked_req_rids"] = [r.rid if r is not None else None for r in self.chunked_reqs]
 
         # request cache stat
         if isinstance(self.tree_cache, ChunkCache):
@@ -1612,9 +1571,7 @@ class Scheduler(
                         precision_tracer._request_counter = 0
                         precision_tracer._completed_requests_count = 0
                         precision_tracer._request_traces = {}
-                        logger.info(
-                            "[SCHEDULER] Reset request_counter, completed_count and traces"
-                        )
+                        logger.info("[SCHEDULER] Reset request_counter, completed_count and traces")
 
                 if "max_requests" in tracer_config:
                     precision_tracer._max_requests = tracer_config["max_requests"]
@@ -1637,9 +1594,7 @@ class Scheduler(
                         precision_tracer._save_tensor,
                     )
 
-                logger.info(
-                    "[SCHEDULER] Precision tracer state updated: %s", tracer_config
-                )
+                logger.info("[SCHEDULER] Precision tracer state updated: %s", tracer_config)
 
         except Exception as e:
             success = False
@@ -1674,9 +1629,7 @@ class Scheduler(
         current_batch_reqs = _batch_size(self.cur_batch)
         last_batch_reqs = _batch_size(self.last_batch)
         chunked_pending = any(req is not None for req in self.chunked_reqs)
-        pending_results = (
-            len(getattr(self, "result_queue", ())) if self.enable_overlap else 0
-        )
+        pending_results = len(getattr(self, "result_queue", ())) if self.enable_overlap else 0
 
         has_pending = (
             waiting_reqs > 0
@@ -1694,11 +1647,7 @@ class Scheduler(
         pd_transfer = len(self.disagg_transfer_queue or ())
         pd_bootstrap = len(self._pd_pending_bootstrap)
         has_pending = (
-            has_pending
-            or pd_prefill > 0
-            or pd_prealloc > 0
-            or pd_transfer > 0
-            or pd_bootstrap > 0
+            has_pending or pd_prefill > 0 or pd_prealloc > 0 or pd_transfer > 0 or pd_bootstrap > 0
         )
 
         if has_pending:
@@ -1828,12 +1777,8 @@ class Scheduler(
         if self.is_hybrid:
             # Per-rank invariant: available + evictable + protected == size_per_rank.
             # Checking per-rank avoids one rank's over-count masking another's leak.
-            full_size_per_rank = (
-                self.token_to_kv_pool_allocator.full_attn_allocator.size_per_rank
-            )
-            swa_size_per_rank = (
-                self.token_to_kv_pool_allocator.swa_attn_allocator.size_per_rank
-            )
+            full_size_per_rank = self.token_to_kv_pool_allocator.full_attn_allocator.size_per_rank
+            swa_size_per_rank = self.token_to_kv_pool_allocator.swa_attn_allocator.size_per_rank
             is_unified = isinstance(self.tree_cache, UnifiedRadixCache)
             if is_unified:
                 # A paged allocation reserves a whole page even when the tree
@@ -1851,9 +1796,7 @@ class Scheduler(
                     if capacity < 0 or capacity % page_size != 0:
                         return f"[dp={dp}][{pool}] {capacity=}, {page_size=} must be page-aligned"
                     if available < 0 or available > capacity:
-                        return (
-                            f"[dp={dp}][{pool}] {available=} outside [0, {capacity=}]"
-                        )
+                        return f"[dp={dp}][{pool}] {available=} outside [0, {capacity=}]"
                     if available % page_size != 0:
                         return f"[dp={dp}][{pool}] {available=}, {page_size=} must be page-aligned"
 
@@ -1919,8 +1862,7 @@ class Scheduler(
                         )
             if leak_msgs:
                 raise ValueError(
-                    "token_to_kv_pool_allocator memory leak detected!\n"
-                    + "\n".join(leak_msgs)
+                    "token_to_kv_pool_allocator memory leak detected!\n" + "\n".join(leak_msgs)
                 )
         else:
             size_per_rank = self.token_to_kv_pool_allocator.size_per_rank
@@ -1931,13 +1873,11 @@ class Scheduler(
                 protected = self.tree_cache.protected_size(dp_rank=dp)
                 if avail + evict + protected != size_per_rank:
                     leak_msgs.append(
-                        f"[dp={dp}] expected={size_per_rank}, "
-                        f"{avail=}, {evict=}, {protected=}"
+                        f"[dp={dp}] expected={size_per_rank}, " f"{avail=}, {evict=}, {protected=}"
                     )
             if leak_msgs:
                 raise ValueError(
-                    "token_to_kv_pool_allocator memory leak detected!\n"
-                    + "\n".join(leak_msgs)
+                    "token_to_kv_pool_allocator memory leak detected!\n" + "\n".join(leak_msgs)
                 )
 
         req_total_size = self.req_to_token_pool.size
@@ -1956,10 +1896,7 @@ class Scheduler(
 
     def _get_token_info(self):
         available_size = sum(
-            [
-                self.token_to_kv_pool_allocator.free_size(dp)
-                for dp in range(self.dp_size)
-            ]
+            [self.token_to_kv_pool_allocator.free_size(dp) for dp in range(self.dp_size)]
         )
         # Sum evictable size across all DP ranks
         evictable_size = sum(
@@ -1971,35 +1908,19 @@ class Scheduler(
 
     def _get_swa_token_info(self):
         full_available_size = sum(
-            [
-                self.token_to_kv_pool_allocator.full_available_size(dp)
-                for dp in range(self.dp_size)
-            ]
+            [self.token_to_kv_pool_allocator.full_available_size(dp) for dp in range(self.dp_size)]
         )
         full_evictable_size = sum(
-            [
-                self.tree_cache.full_evictable_size(dp_rank=dp)
-                for dp in range(self.dp_size)
-            ]
+            [self.tree_cache.full_evictable_size(dp_rank=dp) for dp in range(self.dp_size)]
         )
         swa_available_size = sum(
-            [
-                self.token_to_kv_pool_allocator.swa_available_size(dp)
-                for dp in range(self.dp_size)
-            ]
+            [self.token_to_kv_pool_allocator.swa_available_size(dp) for dp in range(self.dp_size)]
         )
         swa_evictable_size = sum(
-            [
-                self.tree_cache.swa_evictable_size(dp_rank=dp)
-                for dp in range(self.dp_size)
-            ]
+            [self.tree_cache.swa_evictable_size(dp_rank=dp) for dp in range(self.dp_size)]
         )
-        full_num_used = self.full_tokens_per_layer - (
-            full_available_size + full_evictable_size
-        )
-        swa_num_used = self.swa_tokens_per_layer - (
-            swa_available_size + swa_evictable_size
-        )
+        full_num_used = self.full_tokens_per_layer - (full_available_size + full_evictable_size)
+        swa_num_used = self.swa_tokens_per_layer - (swa_available_size + swa_evictable_size)
         full_token_usage = full_num_used / self.full_tokens_per_layer
         swa_token_usage = swa_num_used / self.swa_tokens_per_layer
         return (
@@ -2035,9 +1956,9 @@ class Scheduler(
             if req is None:
                 continue
             chunked_req_to_exclude[dp_rank] = req
-            if self._pending_chunked_abort_reqs[dp_rank] is None and len(
-                req.fill_ids
-            ) > len(req.prefix_indices):
+            if self._pending_chunked_abort_reqs[dp_rank] is None and len(req.fill_ids) > len(
+                req.prefix_indices
+            ):
                 self.tree_cache.cache_unfinished_req(req)
         return chunked_req_to_exclude
 
@@ -2045,9 +1966,7 @@ class Scheduler(
         if self.pd == "pathways":
             return
         for dp_rank, req in enumerate(self.chunked_reqs):
-            if req is None or (
-                not recv_req.abort_all and not req.rid.startswith(recv_req.rid)
-            ):
+            if req is None or (not recv_req.abort_all and not req.rid.startswith(recv_req.rid)):
                 continue
             pending_req = self._pending_chunked_abort_reqs[dp_rank]
             assert pending_req is None or pending_req is req
@@ -2086,11 +2005,7 @@ class Scheduler(
         return consumed
 
     def _retire_chunked_req_batch_owners(self, consumed: dict[int, Req]) -> None:
-        if (
-            not consumed
-            or self.last_batch is None
-            or not self.last_batch.forward_mode.is_extend()
-        ):
+        if not consumed or self.last_batch is None or not self.last_batch.forward_mode.is_extend():
             return
 
         self.last_batch.filter_batch(chunked_req_to_exclude=consumed)
@@ -2128,8 +2043,7 @@ class Scheduler(
                 self.tree_cache,
                 is_insert=False,
                 allow_overallocated=(
-                    self.spec_algorithm is not None
-                    and not self.spec_algorithm.is_none()
+                    self.spec_algorithm is not None and not self.spec_algorithm.is_none()
                 ),
             )
             self.chunked_reqs[dp_rank] = None
@@ -2231,9 +2145,7 @@ class Scheduler(
                 elif (
                     not self._is_spec_decode_enabled()
                     or self.enable_overlap
-                    or can_merge_spec_non_overlap_prefill(
-                        self.enable_overlap, self.spec_algorithm
-                    )
+                    or can_merge_spec_non_overlap_prefill(self.enable_overlap, self.spec_algorithm)
                 ):
                     # Spec overlap keeps prefill and decode as separate forwards, but
                     # once prefill has produced req-granular relay state it can join
@@ -2280,10 +2192,7 @@ class Scheduler(
             ret = new_batch
         else:
             # Run decode (skip for prefill-only batches)
-            if (
-                not self.running_batch.is_empty()
-                and not self.running_batch.is_prefill_only
-            ):
+            if not self.running_batch.is_empty() and not self.running_batch.is_prefill_only:
                 self.running_batch = self.update_running_batch(self.running_batch)
                 ret = self.running_batch if not self.running_batch.is_empty() else None
                 if ret is not None:
@@ -2317,9 +2226,7 @@ class Scheduler(
         if (
             self._is_spec_decode_enabled()
             and not self.enable_overlap
-            and not can_merge_spec_non_overlap_prefill(
-                self.enable_overlap, self.spec_algorithm
-            )
+            and not can_merge_spec_non_overlap_prefill(self.enable_overlap, self.spec_algorithm)
             and not self.running_batch.is_empty()
         ):
             return None
@@ -2381,8 +2288,7 @@ class Scheduler(
 
             # Check whether dp is full load
             if self.running_batch.reqs_info[dp_rank].batch_is_full or (
-                len(self.running_batch.reqs_info[dp_rank].reqs)
-                + len(adder.can_run_list[dp_rank])
+                len(self.running_batch.reqs_info[dp_rank].reqs) + len(adder.can_run_list[dp_rank])
                 >= self.per_dp_max_running_requests
             ):
                 continue
@@ -2415,13 +2321,7 @@ class Scheduler(
                 self.lora_paths is not None
                 and len(
                     lora_set
-                    | set(
-                        [
-                            req.lora_id
-                            for reqs in adder.can_run_list.values()
-                            for req in reqs
-                        ]
-                    )
+                    | set([req.lora_id for reqs in adder.can_run_list.values() for req in reqs])
                     | set([req.lora_id])
                 )
                 > self.max_loras_per_batch
@@ -2622,9 +2522,7 @@ class Scheduler(
                 return self.update_running_batch(batch)
             old_ratio = self.new_token_ratio
 
-            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
-            )
+            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(self.server_args)
             num_retracted_reqs = len(retracted_reqs)
             self.new_token_ratio = new_token_ratio
 
@@ -2711,11 +2609,7 @@ class Scheduler(
 
         # Run forward
         assert self.is_generation
-        _worker = (
-            self.tp_worker_p
-            if self.pd and batch.forward_mode.is_extend()
-            else self.tp_worker
-        )
+        _worker = self.tp_worker_p if self.pd and batch.forward_mode.is_extend() else self.tp_worker
         (
             precompile_token_paddings,
             precompile_bs_paddings,
@@ -2743,9 +2637,7 @@ class Scheduler(
                 self._extract_dp_output_ids(next_token_ids, model_worker_batch, batch)
             else:
                 logits_output, next_token_ids_device, cache_miss_count = (
-                    _worker.forward_batch_generation(
-                        model_worker_batch, sampling_metadata=None
-                    )
+                    _worker.forward_batch_generation(model_worker_batch, sampling_metadata=None)
                 )
                 if self.pd:
                     next_token_ids = self._pd_gather_output(
@@ -2756,9 +2648,7 @@ class Scheduler(
                     # devices.  Replicate first so device_get can proceed.
                     from jax.experimental.multihost_utils import process_allgather
 
-                    next_token_ids_device = process_allgather(
-                        next_token_ids_device, tiled=True
-                    )
+                    next_token_ids_device = process_allgather(next_token_ids_device, tiled=True)
                     next_token_ids = np.array(jax.device_get(next_token_ids_device))
                 else:
                     next_token_ids = np.array(jax.device_get(next_token_ids_device))
@@ -2788,9 +2678,7 @@ class Scheduler(
             extend_input_len_per_req = []
             for info in batch.reqs_info:
                 if info.reqs:
-                    extend_input_len_per_req.extend(
-                        [req.extend_input_len for req in info.reqs]
-                    )
+                    extend_input_len_per_req.extend([req.extend_input_len for req in info.reqs])
         else:
             extend_input_len_per_req = None
         if batch.return_logprob:
@@ -2817,10 +2705,7 @@ class Scheduler(
                 batch_output.next_token_ids
                 if (
                     self.spec_algorithm is not None
-                    and (
-                        self.spec_algorithm.is_eagle()
-                        or self.spec_algorithm.is_dflash_family()
-                    )
+                    and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family())
                     and (batch.forward_mode.is_decode() or defer_spec_prefill_output)
                     and self.enable_overlap
                 )
@@ -2835,14 +2720,10 @@ class Scheduler(
         )
         if (
             self.spec_algorithm is not None
-            and (
-                self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family()
-            )
+            and (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_dflash_family())
             and batch_output.next_draft_input is not None
         ):
-            assert isinstance(
-                batch_output.next_draft_input, (EagleDraftInput, DFlashDraftInput)
-            )
+            assert isinstance(batch_output.next_draft_input, (EagleDraftInput, DFlashDraftInput))
             ret.next_draft_input = batch_output.next_draft_input
             ret.accept_lens = batch_output.accept_lens
         return ret
@@ -2914,15 +2795,12 @@ class Scheduler(
         use_spec_prefill_overlap = can_use_spec_prefill_overlap(
             self.enable_overlap, self.spec_algorithm, batch
         ) and self.draft_worker._can_use_fused_spec_prefill(model_worker_batch)
-        use_legacy_eagle3_decode = (
-            batch.forward_mode.is_decode()
-            and use_legacy_eagle3_non_overlap(self.enable_overlap, self.spec_algorithm)
+        use_legacy_eagle3_decode = batch.forward_mode.is_decode() and use_legacy_eagle3_non_overlap(
+            self.enable_overlap, self.spec_algorithm
         )
         if use_spec_decode_overlap:
             batch_output, published_new_seq_lens = (
-                self.draft_worker.forward_batch_speculative_decode_overlap(
-                    model_worker_batch
-                )
+                self.draft_worker.forward_batch_speculative_decode_overlap(model_worker_batch)
             )
         elif use_spec_prefill_overlap:
             batch_output = self.draft_worker.forward_batch_speculative_prefill_overlap(
@@ -3058,9 +2936,7 @@ class Scheduler(
                     reqs.extend(info.reqs)
 
         for req in reqs:
-            if not req.finished() and (
-                recv_req.abort_all or req.rid.startswith(recv_req.rid)
-            ):
+            if not req.finished() and (recv_req.abort_all or req.rid.startswith(recv_req.rid)):
                 # Abort method 3: set `to_finish`
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
@@ -3158,10 +3034,7 @@ class Scheduler(
             # queues drain to a stable ownership boundary during the pause.
             self.running_batch.filter_batch()
             all_reqs = [
-                req
-                for info in self.running_batch.reqs_info
-                for req in info.reqs
-                if info.reqs
+                req for info in self.running_batch.reqs_info for req in info.reqs if info.reqs
             ]
             retracted_reqs = []
             if len(all_reqs) != 0:
@@ -3210,9 +3083,7 @@ def _reserve_host_slot_for_pd(host_pool, use_d2h_staging, req):
     return True, buffer_id
 
 
-def dispatch_scheduler_event_loop(
-    scheduler: Scheduler, server_args: ServerArgs
-) -> None:
+def dispatch_scheduler_event_loop(scheduler: Scheduler, server_args: ServerArgs) -> None:
     """Choose and run the appropriate scheduler event loop."""
 
     mode = server_args.disaggregation_mode

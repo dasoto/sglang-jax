@@ -333,6 +333,8 @@ class Req:
         self.disagg_peer_process_index: int = 0
         self.disagg_chunk_index: int = 0
         self.disagg_chunk_sender = None
+        # Transfer state all prefill NPs agreed on (multi-host synced drain).
+        self.disagg_synced_state = None
 
         # Memory pool info
         self.req_pool_idx: int | None = None
@@ -2057,9 +2059,7 @@ class ScheduleBatch:
             )
             self.has_stream = any(req.stream for req in all_reqs)
             self.has_grammar = any(req.grammar for req in all_reqs)
-            self.is_prefill_only = all(
-                req.sampling_params.max_new_tokens == 0 for req in all_reqs
-            )
+            self.is_prefill_only = all(req.sampling_params.max_new_tokens == 0 for req in all_reqs)
         else:
             self.return_logprob = False
             self.return_hidden_states = False

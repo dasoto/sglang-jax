@@ -943,10 +943,15 @@ class SchedulerDisaggregationPrefillMixin:
     def send_kv_chunk(self: Scheduler) -> None:
         """Reap senders that reached SUCCESS / FAILED."""
 
-        if getattr(self, "_disagg_prefill_compute", None):
-            terminal = self.disagg_prefill_queue.drain_terminal(self._prefill_compute_released)
+        can_release = (
+            self._prefill_compute_released
+            if getattr(self, "_disagg_prefill_compute", None)
+            else None
+        )
+        if jax.process_count() > 1:
+            terminal = self._drain_prefill_queue_synced(can_release)
         else:
-            terminal = self.disagg_prefill_queue.drain_terminal()
+            terminal = self.disagg_prefill_queue.drain_terminal(can_release)
         for entry in terminal:
             on_terminal = entry.on_terminal
             if on_terminal is None:
@@ -958,6 +963,53 @@ class SchedulerDisaggregationPrefillMixin:
                     "on_terminal for req_id=%s raised; continuing",
                     entry.req_id,
                 )
+
+    def _drain_prefill_queue_synced(self: Scheduler, can_release=None) -> list[PrefillBookkeeping]:
+        """Multi-host P: release a transfer only once every NP agrees on its terminal
+        state (SUCCESS on all NPs, or FAILED on any), in the same loop iteration.
+
+        Each NP's sender reaches SUCCESS / FAILED on its own. Releasing on different
+        iterations (or one NP finishing a request another aborts) leaves the NPs with
+        different radix-cache and allocator states, after which the same request
+        gets different pages per NP (device_put "not the same on each process").
+        Runs only on ticks rank 0 marked with _PD_SYNC_PREFILL, which every NP sees.
+        """
+        if not getattr(self, "_pd_sync_prefill_this_tick", False):
+            return []
+        from sgl_jax.srt.disaggregation.common.multihost_sync import synced_terminal_rooms
+
+        queue = self.disagg_prefill_queue
+        with queue._lock:
+            entries = list(queue._entries.values())
+
+        def _poll(entry):
+            state = entry.sender.poll()
+            if state == KVPoll.SUCCESS and can_release is not None and not can_release(entry.req):
+                return KVPoll.TRANSFERRING  # this NP cannot release it yet
+            return state
+
+        success, failed = synced_terminal_rooms(
+            entries,
+            poll_fn=_poll,
+            room_fn=lambda e: getattr(e.req, "bootstrap_room", None),
+        )
+        if not success and not failed:
+            return []
+        out: list[PrefillBookkeeping] = []
+        with queue._lock:
+            for req_id, entry in list(queue._entries.items()):
+                room = getattr(entry.req, "bootstrap_room", None)
+                if room in failed:
+                    state = KVPoll.FAILED
+                elif room in success:
+                    state = KVPoll.SUCCESS
+                else:
+                    continue
+                del queue._entries[req_id]
+                if entry.req is not None:
+                    entry.req.disagg_synced_state = state
+                out.append(entry)
+        return out
 
     # ------------------------------------------------------------------
     # Overridable / test-friendly hooks
@@ -1367,8 +1419,12 @@ class SchedulerDisaggregationPrefillMixin:
             # before the request slot and KV pages become reusable.
             self._retire_chunk_producer_ownership(req)
 
+        # Multi-host: the state every NP agreed on (see _drain_prefill_queue_synced).
+        synced = getattr(req, "disagg_synced_state", None)
         try:
-            state = sender.poll()
+            state = sender.poll() if synced is None else synced
+            if synced == KVPoll.FAILED:
+                sender.fail(reason="peer_np_failed")  # no-op if it succeeded on this NP
             if req.to_finish is not None:
                 req.check_finished()
                 req.output_ids = []
@@ -1387,6 +1443,7 @@ class SchedulerDisaggregationPrefillMixin:
                 enabled=getattr(self.server_args, "enable_request_time_stats_logging", False),
             )
             sender.clear()
+            req.disagg_synced_state = None
             self._release_prefill_req_resources(req)
             if req.disagg_chunk_sender is sender:
                 req.disagg_chunk_sender = None
