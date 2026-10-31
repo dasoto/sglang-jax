@@ -28,6 +28,7 @@ pre-#1733 (``c136c733``) MLA v2 kernel:
 from __future__ import annotations
 
 import contextlib
+import os
 import unittest
 import warnings
 from unittest import mock
@@ -1189,3 +1190,79 @@ class TestMLAV2BitExactParity(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _dcp_rank_inputs(lens, *, page_size, num_heads, kv_lora_rank, qk_rope_dim, dcp, rank, seed):
+    """One DCP rank's view: every dcp-th page of each sequence (positions page * page_size),
+    local KV lengths and page tables, the global lengths, and a random cache holding them."""
+    rng = np.random.default_rng(seed)
+    nope_dim, rope_dim = kmod.align_to(kv_lora_rank, 128), kmod.align_to(qk_rope_dim, 128)
+    q_lens = [q for q, _ in lens]
+    total_q = sum(q_lens)
+    local_lens, local_pages, positions = [], [], []
+    for _, kv_len in lens:
+        pages = [m for m in range(-(-kv_len // page_size)) if m % dcp == rank]
+        local_pages.append(len(pages))
+        local_lens.append(sum(min(page_size, kv_len - m * page_size) for m in pages))
+        positions.extend(m * page_size for m in pages)
+    total_pages = sum(local_pages) + 2
+    cache_kv = rng.standard_normal((total_pages, page_size, 1, nope_dim + rope_dim)) * 0.25
+    cache_kv[..., nope_dim + qk_rope_dim :] = 0
+    f32 = jnp.float32
+    return (
+        jnp.asarray(rng.standard_normal((total_q, num_heads, kv_lora_rank)) * 0.25, f32),
+        jnp.asarray(rng.standard_normal((total_q, num_heads, qk_rope_dim)) * 0.25, f32),
+        jnp.zeros((total_q, kv_lora_rank), f32),  # DCP: the backend writes new KV itself
+        jnp.zeros((total_q, qk_rope_dim), f32),
+        jnp.asarray(cache_kv, f32),
+        jnp.asarray(local_lens, jnp.int32),
+        jnp.arange(sum(local_pages), dtype=jnp.int32),
+        jnp.asarray(np.r_[0, np.cumsum(q_lens)], jnp.int32),
+        jnp.asarray(np.r_[0, np.cumsum(local_pages) * page_size], jnp.int32),
+        jnp.asarray([0, 0, len(lens)], jnp.int32),
+    ), dict(
+        page_seq_positions=jnp.asarray(positions, jnp.int32),
+        global_kv_lens=jnp.asarray([kv for _, kv in lens], jnp.int32),
+    )
+
+
+class TestMLAV2DcpMixedMask(unittest.TestCase):
+    """The Pallas kernel body's DCP mask (page positions, global lengths) in mixed blocks,
+    per score element and vector-built (SGLANG_JAX_MLA_VECTOR_DCP_MASK), run through the CPU
+    pallas_call emulation against the pure-JAX CPU path of the same entry point; 6 heads, so
+    the query token of a row is a division by a non-power of two."""
+
+    def test_kernel_body_matches_cpu_path(self):
+        # (new tokens, global KV length); every sequence has pages on both ranks (the backend
+        # gives a rank without any a dummy page, which this synthetic layout does not).
+        lens = [(8, 37), (5, 21), (12, 28), (3, 50)]
+        common = dict(
+            sm_scale=0.1,
+            num_kv_pages_per_block=(2, 1, 2),
+            num_queries_per_block=(1, 1, 4),
+            decode_batch_size=1,
+        )
+        for vector_mask, rank in ((m, r) for m in ("0", "1") for r in (0, 1)):
+            with (
+                self.subTest(vector_mask=vector_mask, rank=rank),
+                mock.patch.dict(os.environ, {"SGLANG_JAX_MLA_VECTOR_DCP_MASK": vector_mask}),
+            ):
+                args, dcp_kw = _dcp_rank_inputs(
+                    lens,
+                    page_size=16,
+                    num_heads=6,
+                    kv_lora_rank=128,
+                    qk_rope_dim=64,
+                    dcp=2,
+                    rank=rank,
+                    seed=rank + 3,
+                )
+                cache = np.asarray(args[4])
+                with mock.patch.object(jax, "default_backend", return_value="tpu"):
+                    out, _, _, _ = run_v2_kernel_with_capture(*args, **dcp_kw, **common)
+                args = args[:4] + (jnp.asarray(cache),) + args[5:]  # the kernel donates it
+                ref, _ = kmod.mla_ragged_paged_attention(*args, **dcp_kw, **common)
+                total_q = sum(q for q, _ in lens)
+                np.testing.assert_allclose(
+                    out[:total_q], np.asarray(ref)[:total_q], rtol=1e-4, atol=1e-5
+                )

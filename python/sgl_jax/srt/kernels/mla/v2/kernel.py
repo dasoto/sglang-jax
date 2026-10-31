@@ -26,6 +26,7 @@ sglang-jax specific features:
 
 import functools
 import math
+import os
 from enum import Enum
 
 import jax
@@ -37,6 +38,17 @@ from jax.experimental.pallas import tpu as pltpu
 DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+
+# DCP blocks (page_seq_positions) build the causal/page mask from per-column key positions and
+# per-row query tokens with one broadcast compare instead of per score element
+# (SGLANG_JAX_MLA_VECTOR_DCP_MASK=1; read when the kernel is traced).
+def _vector_dcp_mask() -> bool:
+    return os.environ.get("SGLANG_JAX_MLA_VECTOR_DCP_MASK", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
 
 
 def cdiv_on_kv_packing(a, kv_packing):
@@ -393,13 +405,13 @@ def _mla_ragged_paged_attention_kernel(
         if q_scale is not None:
             s *= q_scale
 
-        q_row_offset = (
-            0
-            if s.shape[1] == num_q_heads
-            else floor_div_pow2(lax.broadcasted_iota(jnp.int32, s.shape[1:], 0), num_q_heads)
-        )
-
         mask_list = []
+        if page_seq_positions_ref is None or not _vector_dcp_mask():
+            q_row_offset = (
+                0
+                if s.shape[1] == num_q_heads
+                else floor_div_pow2(lax.broadcasted_iota(jnp.int32, s.shape[1:], 0), num_q_heads)
+            )
         if page_seq_positions_ref is None:
             k_span = bkv_idx * bkv_sz + lax.broadcasted_iota(jnp.int32, s.shape[1:], 1)
             for b in range(batch_size):
@@ -413,7 +425,7 @@ def _mla_ragged_paged_attention_kernel(
                 if sliding_window is not None:
                     mask = jnp.logical_or(mask, q_span - sliding_window >= k_span)
                 mask_list.append(mask)
-        else:
+        elif not _vector_dcp_mask():
             col_iota = lax.broadcasted_iota(jnp.int32, s.shape[1:], 1)
             in_page_offset = mod_pow2(col_iota, page_size)
             page_in_block = floor_div_pow2(col_iota, page_size)
@@ -443,6 +455,55 @@ def _mla_ragged_paged_attention_kernel(
                 mask = jnp.logical_or(q_span < k_span_b, k_span_b >= global_kv_len)
                 if sliding_window is not None:
                     mask = jnp.logical_or(mask, q_span - sliding_window >= k_span_b)
+                mask_list.append(mask)
+        else:
+            # Key positions depend on the column only and query positions on the row only, so
+            # they are built as a [1, bkv_sz] row and a [rows, 128] lane-replicated column and
+            # the [rows, bkv_sz] mask takes one broadcast compare. Per score element (an iota,
+            # an integer division by num_q_heads, a select per page of the block and the bound
+            # checks) the mask cost several times the softmax's VPU work in mixed blocks.
+            rows, cols = s.shape[1], s.shape[2]
+            col_iota = lax.broadcasted_iota(jnp.int32, (1, cols), 1)
+            in_page_offset = mod_pow2(col_iota, page_size)
+            page_in_block = floor_div_pow2(col_iota, page_size)
+            if rows == num_q_heads:
+                row_tok = jnp.zeros((rows, 128), jnp.int32)
+            else:
+                # Query token of each (token, head) row: floor((row + 0.5) / num_q_heads) in f32
+                # is exact for these row counts (an error below 1e-3 cannot cross an integer).
+                row_f = lax.broadcasted_iota(jnp.int32, (rows, 128), 0).astype(jnp.float32)
+                row_tok = jnp.floor((row_f + 0.5) * (1.0 / num_q_heads)).astype(jnp.int32)
+            kv_p_start = bkv_idx * bkv_p
+            for b in range(batch_size):
+                seq_idx = batch_start_seq_idx + b
+                q_start = cu_q_lens_ref[seq_idx]
+                q_end = cu_q_lens_ref[seq_idx + 1]
+                q_len = q_end - q_start
+                global_kv_len = global_kv_lens_ref[seq_idx]
+                q_span = global_kv_len - q_len + bq_idx * bq_sz + row_tok  # [rows, 128]
+
+                start_kv_page_idx = floor_div_pow2(cu_kv_lens_ref[seq_idx], page_size)
+                end_kv_page_idx = floor_div_pow2(cu_kv_lens_ref[seq_idx + 1], page_size)
+                page_indices_offset = start_kv_page_idx + kv_p_start
+
+                k_span_b = jnp.full_like(col_iota, 0x3FFFFFFF)  # [1, bkv_sz]
+                for p_i in range(bkv_p):
+                    in_seq_bounds = (page_indices_offset + p_i) < end_kv_page_idx
+                    page_idx_i = jnp.minimum(page_indices_offset + p_i, num_page_indices - 1)
+                    page_pos_i = jnp.where(
+                        in_seq_bounds, page_seq_positions_ref[page_idx_i], 0x3FFFFFFF
+                    )
+                    k_span_b = jnp.where(
+                        page_in_block == p_i, page_pos_i + in_page_offset, k_span_b
+                    )
+                # Keys at or past the global length are masked like keys outside the sequence.
+                k_span_b = jnp.where(k_span_b >= global_kv_len, 0x3FFFFFFF, k_span_b)
+                k_full = jnp.broadcast_to(k_span_b, (rows, cols))
+                mask = broadcast_minor(q_span, (rows, cols)) < k_full
+                if sliding_window is not None:
+                    mask = jnp.logical_or(
+                        mask, broadcast_minor(q_span - sliding_window, (rows, cols)) >= k_full
+                    )
                 mask_list.append(mask)
         mask = jnp.stack(mask_list, axis=0)
 
