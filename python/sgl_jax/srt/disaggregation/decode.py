@@ -643,13 +643,13 @@ class SchedulerDisaggregationDecodeMixin:
 
         with self.disagg_transfer_queue._lock:
             entries = list(self.disagg_transfer_queue._entries.values())
-        if not entries:
-            return []
         if not getattr(self, "_pd_sync_transfers_this_tick", True):
             for e in entries:
                 with suppress(Exception):
                     e.receiver.poll()
             return []
+        # Rank 0 broadcast this sync tick, so every NP must join the allgather,
+        # including one whose own queue is empty; skipping it would hang the rest.
         success, failed = synced_terminal_rooms(
             entries,
             poll_fn=lambda e: e.receiver.poll(),

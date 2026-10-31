@@ -180,6 +180,29 @@ def test_single_process_transfer_drain_does_not_issue_multihost_collectives(monk
     )
 
 
+@pytest.mark.parametrize("sync_tick", [True, False])
+def test_multihost_transfer_drain_joins_sync_with_empty_queue(monkeypatch, sync_tick):
+    """A sync tick is broadcast by rank 0: an NP with no local transfers must still
+    join the allgather, or the NPs that do have transfers hang in it."""
+    from sgl_jax.srt.disaggregation.common import multihost_sync
+
+    monkeypatch.setattr(decode.jax, "process_count", lambda: 2)
+    calls = []
+
+    def fake_sync(entries, poll_fn, room_fn):
+        calls.append(list(entries))
+        return set(), set()
+
+    monkeypatch.setattr(multihost_sync, "synced_terminal_rooms", fake_sync)
+    scheduler = SimpleNamespace(
+        disagg_transfer_queue=SimpleNamespace(_lock=threading.Lock(), _entries={}),
+        _pd_sync_transfers_this_tick=sync_tick,
+    )
+    out = decode.SchedulerDisaggregationDecodeMixin._drain_transfer_queue_synced(scheduler)
+    assert out == []
+    assert calls == ([[]] if sync_tick else [])
+
+
 @pytest.mark.parametrize("role", ["prefill", "decode"])
 def test_pause_drains_role_before_retracting_running_requests(role):
     events = []
@@ -279,4 +302,3 @@ def test_recv_requests_piggybacks_pd_sync_transfers():
     reqs = scheduler.recv_requests()
     assert reqs == []
     assert scheduler._pd_sync_transfers_this_tick is True
-
