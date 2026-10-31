@@ -126,6 +126,19 @@ def _segment_gather_sum(rows, tok, valid, num_tokens):
     return jax.lax.cond(n_extra > ob, full, small, out)
 
 
+def _reduce_scatter_minor(x, tp: int):
+    """[T, H] partials -> this chip's reduced [T, H/tp] slice: a reduce-scatter over "tensor".
+
+    The H slices are moved to the major axis first: scattering the minor axis directly into
+    H/tp-wide chunks (112 lanes for Kimi-K3) let XLA lower the collective as an all-reduce of
+    all of [T, H] plus a slice, twice the bytes, when the operand came out of the experts'
+    combine with H minor (compact path, v6e).
+    """
+    t, h = x.shape
+    y = x.reshape(t, tp, h // tp).transpose(1, 0, 2)  # [tp, T, H/tp]
+    return jax.lax.psum_scatter(y, "tensor", scatter_dimension=0, tiled=True)[0]
+
+
 def _parse_compact_divisors(value: str) -> tuple[int, ...]:
     value = value.strip().lower()
     if value in ("", "0", "off", "false", "no"):
@@ -549,7 +562,7 @@ class MXFP4EPMoE(EPMoE):
                 # A real reduce-scatter inside each DP group ([T, H] -> [T, H/tp]), then the
                 # small cross-group reduction of the slices (XLA runs it as an all-reduce plus
                 # a slice); the norm's row sums of squares take one f32 all-reduce of [T/dp].
-                y = jax.lax.psum_scatter(x[0], "tensor", scatter_dimension=1, tiled=True)
+                y = _reduce_scatter_minor(x[0], tp)
                 y = jax.lax.psum_scatter(y, "data", scatter_dimension=0, tiled=True)
                 y32 = y.astype(jnp.float32)
                 return y, jax.lax.psum(jnp.sum(y32 * y32, axis=1), "tensor")
@@ -858,7 +871,7 @@ class MXFP4EPMoE(EPMoE):
             )
 
         def combine_sumsq_hier(x, p):  # as combine_sumsq: reduce-scatter in the group first
-            y = jax.lax.psum_scatter(x[0], "tensor", scatter_dimension=1, tiled=True)  # [c, hl]
+            y = _reduce_scatter_minor(x[0], tp)  # [c, hl]
             y = jax.lax.psum(y, "data")  # every compact row of this tensor slice
             y32 = y.astype(jnp.float32)
             ss = jax.lax.psum(jnp.sum(y32 * y32, axis=1), "tensor")  # [c]
