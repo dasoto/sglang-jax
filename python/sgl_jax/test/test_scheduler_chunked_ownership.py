@@ -817,6 +817,47 @@ class TestPrefillShortestFirst(unittest.TestCase):
         req.init_next_round_input = Mock()
         return req
 
+    def test_router_match_reaches_the_queued_request(self):
+        """The DP router records its prefix match on the intake request; the scheduler's Req
+        built from it keeps the match, so shortest-first estimates uncached tokens."""
+        scheduler = self._sjf_scheduler()
+        scheduler.model_config = SimpleNamespace(hf_eos_token_id={2}, vocab_size=100)
+        scheduler.tokenizer = None
+        scheduler.server_args = SimpleNamespace(
+            disaggregation_enable_overlap_schedule=False, allow_auto_truncate=False
+        )
+        scheduler.max_req_input_len = 1 << 20
+        scheduler.max_req_len = 1 << 20
+        scheduler.grammar_backend = None
+        scheduler.forward_ct = 3
+        recv = SimpleNamespace(
+            rid="warm",
+            text="",
+            input_ids=list(range(5000)),
+            sampling_params=SamplingParams(max_new_tokens=8),
+            radix_input_ids=None,
+            return_logprob=False,
+            return_output_logprob_only=False,
+            top_logprobs_num=0,
+            token_ids_logprob=None,
+            stream=False,
+            lora_id=None,
+            extra_key=None,
+            dp_rank=0,
+            return_routed_experts=False,
+            return_hidden_states=False,
+            bootstrap_host=None,
+            bootstrap_port=None,
+            bootstrap_room=None,
+            disagg_transfer_id=None,
+            logprob_start_len=-1,
+            _dp_match_len=4608,
+        )
+        scheduler.handle_generate_request(recv)
+        (req,) = scheduler.waiting_queue
+        self.assertEqual(scheduler._sjf_new_tokens(req), 392)
+        self.assertEqual(req._sjf_enqueue_ct, 3)
+
     def test_queue_order_is_shortest_new_prompt_first_with_aging(self):
         scheduler = self._sjf_scheduler()
         cold = self._queued(scheduler, "cold", 20000, 0)  # 20000 new tokens

@@ -1324,6 +1324,11 @@ class Scheduler(
             return_hidden_states=recv_req.return_hidden_states,
         )
         req.tokenizer = self.tokenizer
+        # The prefix the DP router matched on the chosen rank (set on the intake request):
+        # shortest-first prefill estimates the request's uncached tokens from it.
+        matched = getattr(recv_req, "_dp_match_len", None)
+        if matched is not None:
+            req._dp_match_len = matched
         if (
             req.return_hidden_states
             and self.spec_algorithm is not None
