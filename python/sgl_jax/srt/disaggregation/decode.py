@@ -1090,6 +1090,7 @@ class SchedulerDisaggregationDecodeMixin:
                 raise RuntimeError("received DSA indexer keys but the pool has none")
         else:
             target_buffers = kv_pool.kv_buffer
+        wire_to = None  # pool transfer sharding the wire-layout chunks are moved into
         if jax.process_count() > 1 and isinstance(kv, jax.Array) and kv.is_fully_addressable:
             # Pulled KV is this host's local shard on a 1-D local mesh.
             # Assemble it into the global pool sharding.
@@ -1104,9 +1105,11 @@ class SchedulerDisaggregationDecodeMixin:
                 gsh = NamedSharding(kv_pool.mesh, stacked_spec)
             gshape = (len(target_buffers), padded_pages) + per_layer_tail
             if _PD_WIRE and is_mla:
-                # Arrived in the wire layout; move it into this pool's transfer layout.
+                # Arrived in the wire layout; each layer chunk moves into this pool's
+                # transfer layout below. A whole-request reshard program needs about
+                # twice the request's KV per chip and failed to load for long prompts.
                 kv = _local_to_global_shard(kv, gshape, _pd_wire_sharding(len(gshape)))
-                kv = jax.device_put(kv, gsh)
+                wire_to = gsh
             else:
                 kv = _local_to_global_shard(kv, gshape, gsh)
 
@@ -1136,8 +1139,11 @@ class SchedulerDisaggregationDecodeMixin:
             n_layers = len(target_buffers)
             for start in range(0, n_layers, _MLA_KV_CHUNK_LAYERS):
                 end = min(n_layers, start + _MLA_KV_CHUNK_LAYERS)
+                chunk = kv[start:end]
+                if wire_to is not None:
+                    chunk = jax.device_put(chunk, wire_to)
                 target_buffers[start:end] = write_all_mla_kv_layers(
-                    kv[start:end],
+                    chunk,
                     dst_indices,
                     list(target_buffers[start:end]),
                 )
