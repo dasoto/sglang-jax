@@ -157,6 +157,24 @@ def _rms_norm_from_sumsq(x: jax.Array, sumsq: jax.Array, norm: RMSNorm) -> jax.A
     return (x.astype(jnp.float32) * mul).astype(out_dtype)
 
 
+def _gather_routing(mesh, topk_weights: jax.Array, topk_ids: jax.Array):
+    """Token-sharded [T, k] router outputs -> P("data", None), the layout the MoE paths take.
+
+    f32 weights and int32 ids are bit-packed into one [T, 2k] array, so the gather over
+    "tensor" is one small collective instead of two.
+    """
+    k = topk_ids.shape[1]
+    packed = jnp.concatenate(
+        [
+            topk_weights.astype(jnp.float32),
+            jax.lax.bitcast_convert_type(topk_ids.astype(jnp.int32), jnp.float32),
+        ],
+        axis=1,
+    )
+    packed = jax.sharding.reshard(packed, NamedSharding(mesh, P("data", None)))
+    return packed[:, :k], jax.lax.bitcast_convert_type(packed[:, k:], jnp.int32)
+
+
 def _row_parallel_sum(mesh, x1, w1, x2, w2) -> jax.Array:
     """``x1 @ w1 + x2 @ w2`` for two row-parallel projections, with one all-reduce.
 
@@ -504,6 +522,14 @@ class KimiK3LatentMoE(nnx.Module):
             quantization_config=None if self.is_mxfp4 else quantization_config,
         )
 
+        # SGLANG_JAX_MOE_SHARDED_ROUTING=1: route prefill-sized steps on token-sharded scores
+        # (see _token_sharded_routing).
+        self.sharded_routing = os.environ.get(
+            "SGLANG_JAX_MOE_SHARDED_ROUTING", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        self.sharded_routing_min_tokens = int(
+            os.environ.get("SGLANG_JAX_MOE_SHARDED_ROUTING_MIN_TOKENS", "256")
+        )
         num_shared = getattr(config, "num_shared_experts", 0) or 0
         # SGLANG_JAX_MOE_NORM_FROM_COMBINE=1: routed_expert_norm takes its row sums of squares
         # from the experts' combine (MXFP4EPMoE.emit_sumsq) instead of all-reducing them over
@@ -534,12 +560,16 @@ class KimiK3LatentMoE(nnx.Module):
         token_mask: jax.Array | None = None,
         compact_pos: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
-        router_scores = self.gate(hidden_states)
+        routing = self._token_sharded_routing(hidden_states)
+        router_scores = self.gate(hidden_states, out_sharding=routing)
         topk_weights, topk_ids = self.topk(
             router_scores,
             self.gate.bias.value,
             dispatch_info=None if self.gate_prepermuted else dispatch_info,
+            routing_sharding=routing,
         )
+        if routing is not None:
+            topk_weights, topk_ids = _gather_routing(self.mesh, topk_weights, topk_ids)
         if self.routed_expert_down_proj is not None:
             latent, _ = self.routed_expert_down_proj(hidden_states)
         else:
@@ -570,6 +600,27 @@ class KimiK3LatentMoE(nnx.Module):
         if self.shared_experts is not None:
             routed = routed + self.shared_experts(hidden_states)
         return routed, topk_ids
+
+    def _token_sharded_routing(self, hidden_states: jax.Array) -> NamedSharding | None:
+        """P(("data", "tensor"), None) when the router should run on 1/tp of each group's tokens.
+
+        Opt-in (SGLANG_JAX_MOE_SHARDED_ROUTING=1) for prefill-sized steps: the hidden states,
+        and so the router scores, top-k and EPLB remap, are replicated over "tensor", so every
+        chip of a DP group otherwise all-gathers all of the group's [T/dp, E] scores and runs
+        the top-k and the replica remap (a scalar gather) on all of its tokens. Token-sharded,
+        the scores take an all-to-all of 1/tp of the data and each chip routes T/(dp*tp)
+        tokens; the [T, k] outputs are gathered back.
+        """
+        if not self.sharded_routing or self.mesh is None or hidden_states.ndim != 2:
+            return None
+        shape = dict(self.mesh.shape)
+        if set(shape) != {"data", "tensor"} or self.gate.kernel_axes[1] is None:
+            return None
+        dp, tp = shape["data"], shape["tensor"]
+        t = hidden_states.shape[0]
+        if t % (dp * tp) or t // dp < self.sharded_routing_min_tokens:
+            return None
+        return NamedSharding(self.mesh, P(("data", "tensor"), None))
 
     def _fuse_output_allreduce(self, routed: jax.Array) -> bool:
         """One all-reduce for the routed up-projection plus the shared experts.

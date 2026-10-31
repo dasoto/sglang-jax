@@ -161,3 +161,53 @@ def test_local_window_path_skips_masked_padding_tokens():
     assert np.all(out_win[~mask] == 0)
     scale = np.abs(out_gen[mask]).max()
     np.testing.assert_allclose(out_win[mask], out_gen[mask], rtol=0, atol=1e-2 * scale)
+
+
+
+@pytest.mark.skipif(len(jax.devices()) < 4, reason="needs 4 (CPU) devices")
+@pytest.mark.parametrize("T,cap", [(40, None), (64, 24)])
+def test_local_window_packed_sort_matches_stable_sort(T, cap, monkeypatch):
+    """The single-operand (local expert, row) key sort and the stable key/value sort over all
+    rows (taken above _PACKED_SORT_MAX_ROWS) give the same windows: bit-identical outputs."""
+    import sgl_jax.srt.layers.moe_mxfp4 as moe_mxfp4
+
+    H, I, E, topk, ep = 256, 256, 8, 3, 2
+    mesh = jax.make_mesh(
+        (1, 4), ("data", "tensor"), axis_types=(jax.sharding.AxisType.Explicit,) * 2
+    )
+    with jax.set_mesh(mesh):
+        common = dict(
+            hidden_size=H,
+            num_experts=E,
+            num_experts_per_tok=topk,
+            ep_size=ep,
+            mesh=mesh,
+            intermediate_dim=I,
+            activation="situ",
+            situ_beta=4.0,
+            situ_linear_beta=25.0,
+        )
+        layer = MXFP4EPMoE(use_gmm_kernel=True, **common)
+        layer.local_window_min_rows = 1
+        layer.local_window_capacity = cap
+        for name, (k, n), seed in (("w1", (H, I), 7), ("w3", (H, I), 8), ("w2", (I, H), 9)):
+            packed, scale = F.random_mxfp4((k, n), E, seed=seed, zero_frac=0.1)
+            for suffix, arr in (("weight_packed", packed), ("weight_scale", scale)):
+                param = getattr(layer, f"{name}_{suffix}")
+                param.value = jax.device_put(jnp.asarray(arr), param.value.sharding)
+        assert layer.prepare_gmm_kernel_weights()
+        ids, w = _routing(T, E, topk, seed=200 + T)
+        rep = NamedSharding(mesh, P(None, None))
+        hs = jax.device_put(
+            jnp.asarray(np.random.default_rng(T + 1).standard_normal((T, H)), jnp.bfloat16), rep
+        )
+        tw = jax.device_put(jnp.asarray(w), rep)
+        ti = jax.device_put(jnp.asarray(ids), rep)
+        out_packed = np.asarray(
+            jax.jit(lambda a, b, c: layer(a, b, c))(hs, tw, ti).astype(jnp.float32)
+        )
+        monkeypatch.setattr(moe_mxfp4, "_PACKED_SORT_MAX_ROWS", 0)
+        out_stable = np.asarray(
+            jax.jit(lambda a, b, c: layer(a, b, c))(hs, tw, ti).astype(jnp.float32)
+        )
+    np.testing.assert_array_equal(out_packed, out_stable)

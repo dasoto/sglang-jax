@@ -48,6 +48,12 @@ MOE_RS_COMBINE_ENV = "SGLANG_JAX_MOE_RS_COMBINE"
 # static compact size. "" or "0" disables it.
 MOE_COMPACT_ENV = "SGLANG_JAX_MOE_COMPACT"
 MOE_COMPACT_MIN_TOKENS_ENV = "SGLANG_JAX_MOE_COMPACT_MIN_TOKENS"
+# Two-stage combine for the emit_sumsq paths (SGLANG_JAX_MOE_HIER_COMBINE=1): a reduce-scatter
+# over "tensor" inside each DP group, then a reduction over "data" of the 1/tp-wide slices,
+# instead of one all-reduce of the full [T, H] partials over the whole model mesh.
+MOE_HIER_COMBINE_ENV = "SGLANG_JAX_MOE_HIER_COMBINE"
+# Local-window row sort: (local expert, row) packed into one int32 key needs rows < 2^16.
+_PACKED_SORT_MAX_ROWS = 1 << 16
 
 
 # Local-window combine of the weighted expert rows into the per-chip [T, H] accumulator (see
@@ -210,6 +216,14 @@ class MXFP4EPMoE(EPMoE):
         # to the output ([T] P("data")) and the norm needs no all-reduce of its own. The compact
         # path also takes its tensor slice from that all-reduce instead of an extra all-gather.
         self.emit_sumsq = False
+        # With emit_sumsq, reduce the partials in two stages (see MOE_HIER_COMBINE_ENV): each
+        # chip receives 1/tp of [T, H] from its group instead of all of it from every chip.
+        self.hier_combine = os.environ.get(MOE_HIER_COMBINE_ENV, "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         self.local_combine = _local_combine_mode()
         self.local_combine_large = _local_combine_mode(
             MOE_LOCAL_COMBINE_LARGE_ENV, ("scatter", "sorted", "gather")
@@ -524,9 +538,18 @@ class MXFP4EPMoE(EPMoE):
                 r32 = rows.astype(jnp.float32)
                 return mine, jnp.sum(r32 * r32, axis=1)
 
+            def reduce_rows_sumsq_hier(x):  # as reduce_rows_sumsq, in two stages
+                # A real reduce-scatter inside each DP group ([T, H] -> [T, H/tp]), then the
+                # small cross-group reduction of the slices (XLA runs it as an all-reduce plus
+                # a slice); the norm's row sums of squares take one f32 all-reduce of [T/dp].
+                y = jax.lax.psum_scatter(x[0], "tensor", scatter_dimension=1, tiled=True)
+                y = jax.lax.psum_scatter(y, "data", scatter_dimension=0, tiled=True)
+                y32 = y.astype(jnp.float32)
+                return y, jax.lax.psum(jnp.sum(y32 * y32, axis=1), "tensor")
+
             if self.emit_sumsq:
                 return shard_map(
-                    reduce_rows_sumsq,
+                    reduce_rows_sumsq_hier if self.hier_combine else reduce_rows_sumsq,
                     mesh=self.mesh,
                     in_specs=P(("data", "tensor"), None, None),
                     out_specs=(P("data", "tensor"), P("data")),
@@ -827,9 +850,21 @@ class MXFP4EPMoE(EPMoE):
                 jnp.where(real, ss[q], 0.0),
             )
 
+        def combine_sumsq_hier(x, p):  # as combine_sumsq: reduce-scatter in the group first
+            y = jax.lax.psum_scatter(x[0], "tensor", scatter_dimension=1, tiled=True)  # [c, hl]
+            y = jax.lax.psum(y, "data")  # every compact row of this tensor slice
+            y32 = y.astype(jnp.float32)
+            ss = jax.lax.psum(jnp.sum(y32 * y32, axis=1), "tensor")  # [c]
+            q = jnp.clip(p, 0, c - 1)
+            real = p >= 0
+            return (
+                jnp.where(real[:, None], y[q], jnp.zeros((), y.dtype)),
+                jnp.where(real, ss[q], 0.0),
+            )
+
         if self.emit_sumsq:
             return shard_map(
-                combine_sumsq,
+                combine_sumsq_hier if self.hier_combine else combine_sumsq,
                 mesh=self.mesh,
                 in_specs=(P(("data", "tensor"), None, None), P("data")),
                 out_specs=(P("data", "tensor"), P("data")),
@@ -931,21 +966,33 @@ class MXFP4EPMoE(EPMoE):
         rows = num_tokens * top_k
         e_l = self.experts_per_device
         flat_experts = jnp.ravel(topk_ids).astype(jnp.int32)
-        # One stable key/value sort gives the expert-sorted order without a separate gather
-        # (a 65K-index gather cost ~0.6 ms per layer on v5e). Group sizes by comparison and
-        # reduction instead of jnp.bincount, whose scatter-add cost ~0.8 ms per layer.
-        # Ids >= num_experts (masked DP padding) sort last and are not counted.
-        _, sorted_pos = jax.lax.sort_key_val(
-            flat_experts, jnp.arange(rows, dtype=jnp.int32), is_stable=True
-        )
-        group_sizes = jnp.sum(
-            flat_experts[:, None] == jnp.arange(self.num_experts, dtype=jnp.int32)[None, :],
-            axis=0,
-            dtype=jnp.int32,
-        )
         group_offset = (jax.lax.axis_index("expert") * e_l).astype(jnp.int32)
-        local_sizes = jax.lax.dynamic_slice_in_dim(group_sizes, group_offset, e_l)
-        start = jnp.sum(jnp.where(jnp.arange(self.num_experts) < group_offset, group_sizes, 0))
+        local_e = flat_experts - group_offset
+        # Group sizes by comparison and reduction (jnp.bincount's scatter-add cost ~0.8 ms per
+        # layer on v5e), over this shard's experts only. Ids >= num_experts (masked DP padding)
+        # are never local.
+        local_sizes = jnp.sum(
+            local_e[:, None] == jnp.arange(e_l, dtype=jnp.int32)[None, :], axis=0, dtype=jnp.int32
+        )
+        if rows <= _PACKED_SORT_MAX_ROWS:
+            # One single-operand sort of (local expert, row) keys, non-local rows last: the
+            # local rows come first in the same order as the stable expert sort below, and
+            # sorting one int32 array instead of a key/value pair moves half the data.
+            is_local = (local_e >= 0) & (local_e < e_l)
+            key = jnp.where(
+                is_local,
+                (local_e << 16) | jnp.arange(rows, dtype=jnp.int32),
+                jnp.iinfo(jnp.int32).max,
+            )
+            sorted_pos = jnp.minimum(jax.lax.sort(key) & jnp.int32(0xFFFF), rows - 1)
+            start = jnp.int32(0)
+        else:
+            # One stable key/value sort gives the expert-sorted order without a separate
+            # gather (a 65K-index gather cost ~0.6 ms per layer on v5e).
+            _, sorted_pos = jax.lax.sort_key_val(
+                flat_experts, jnp.arange(rows, dtype=jnp.int32), is_stable=True
+            )
+            start = jnp.sum((flat_experts < group_offset).astype(jnp.int32))
         local_rows = jnp.sum(local_sizes)
         local_cum = jnp.concatenate(
             [jnp.zeros((1,), jnp.int32), jnp.cumsum(local_sizes).astype(jnp.int32)]
@@ -968,8 +1015,9 @@ class MXFP4EPMoE(EPMoE):
         combine = self.local_combine
         if combine == "onehot" and num_tokens > self.onehot_max_tokens:
             combine = self.local_combine_large
+        acc_dtype = self.local_acc_dtype
 
-        def window(w, acc):
+        def window(w, acc):  # acc None: the first window, whose sum is the accumulator
             base = w * cap
             rel = base + jnp.arange(cap, dtype=jnp.int32)
             valid = rel < local_rows
@@ -1007,14 +1055,16 @@ class MXFP4EPMoE(EPMoE):
                 onehot = (
                     (tok[None, :] == jnp.arange(num_tokens, dtype=tok.dtype)[:, None])
                     & valid[None, :]
-                ).astype(acc.dtype)
+                ).astype(acc_dtype)
                 add = jnp.dot(
                     onehot,
-                    contrib.astype(acc.dtype),
+                    contrib.astype(acc_dtype),
                     preferred_element_type=jnp.float32,
-                    precision=jax.lax.Precision.HIGHEST if acc.dtype == jnp.float32 else None,
-                )
-                return acc + add.astype(acc.dtype)
+                    precision=jax.lax.Precision.HIGHEST if acc_dtype == jnp.float32 else None,
+                ).astype(acc_dtype)
+                return add if acc is None else acc + add
+            if acc is None:
+                acc = jnp.zeros((num_tokens, w_down.shape[-1]), acc_dtype)
             if combine == "gather":
                 return acc + _segment_gather_sum(
                     contrib.astype(acc.dtype), tok, valid, num_tokens
@@ -1028,8 +1078,11 @@ class MXFP4EPMoE(EPMoE):
             return acc.at[tok].add(contrib.astype(acc.dtype))
 
         n_windows = (local_rows + cap - 1) // cap
-        acc = jnp.zeros((num_tokens, w_down.shape[-1]), self.local_acc_dtype)
-        acc = jax.lax.fori_loop(0, n_windows, window, acc)
+        # Window 0 runs unconditionally (an empty one contributes zeros): with the one-hot
+        # combine its matmul output is the accumulator, without a zero fill and an add of the
+        # whole [T, H] (~55 us per MoE layer at T = 2304 on v6e).
+        acc = window(0, None)
+        acc = jax.lax.fori_loop(1, n_windows, window, acc)
         return acc.astype(self.dtype)
 
     def _gmm_compute(

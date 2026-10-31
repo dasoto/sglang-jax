@@ -130,6 +130,46 @@ def test_emit_sumsq(per_group, compact, window, use_mask):
 
 
 @pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (CPU) devices")
+@pytest.mark.parametrize(
+    "per_group,compact,window",
+    [
+        ((32, 32), False, True),  # full local-window path
+        ((32, 32), False, False),  # generic path
+        ((5, 0), True, True),  # compact, one busy group
+        ((9, 14), True, True),  # compact, both groups
+        ((32, 7), True, True),  # falls back to the full path inside the switch
+    ],
+)
+def test_emit_sumsq_hier_combine(per_group, compact, window):
+    """SGLANG_JAX_MOE_HIER_COMBINE: same outputs and sums as the one-step all-reduce combine.
+
+    The two reduction stages round the bf16 partial sums in a different order, so the outputs
+    agree to bf16 rounding; the sums of squares must match the returned output rows.
+    """
+    T = 64
+    mesh = _mesh()
+    mask_np = _prefix_mask(T, per_group)
+    with jax.set_mesh(mesh):
+        ref, new = _layers(mesh, compact, window, seed=sum(per_group) + 7)
+        ref.emit_sumsq = True
+        new.hier_combine = True
+        hs, tw, ti, mask = _inputs(mesh, T, mask_np, seed=sum(per_group) + 9)
+        f_ref = jax.jit(lambda a, b, c, m: ref(a, b, c, token_mask=m))
+        f_new = jax.jit(lambda a, b, c, m: new(a, b, c, token_mask=m))
+        out_ref, ss_ref = f_ref(hs, tw, ti, mask)
+        out_new, ss_new = f_new(hs, tw, ti, mask)
+        assert out_new.sharding.spec == P("data", "tensor")
+        out_ref = np.asarray(out_ref.astype(jnp.float32))
+        out_new = np.asarray(out_new.astype(jnp.float32))
+        ss_ref, ss_new = np.asarray(ss_ref), np.asarray(ss_new)
+    np.testing.assert_allclose(out_new, out_ref, rtol=2e-2, atol=2e-2 * np.abs(out_ref).max())
+    expect = np.sum(out_new.astype(np.float64) ** 2, axis=1)
+    np.testing.assert_allclose(ss_new[mask_np], expect[mask_np], rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(ss_new[mask_np], ss_ref[mask_np], rtol=2e-2)
+    assert np.all(ss_new[~mask_np] == 0)
+
+
+@pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (CPU) devices")
 def test_norm_from_sumsq_matches_rmsnorm():
     from sgl_jax.srt.models.kimi_k3 import _rms_norm_from_sumsq
 

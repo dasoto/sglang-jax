@@ -123,7 +123,17 @@ class GateLogit(nnx.Module):
             self.bias = None
 
     @named_scope
-    def __call__(self, hidden_states: jax.Array) -> tuple[jax.Array, jax.Array | None]:
+    def __call__(
+        self,
+        hidden_states: jax.Array,
+        out_sharding: jax.sharding.Sharding | None = None,
+    ) -> tuple[jax.Array, jax.Array | None]:
+        """``out_sharding`` (default: the hidden states') is the layout of the returned scores.
+
+        With an expert-sharded kernel the scores come out sharded over experts, and this
+        reshard gathers them: to the hidden states' layout an all-gather of every token's
+        scores to each chip, to a token-sharded layout an all-to-all of 1/tp of them.
+        """
         # XLA fuses the converts into the dot's operand reads, so a BF16-stored
         # kernel computed in f32 reads half the bytes of an f32 kernel and yields
         # the same HIGHEST-precision result.
@@ -147,7 +157,10 @@ class GateLogit(nnx.Module):
                 raise ValueError("unknown score func")
 
         if self.kernel_axes[1] is not None:
-            logits = jax.sharding.reshard(logits, jax.typeof(hidden_states).sharding)
+            logits = jax.sharding.reshard(
+                logits,
+                jax.typeof(hidden_states).sharding if out_sharding is None else out_sharding,
+            )
 
         return logits
 
