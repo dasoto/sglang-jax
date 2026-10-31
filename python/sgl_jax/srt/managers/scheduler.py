@@ -125,6 +125,45 @@ _PIN_QUEUED_PREFIX = os.environ.get("SGLANG_JAX_PIN_QUEUED_PREFIX", "0").strip()
     "1", "true", "yes", "on")
 _PIN_QUEUED_MIN_TOKENS = int(os.environ.get("SGLANG_JAX_PIN_QUEUED_MIN_TOKENS", "4096"))
 
+
+@dataclass(frozen=True)
+class _PrefillSjfConfig:
+    """Shortest-new-prompt-first prefill per DP rank (SGLANG_JAX_PREFILL_SJF=1).
+
+    The waiting queue is ordered by each request's estimated uncached prompt tokens (prompt
+    length minus the prefix the DP router matched on its rank), less ``aging_tokens_per_step``
+    per scheduler step spent waiting, so long prompts are not starved. A rank's chunked
+    prefill with at least ``park_min_remaining`` tokens left is parked (it keeps its KV pages,
+    tree locks and recurrent slot) while a request of at most ``short_tokens`` estimated new
+    tokens waits for that rank, and resumes when none does, after ``max_park_steps`` steps
+    parked in total, or when it is aborted. Ages count scheduler steps, never wall time, so
+    every node makes the same decisions.
+    """
+
+    short_tokens: int
+    park_min_remaining: int
+    aging_tokens_per_step: int
+    max_park_steps: int
+
+    @classmethod
+    def from_env(cls) -> "_PrefillSjfConfig | None":
+        if os.environ.get("SGLANG_JAX_PREFILL_SJF", "0").strip().lower() not in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        ):
+            return None
+        return cls(
+            short_tokens=int(os.environ.get("SGLANG_JAX_SJF_SHORT_TOKENS", "4096")),
+            park_min_remaining=int(os.environ.get("SGLANG_JAX_SJF_PARK_MIN_REMAINING", "8192")),
+            aging_tokens_per_step=int(
+                os.environ.get("SGLANG_JAX_SJF_AGING_TOKENS_PER_STEP", "200")
+            ),
+            max_park_steps=int(os.environ.get("SGLANG_JAX_SJF_MAX_PARK_STEPS", "300")),
+        )
+
+
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
 TEST_RETRACT_INTERVAL = int(os.environ.get("SGLANG_TEST_RETRACT_INTERVAL", "3"))
@@ -564,6 +603,9 @@ class Scheduler(
             self.chunked_prefill_size = None
         self.chunked_reqs = [None] * self.dp_size  # Per-DP chunked requests
         self._pending_chunked_abort_reqs = [None] * self.dp_size
+        # Shortest-first prefill (see _PrefillSjfConfig): chunked requests parked per DP rank.
+        self._sjf = _PrefillSjfConfig.from_env()
+        self.parked_chunked_reqs: list[list[Req]] = [[] for _ in range(self.dp_size)]
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
         )
@@ -956,6 +998,9 @@ class Scheduler(
                     yield rank, info.chunked_req
         for rank, req in enumerate(self.chunked_reqs):
             if req is not None:
+                yield rank, req
+        for rank, parked in enumerate(getattr(self, "parked_chunked_reqs", ())):
+            for req in parked:
                 yield rank, req
         for queue in (self.waiting_queue, self.grammar_queue):
             for req in queue:
@@ -1483,7 +1528,9 @@ class Scheduler(
         # scheduling state
         ret["cur_batch_is_none"] = self.cur_batch is None
         ret["last_batch_is_none"] = self.last_batch is None
-        ret["chunked_req_is_none"] = all(r is None for r in self.chunked_reqs)
+        ret["chunked_req_is_none"] = all(r is None for r in self.chunked_reqs) and not any(
+            getattr(self, "parked_chunked_reqs", ())
+        )
         ret["chunked_req_rids"] = [r.rid if r is not None else None for r in self.chunked_reqs]
 
         # request cache stat
@@ -1610,7 +1657,9 @@ class Scheduler(
         running_reqs = _batch_size(self.running_batch)
         current_batch_reqs = _batch_size(self.cur_batch)
         last_batch_reqs = _batch_size(self.last_batch)
-        chunked_pending = any(req is not None for req in self.chunked_reqs)
+        chunked_pending = any(req is not None for req in self.chunked_reqs) or any(
+            getattr(self, "parked_chunked_reqs", ())
+        )
         pending_results = len(getattr(self, "result_queue", ())) if self.enable_overlap else 0
 
         has_pending = (
@@ -1681,6 +1730,7 @@ class Scheduler(
         self.pending_dp_reqs = []
         self.chunked_reqs = [None] * self.dp_size
         self._pending_chunked_abort_reqs = [None] * self.dp_size
+        self.parked_chunked_reqs = [[] for _ in range(self.dp_size)]
         if self.enable_overlap:
             self.result_queue = deque()
 
@@ -1741,6 +1791,7 @@ class Scheduler(
 
     def _add_request_to_queue(self, req: Req):
         req.queue_time_start = time.perf_counter()
+        req._sjf_enqueue_ct = getattr(self, "forward_ct", 0)
         if _PIN_QUEUED_PREFIX:
             self._pin_queued_prefix(req)
         self.waiting_queue.append(req)
@@ -1998,6 +2049,14 @@ class Scheduler(
     def _retract_parked_chunked_reqs(self, retracted_reqs: list[Req]) -> None:
         if self.pd == "pathways":
             return
+        for dp_rank, parked in enumerate(getattr(self, "parked_chunked_reqs", ())):
+            for req in parked:  # shortest-first parking: release like an owned chunk below
+                assert req.is_chunked == 0
+                self._release_prefill_host_buffer(req)
+                release_kv_cache(req, self.tree_cache, is_insert=False)
+                req.reset_for_retract()
+                self._add_request_to_queue(req)
+            self.parked_chunked_reqs[dp_rank] = []
         retracted_request_ids = {id(req) for req in retracted_reqs}
         for dp_rank, req in enumerate(self.chunked_reqs):
             if req is None:
@@ -2182,6 +2241,91 @@ class Scheduler(
 
         return ret
 
+    def _sjf_new_tokens(self, req: Req) -> int:
+        """Estimated uncached prompt tokens: the prefix the DP router matched on its rank."""
+        return len(req.origin_input_ids) - getattr(req, "_dp_match_len", 0)
+
+    def _sjf_priority(self, req: Req) -> int:
+        waited = self.forward_ct - getattr(req, "_sjf_enqueue_ct", self.forward_ct)
+        return self._sjf_new_tokens(req) - self._sjf.aging_tokens_per_step * waited
+
+    def _sjf_parked_steps(self, req: Req) -> int:
+        steps = getattr(req, "_sjf_parked_steps", 0)
+        since = getattr(req, "_sjf_parked_at", None)
+        return steps + (self.forward_ct - since if since is not None else 0)
+
+    def _sjf_short_waiting(self, dp_rank: int) -> Req | None:
+        """First (shortest-first ordered) queued request of ``dp_rank`` that may preempt."""
+        info = self.running_batch.reqs_info[dp_rank]
+        if info.batch_is_full or len(info.reqs) >= self.per_dp_max_running_requests:
+            return None
+        for req in self.waiting_queue:
+            if req.dp_rank == dp_rank and self._sjf_new_tokens(req) <= self._sjf.short_tokens:
+                return req
+        return None
+
+    def _sjf_resume(self, dp_rank: int, req: Req, why: str) -> Req:
+        self.parked_chunked_reqs[dp_rank].remove(req)
+        req._sjf_parked_steps = self._sjf_parked_steps(req)
+        req._sjf_parked_at = None
+        self.chunked_reqs[dp_rank] = req
+        if req.to_finish is not None and self._pending_chunked_abort_reqs[dp_rank] is None:
+            self._pending_chunked_abort_reqs[dp_rank] = req  # aborted while parked
+        if getattr(self, "_dp_route_log", False):
+            logger.info(
+                "SJF resume rid=%s dp=%d why=%s remaining=%d parked_steps=%d",
+                req.rid,
+                dp_rank,
+                why,
+                len(req.origin_input_ids) - len(req.prefix_indices),
+                req._sjf_parked_steps,
+            )
+        return req
+
+    def _sjf_park_and_resume(self) -> None:
+        """Per DP rank: park a long chunked prefill for a short queued request, or resume one.
+
+        Runs after the previous batch's chunked owners were synced and their partial prefixes
+        cached, before this round re-adds them; a parked request leaves this round's batch
+        without a chunked owner on its rank, so the next sync does not re-adopt it.
+        """
+        cfg = self._sjf
+        for dp_rank in range(self.dp_size):
+            parked = self.parked_chunked_reqs[dp_rank]
+            cur = self.chunked_reqs[dp_rank]
+            if cur is None and parked:
+                aborted = [r for r in parked if r.to_finish is not None]
+                if aborted:
+                    self._sjf_resume(dp_rank, aborted[0], "abort")
+                elif self._sjf_parked_steps(parked[-1]) >= cfg.max_park_steps:
+                    self._sjf_resume(dp_rank, parked[-1], "aged")
+                elif self._sjf_short_waiting(dp_rank) is None:
+                    self._sjf_resume(dp_rank, parked[-1], "drained")
+                continue
+            if cur is None or parked or self._pending_chunked_abort_reqs[dp_rank] is not None:
+                continue
+            remaining = len(cur.origin_input_ids) - len(cur.prefix_indices)
+            if (
+                remaining < cfg.park_min_remaining
+                or self._sjf_parked_steps(cur) >= cfg.max_park_steps
+            ):
+                continue
+            short = self._sjf_short_waiting(dp_rank)
+            if short is None or 2 * self._sjf_new_tokens(short) > remaining:
+                continue
+            self.chunked_reqs[dp_rank] = None
+            cur._sjf_parked_at = self.forward_ct
+            parked.append(cur)
+            if getattr(self, "_dp_route_log", False):
+                logger.info(
+                    "SJF park rid=%s dp=%d remaining=%d for rid=%s new~%d",
+                    cur.rid,
+                    dp_rank,
+                    remaining,
+                    short.rid,
+                    self._sjf_new_tokens(short),
+                )
+
     def _steal_for_idle_dp_ranks(self, adder, chunk_exhausted_dps) -> None:
         """Hand queued cold requests to DP ranks that would otherwise prefill nothing.
 
@@ -2280,7 +2424,10 @@ class Scheduler(
             self.tree_cache.check_hicache_events()
 
         # Handle the cases where prefill is not allowed
-        has_chunked_reqs = any(req is not None for req in self.chunked_reqs)
+        sjf = getattr(self, "_sjf", None)  # shortest-first prefill (_PrefillSjfConfig)
+        has_chunked_reqs = any(req is not None for req in self.chunked_reqs) or any(
+            getattr(self, "parked_chunked_reqs", ())
+        )
         if self.is_hybrid:
             for info in self.running_batch.reqs_info:
                 info.batch_is_full = False
@@ -2306,7 +2453,11 @@ class Scheduler(
             return None
 
         # Get priority queue
+        if sjf is not None and not admissions_paused:
+            self.waiting_queue.sort(key=self._sjf_priority)
         self.policy.calc_priority(self.waiting_queue)
+        if sjf is not None and not admissions_paused:
+            self._sjf_park_and_resume()
 
         adder = PrefillAdder(
             self.page_size,
@@ -2373,6 +2524,13 @@ class Scheduler(
             if (
                 self.chunked_reqs[dp_rank] is not None
                 or adder.new_chunked_reqs[dp_rank] is not None
+            ):
+                continue
+            # A rank with a parked chunked prefill admits only the short requests it gave way to.
+            if (
+                sjf is not None
+                and self.parked_chunked_reqs[dp_rank]
+                and self._sjf_new_tokens(req) > sjf.short_tokens
             ):
                 continue
 
@@ -2446,6 +2604,21 @@ class Scheduler(
                     break
             if _reserved_bid is not None:
                 req.disagg_host_buffer_id = _reserved_bid
+
+        if sjf is not None:
+            # A rank whose parked request gave way to a short one that could not start (cap,
+            # memory, recurrent slots) resumes it at once instead of idling this round.
+            for dp_rank, parked in enumerate(self.parked_chunked_reqs):
+                if (
+                    parked
+                    and self.chunked_reqs[dp_rank] is None
+                    and not adder.can_run_list[dp_rank]
+                    and adder.new_chunked_reqs[dp_rank] is None
+                ):
+                    req = self._sjf_resume(dp_rank, parked[-1], "idle")
+                    if self._pending_chunked_abort_reqs[dp_rank] is None:
+                        req.init_next_round_input()
+                        self.chunked_reqs[dp_rank] = adder.add_chunked_req(req)
 
         if (
             getattr(self, "_dp_steal_max_cached", None) is not None
@@ -2967,6 +3140,10 @@ class Scheduler(
     def abort_request(self, recv_req: AbortReq):
         self._sync_chunked_req_owners()
         self._mark_pending_chunked_aborts(recv_req)
+        for parked in getattr(self, "parked_chunked_reqs", ()):
+            for req in parked:  # resumed first, then finalized like an owned chunked abort
+                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
+                    req.to_finish = FINISH_ABORT()
 
         # Delete requests in the waiting queue
         to_del = []

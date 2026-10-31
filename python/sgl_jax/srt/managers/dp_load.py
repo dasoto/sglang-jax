@@ -233,6 +233,9 @@ class DpRouter:
             max_spill_tokens=self.max_spill_tokens if sticky else None,
             holder_slack_tokens=self.holder_slack_tokens,
         )
+        if rank is not None:
+            # The prefix this rank holds: shortest-first prefill estimates new tokens from it.
+            req._dp_match_len = matches.get(rank, 0)
         if self._on_route is not None and (rank is not None or deferrals == 0):
             self._on_route(
                 req,

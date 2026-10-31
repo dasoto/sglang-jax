@@ -781,5 +781,187 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
                 adder.add_one_req.assert_not_called()
 
 
+class _StopAfterScheduling(Exception):
+    pass
+
+
+class TestPrefillShortestFirst(unittest.TestCase):
+    """SGLANG_JAX_PREFILL_SJF: shortest-first queue order and parking of long chunked prefills."""
+
+    _make_req = TestSchedulerChunkedOwnership._make_req
+    _make_batch = TestSchedulerChunkedOwnership._make_batch
+    _make_scheduler = TestSchedulerChunkedOwnership._make_scheduler
+
+    def _sjf_scheduler(self, dp_size=1):
+        from sgl_jax.srt.managers.scheduler import _PrefillSjfConfig
+
+        scheduler, _ = self._make_scheduler([[] for _ in range(dp_size)])
+        scheduler._sjf = _PrefillSjfConfig(
+            short_tokens=4096, park_min_remaining=8192, aging_tokens_per_step=100, max_park_steps=50
+        )
+        scheduler.parked_chunked_reqs = [[] for _ in range(dp_size)]
+        scheduler.per_dp_max_running_requests = 64
+        scheduler.forward_ct = 0
+        scheduler._dp_route_log = False
+        return scheduler
+
+    def _queued(self, scheduler, rid, prompt_len, cached, dp_rank=0):
+        req = self._make_req(rid, list(range(prompt_len)), [], dp_rank=dp_rank)
+        req._dp_match_len = cached
+        req._sjf_enqueue_ct = scheduler.forward_ct
+        req.init_next_round_input = Mock()
+        return req
+
+    def _long_chunk(self, prompt_len=30000, done=2048, dp_rank=0):
+        req = self._make_req("long", list(range(prompt_len)), list(range(done)), dp_rank=dp_rank)
+        req.init_next_round_input = Mock()
+        return req
+
+    def test_queue_order_is_shortest_new_prompt_first_with_aging(self):
+        scheduler = self._sjf_scheduler()
+        cold = self._queued(scheduler, "cold", 20000, 0)  # 20000 new tokens
+        scheduler.forward_ct = 150
+        warm = self._queued(scheduler, "warm", 60000, 59000)  # 1000 new tokens
+        mid = self._queued(scheduler, "mid", 9000, 0)
+        queue = [cold, mid, warm]
+        queue.sort(key=scheduler._sjf_priority)
+        # cold has aged 150 steps (-15000): 5000 < mid's 9000.
+        self.assertEqual([r.rid for r in queue], ["warm", "cold", "mid"])
+
+    def test_long_chunk_parks_for_a_short_request_and_resumes_when_drained(self):
+        scheduler = self._sjf_scheduler()
+        long = self._long_chunk()
+        scheduler.chunked_reqs = [long]
+        short = self._queued(scheduler, "short", 50000, 48000)
+        scheduler.waiting_queue = [short]
+
+        scheduler._sjf_park_and_resume()
+        self.assertEqual(scheduler.chunked_reqs, [None])
+        self.assertEqual(scheduler.parked_chunked_reqs, [[long]])
+
+        scheduler.forward_ct = 7
+        scheduler.waiting_queue = []  # the short request was admitted and finished
+        scheduler._sjf_park_and_resume()
+        self.assertIs(scheduler.chunked_reqs[0], long)
+        self.assertEqual(scheduler.parked_chunked_reqs, [[]])
+        self.assertEqual(long._sjf_parked_steps, 7)
+
+    def test_no_parking_for_a_nearly_done_chunk_or_a_not_much_shorter_request(self):
+        for prompt_len, done, short_new in ((10000, 4000, 1000), (30000, 22000, 4000)):
+            with self.subTest(prompt_len=prompt_len, done=done, short_new=short_new):
+                scheduler = self._sjf_scheduler()
+                long = self._long_chunk(prompt_len, done)
+                scheduler.chunked_reqs = [long]
+                scheduler.waiting_queue = [self._queued(scheduler, "short", short_new, 0)]
+                scheduler._sjf_park_and_resume()
+                self.assertIs(scheduler.chunked_reqs[0], long)
+                self.assertEqual(scheduler.parked_chunked_reqs, [[]])
+
+    def test_no_parking_when_the_short_request_cannot_start(self):
+        scheduler = self._sjf_scheduler()
+        long = self._long_chunk()
+        scheduler.chunked_reqs = [long]
+        scheduler.waiting_queue = [self._queued(scheduler, "short", 1000, 0)]
+        scheduler.running_batch.reqs_info[0].batch_is_full = True
+        scheduler._sjf_park_and_resume()
+        self.assertIs(scheduler.chunked_reqs[0], long)
+
+    def test_parked_request_resumes_after_its_park_budget(self):
+        scheduler = self._sjf_scheduler()
+        long = self._long_chunk()
+        scheduler.chunked_reqs = [long]
+        scheduler.waiting_queue = [self._queued(scheduler, "short", 1000, 0)]
+        scheduler._sjf_park_and_resume()
+        self.assertEqual(scheduler.parked_chunked_reqs, [[long]])
+        scheduler.forward_ct = 50
+        scheduler._sjf_park_and_resume()  # short still waiting, but 50 steps parked
+        self.assertIs(scheduler.chunked_reqs[0], long)
+        scheduler._sjf_park_and_resume()  # and it is not parked again
+        self.assertIs(scheduler.chunked_reqs[0], long)
+
+    def test_aborted_parked_request_resumes_as_a_pending_chunked_abort(self):
+        scheduler = self._sjf_scheduler()
+        long = self._long_chunk()
+        scheduler.parked_chunked_reqs = [[long]]
+        long._sjf_parked_at = 0
+        scheduler.waiting_queue = [self._queued(scheduler, "short", 1000, 0)]
+        scheduler.abort_request(AbortReq(rid="long"))
+        self.assertIsNotNone(long.to_finish)
+        self.assertEqual(scheduler.waiting_queue[0].rid, "short")  # only the parked one matched
+        scheduler._sjf_park_and_resume()
+        self.assertIs(scheduler.chunked_reqs[0], long)
+        self.assertIs(scheduler._pending_chunked_abort_reqs[0], long)
+
+    def test_parked_requests_keep_the_scheduler_busy(self):
+        scheduler = self._sjf_scheduler()
+        scheduler.last_batch = None
+        scheduler.cur_batch = None
+        scheduler.pending_dp_reqs = []
+        long = self._long_chunk()
+        scheduler.parked_chunked_reqs = [[long]]
+        can_flush, msg = scheduler._can_flush_cache()
+        self.assertFalse(can_flush)
+        self.assertIn("chunked=True", msg)
+        self.assertEqual([r for _, r in scheduler._iter_dp_requests()], [long])
+
+    def _adder(self, dp_size=1, admit=False):
+        adder = SimpleNamespace(
+            can_run_list={dp: [] for dp in range(dp_size)},
+            pending_h2d=[],
+            new_chunked_reqs=[None] * dp_size,
+            add_chunked_req=Mock(side_effect=lambda r: r),
+        )
+
+        def add_one_req(r):
+            if admit:
+                adder.can_run_list[r.dp_rank].append(r)
+            return AddReqResult.CONTINUE
+
+        adder.add_one_req = Mock(side_effect=add_one_req)
+        return adder
+
+    def test_get_new_batch_prefill_admits_the_short_request_instead_of_the_chunk(self):
+        scheduler = self._sjf_scheduler()
+        scheduler.tree_cache.supports_recurrent = lambda: False
+        long = self._long_chunk()
+        scheduler.chunked_reqs = [long]
+        short = self._queued(scheduler, "short", 50000, 48000)
+        aged_long = self._queued(scheduler, "aged-long", 40000, 0)
+        aged_long._sjf_enqueue_ct = -1000  # sorts first, but may not start on a parked rank
+        scheduler.waiting_queue = [aged_long, short]
+        adder = self._adder(admit=True)
+        scheduler.log_prefill_stats = Mock()
+        for name in ("req_to_token_pool", "model_config", "mesh", "embedding_pool"):
+            setattr(scheduler, name, None)
+        with (
+            patch("sgl_jax.srt.managers.scheduler.PrefillAdder", return_value=adder),
+            patch(
+                "sgl_jax.srt.managers.scheduler.ScheduleBatch.init_new",
+                side_effect=_StopAfterScheduling,
+            ),
+            self.assertRaises(_StopAfterScheduling),
+        ):
+            scheduler.get_new_batch_prefill()
+        adder.add_chunked_req.assert_not_called()
+        self.assertEqual(adder.can_run_list, {0: [short]})
+        self.assertEqual(scheduler.parked_chunked_reqs, [[long]])
+        self.assertEqual([r.rid for r in scheduler.waiting_queue], ["aged-long"])
+        long.init_next_round_input.assert_not_called()
+
+    def test_parked_chunk_resumes_in_the_same_round_when_the_short_request_cannot_start(self):
+        scheduler = self._sjf_scheduler()
+        scheduler.tree_cache.supports_recurrent = lambda: False
+        long = self._long_chunk()
+        scheduler.chunked_reqs = [long]
+        scheduler.waiting_queue = [self._queued(scheduler, "short", 1000, 0)]
+        adder = self._adder(admit=False)
+        with patch("sgl_jax.srt.managers.scheduler.PrefillAdder", return_value=adder):
+            self.assertIsNone(scheduler.get_new_batch_prefill())
+        adder.add_chunked_req.assert_called_once_with(long)
+        long.init_next_round_input.assert_called_once_with()
+        self.assertIs(scheduler.chunked_reqs[0], long)
+        self.assertEqual(scheduler.parked_chunked_reqs, [[]])
+
+
 if __name__ == "__main__":
     unittest.main()
