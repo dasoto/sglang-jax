@@ -39,6 +39,7 @@ DEFAULT_MASK_VALUE = -0.7 * float(jnp.finfo(jnp.dtype("float32")).max)
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
+
 # DCP blocks (page_seq_positions) build the causal/page mask from per-column key positions and
 # per-row query tokens with one broadcast compare instead of per score element
 # (SGLANG_JAX_MLA_VECTOR_DCP_MASK=1; read when the kernel is traced).
