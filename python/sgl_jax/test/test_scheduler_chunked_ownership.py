@@ -460,12 +460,10 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         scheduler.log_prefill_stats = Mock()
         for name in ("req_to_token_pool", "model_config", "mesh", "embedding_pool"):
             setattr(scheduler, name, None)
+        init_new = Mock(side_effect=_StopAfterScheduling)
         with (
             patch("sgl_jax.srt.managers.scheduler.PrefillAdder", return_value=adder),
-            patch(
-                "sgl_jax.srt.managers.scheduler.ScheduleBatch.init_new",
-                side_effect=_StopAfterScheduling,
-            ),
+            patch("sgl_jax.srt.managers.scheduler.ScheduleBatch.init_new", init_new),
             self.assertRaises(_StopAfterScheduling),
         ):
             scheduler.get_new_batch_prefill()
@@ -473,6 +471,9 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         self.assertEqual(adder.can_run_list, {0: [], 1: [other]})
         self.assertEqual(req.is_chunked, 1)
         self.assertIs(scheduler.chunked_reqs[0], req)
+        # The batch does not name it as rank 0's owner, so finalizing its abort when the
+        # in-flight chunk returns leaves nothing for _sync_chunked_req_owners to re-adopt.
+        self.assertEqual(init_new.call_args.kwargs["chunked_reqs"], [None, None])
 
     def test_abort_finalizes_when_inflight_overlap_chunk_returns(self):
         req = self._make_req("inflight", [1, 2], [10, 11], return_logprob=True)

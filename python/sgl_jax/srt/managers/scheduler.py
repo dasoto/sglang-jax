@@ -2652,6 +2652,7 @@ class Scheduler(
                 self._release_queue_pin(req)
 
         # Update chunked requests for each DP rank
+        batch_owners = [None] * self.dp_size  # owners with a chunk in this batch
         for dp_rank in range(self.dp_size):
             if adder.new_chunked_reqs[dp_rank] is not None:
                 assert (
@@ -2660,20 +2661,21 @@ class Scheduler(
                 self.chunked_reqs[dp_rank] = adder.new_chunked_reqs[dp_rank]
             # Increment for any chunked req (new OR continuing) to keep
             # process_batch_result_prefill from sampling on intermediate chunks -- only when
-            # this batch carries one of its chunks: an owner held back this round (pending
-            # abort) has no result coming, and counting one made its abort finalize with a
-            # chunk still in flight (assert in _finalize_chunked_abort) or never.
+            # this batch carries one of its chunks. An owner held back this round (pending
+            # abort) has no result coming: counting one made its abort finalize with a chunk
+            # still in flight (assert in _finalize_chunked_abort) or never, and naming it as the
+            # batch's owner let _sync_chunked_req_owners re-adopt it after its abort finalized.
             owner = self.chunked_reqs[dp_rank]
             if owner is not None and any(r is owner for r in adder.can_run_list.get(dp_rank, ())):
                 owner.is_chunked += 1
+                batch_owners[dp_rank] = owner
 
         self.log_prefill_stats(adder, all_can_run_reqs, running_bs)
 
         # Use adder.can_run_list directly as reqs_per_dp (already grouped by DP rank)
         reqs_per_dp = [adder.can_run_list.get(i, []) for i in range(self.dp_size)]
 
-        # Use self.chunked_reqs directly as chunked_reqs_per_dp
-        chunked_reqs_per_dp = self.chunked_reqs.copy()
+        chunked_reqs_per_dp = batch_owners
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
