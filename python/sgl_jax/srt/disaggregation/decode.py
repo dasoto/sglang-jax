@@ -85,6 +85,12 @@ def _list_prefills_with_retry(client, attempts: int | None = None, delay_s: floa
     raise AssertionError("unreachable")
 
 
+def _prefill_wire_enabled() -> bool:
+    from sgl_jax.srt.disaggregation import prefill as _prefill
+
+    return _prefill._PD_WIRE
+
+
 def _request_dp_rank(req, dp_size: int, *, prefill: bool = False) -> int:
     field = "disagg_prefill_dp_rank" if prefill else "dp_rank"
     value = getattr(req, field, None)
@@ -93,7 +99,11 @@ def _request_dp_rank(req, dp_size: int, *, prefill: bool = False) -> int:
             return 0
         raise ValueError(f"PD request {req.rid!r} is missing {field} for dp_size={dp_size}")
     value = int(value)
-    if not 0 <= value < dp_size:
+    from sgl_jax.srt.disaggregation import prefill as _prefill
+
+    # With the wire layout the prefill side may run more DP ranks than this decoder.
+    bound = None if (prefill and _prefill._PD_WIRE) else dp_size
+    if value < 0 or (bound is not None and value >= bound):
         raise ValueError(f"PD request {req.rid!r} has {field}={value} outside [0, {dp_size})")
     return value
 
@@ -483,7 +493,8 @@ class SchedulerDisaggregationDecodeMixin:
                     local_kv_dtype=resolve_kv_dtype_name(local_kv_pool.dtype),
                     expected_transfer_engine=(None if manager is None else manager.engine_name),
                     expected_dp_rank=prefill_dp_rank,
-                    expected_dp_size=self.dp_size,
+                    # The wire layout decouples the prefill and decode DP layouts.
+                    expected_dp_size=None if _prefill_wire_enabled() else self.dp_size,
                     expected_chunk_prefill_transfer=bool(
                         getattr(
                             self.server_args,

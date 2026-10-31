@@ -722,3 +722,19 @@ def test_dsa_wire_layout_between_different_dp_layouts(monkeypatch):
             p_np = np.asarray(jax.device_get(p_bufs[l_idx]))
             d_np = np.asarray(jax.device_get(d_bufs[l_idx]))
             np.testing.assert_array_equal(d_np[d_global], p_np[p_global])
+
+
+def test_wire_layout_accepts_more_prefill_dp_ranks(monkeypatch):
+    import pytest
+
+    from sgl_jax.srt.disaggregation import decode as decode_mod
+    from sgl_jax.srt.disaggregation import prefill as prefill_mod
+
+    req = SimpleNamespace(rid="r", dp_rank=1, disagg_prefill_dp_rank=5)
+    monkeypatch.setattr(prefill_mod, "_PD_WIRE", False)
+    with pytest.raises(ValueError):
+        decode_mod._request_dp_rank(req, 4, prefill=True)
+    monkeypatch.setattr(prefill_mod, "_PD_WIRE", True)
+    assert decode_mod._request_dp_rank(req, 4, prefill=True) == 5
+    with pytest.raises(ValueError):
+        decode_mod._request_dp_rank(SimpleNamespace(rid="r", dp_rank=4), 4)
