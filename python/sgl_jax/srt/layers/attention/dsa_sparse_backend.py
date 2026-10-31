@@ -1558,17 +1558,23 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             owned = (tp_ >= 0) & (phys > 0) & ((phys - 1) % dcp == rank)
             tp_local = jnp.where(owned, tp_, -1)
             pt_local = jnp.where((pi_ > 0) & ((pi_ - 1) % dcp == rank), (pi_ - 1) // dcp + 1, 0)
-            ql_all = jax.lax.all_gather(ql_, "tensor", axis=1, tiled=True)
-            qpe_all = jax.lax.all_gather(qpe_, "tensor", axis=1, tiled=True)
+            # Concatenate this rank's heads before the all-gather: concatenating
+            # the gathered [T, H, 576] query cost a full extra pass per layer.
+            q_all = jax.lax.all_gather(
+                jnp.concatenate([ql_, qpe_.astype(ql_.dtype)], axis=-1),
+                "tensor",
+                axis=1,
+                tiled=True,
+            )
             o, cache_, lse = prefill_write_and_attend_ragged_qblock(
-                ql_all,
-                qpe_all,
+                None,
+                None,
                 kvc_,
                 kpe_,
                 cache_,
                 tp_local,
                 pos_,
-                jnp.full((T,), -1, jnp.int32),  # already written above
+                jnp.full((T,), -1, jnp.int32),
                 sl_,
                 cuq_,
                 cukv_,
@@ -1578,6 +1584,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 sm_scale=sm,
                 query_block=_DCP_PREFILL_QB,
                 return_lse=True,
+                q_sparse=q_all,
+                skip_write=True,  # owned rows were written above
             )
             o = _dcp_lse_combine(o, lse, ql_.shape[1])
             return o.astype(ql_.dtype), cache_
