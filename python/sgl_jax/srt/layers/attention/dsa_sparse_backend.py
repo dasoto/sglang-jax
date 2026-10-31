@@ -163,6 +163,11 @@ _TSA_PREFILL_QB = int(os.environ.get("DSA_TSA_PREFILL_QB", "16"))
 # the sparse-prefill query block holds QB x num_heads rows; 16 x 64 heads matches
 # the row count of the head-TP default (256 x 4 heads at TP16).
 _DCP_PREFILL_QB = int(os.environ.get("DSA_DCP_PREFILL_QB", "16"))
+# Recall target for the cross-rank top-k merge under DCP (0 = exact top_k). Decode
+# merges dcp x index_topk candidates per query (65,536 at DCP32), which an exact
+# top_k sorts on every layer; approx_max_k keeps a small candidate set first.
+_DCP_MERGE_RECALL = float(os.environ.get("DSA_DCP_MERGE_RECALL", "0"))
+_DCP_MERGE_APPROX_MIN = 4096
 # dtype of the DCP output reduce-scatter (each rank's softmax-weighted partial).
 # bfloat16 halves the prefill combine traffic ([T, heads, kv_lora_rank] per layer).
 _DCP_COMBINE_DTYPE = jnp.dtype(os.environ.get("DSA_DCP_COMBINE_DTYPE", "float32"))
@@ -1641,12 +1646,27 @@ def _dcp_local_page_table(
     return jnp.where(g > 0, (g - 1) // dcp_size + 1, 0).astype(jnp.int32).reshape(-1)
 
 
-def _dcp_merge_topk(vals: jax.Array, idx: jax.Array, k: int) -> jax.Array:
+def _dcp_merge_topk(
+    vals: jax.Array, idx: jax.Array, k: int, recall: float | None = None
+) -> jax.Array:
     """Global top-k from each rank's local top-k: all-gather (score, index) over
-    ``tensor`` and select again. Descending order, -1 for empty slots."""
+    ``tensor`` and select again. Descending order, -1 for empty slots.
+
+    With ``recall`` in (0, 1) a large candidate set is first reduced by
+    approx_max_k (unsorted candidates, no internal sort) and the exact top_k runs
+    on that smaller set; a missed entry is replaced by the next-best candidate.
+    """
     vals = jax.lax.all_gather(vals, "tensor", axis=1, tiled=True)
     idx = jax.lax.all_gather(idx, "tensor", axis=1, tiled=True)
-    top_vals, pos = jax.lax.top_k(vals, k)
+    recall = _DCP_MERGE_RECALL if recall is None else recall
+    if 0.0 < recall < 1.0 and vals.shape[1] >= _DCP_MERGE_APPROX_MIN:
+        cand_vals, cand_pos = jax.lax.approx_max_k(
+            vals, k, recall_target=recall, aggregate_to_topk=False
+        )
+        top_vals, sel = jax.lax.top_k(cand_vals, k)
+        pos = jnp.take_along_axis(cand_pos, sel, axis=1)
+    else:
+        top_vals, pos = jax.lax.top_k(vals, k)
     return jnp.where(top_vals > -jnp.inf, jnp.take_along_axis(idx, pos, axis=1), -1)
 
 
