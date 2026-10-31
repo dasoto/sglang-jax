@@ -170,6 +170,31 @@ def test_emit_sumsq_hier_combine(per_group, compact, window):
 
 
 @pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (CPU) devices")
+@pytest.mark.parametrize("window", [True, False])
+def test_fp8_dispatch_close_to_bf16(window):
+    """SGLANG_JAX_MOE_FP8_DISPATCH: the two-step token gather moves e4m3 rows with an f32 scale
+    per row of each chip's H slice; outputs within e4m3 rounding of the bf16 gather."""
+    T = 64
+    mesh = _mesh()
+    mask_np = _prefix_mask(T, (32, 32))
+    with jax.set_mesh(mesh):
+        ref, new = _layers(mesh, compact=False, window=window, seed=21)
+        for layer in (ref, new):
+            layer.emit_sumsq = True
+            layer.mesh_gather_two_step_bytes = 0  # the large-input (two-step) gather
+        new.fp8_dispatch = True
+        hs, tw, ti, mask = _inputs(mesh, T, mask_np, seed=23)
+        f_ref = jax.jit(lambda a, b, c, m: ref(a, b, c, token_mask=m))
+        f_new = jax.jit(lambda a, b, c, m: new(a, b, c, token_mask=m))
+        out_ref = np.asarray(f_ref(hs, tw, ti, mask)[0].astype(jnp.float32))
+        out_new = np.asarray(f_new(hs, tw, ti, mask)[0].astype(jnp.float32))
+    scale = np.abs(out_ref).max()
+    np.testing.assert_allclose(out_new, out_ref, rtol=0, atol=0.1 * scale)
+    rel = np.abs(out_new - out_ref).mean() / np.abs(out_ref).mean()
+    assert 0 < rel < 0.05, rel  # changed (quantized), but by e4m3 rounding only
+
+
+@pytest.mark.skipif(len(jax.devices()) < 8, reason="needs 8 (CPU) devices")
 def test_norm_from_sumsq_matches_rmsnorm():
     from sgl_jax.srt.models.kimi_k3 import _rms_norm_from_sumsq
 

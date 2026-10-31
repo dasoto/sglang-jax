@@ -52,6 +52,11 @@ MOE_COMPACT_MIN_TOKENS_ENV = "SGLANG_JAX_MOE_COMPACT_MIN_TOKENS"
 # over "tensor" inside each DP group, then a reduction over "data" of the 1/tp-wide slices,
 # instead of one all-reduce of the full [T, H] partials over the whole model mesh.
 MOE_HIER_COMBINE_ENV = "SGLANG_JAX_MOE_HIER_COMBINE"
+# FP8 token dispatch (SGLANG_JAX_MOE_FP8_DISPATCH=1): the two-step token all-gather moves each
+# chip's [T/dp, H/tp] slice as e4m3 with one f32 scale per row (the experts' inputs are
+# quantized per 1 x H/tp block, as in DeepSeek-V3's FP8 dispatch); 128 instead of 2 x H/tp bytes
+# per row for Kimi-K3's H/tp = 112.
+MOE_FP8_DISPATCH_ENV = "SGLANG_JAX_MOE_FP8_DISPATCH"
 # Local-window row sort: (local expert, row) packed into one int32 key needs rows < 2^16.
 _PACKED_SORT_MAX_ROWS = 1 << 16
 
@@ -239,6 +244,12 @@ class MXFP4EPMoE(EPMoE):
         # With emit_sumsq, reduce the partials in two stages (see MOE_HIER_COMBINE_ENV): each
         # chip receives 1/tp of [T, H] from its group instead of all of it from every chip.
         self.hier_combine = os.environ.get(MOE_HIER_COMBINE_ENV, "0").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        self.fp8_dispatch = os.environ.get(MOE_FP8_DISPATCH_ENV, "0").strip().lower() in (
             "1",
             "true",
             "yes",
@@ -650,6 +661,21 @@ class MXFP4EPMoE(EPMoE):
         def gather(x):  # [T/dp, H/tp] -> [T, H]
             return all_gather(x).reshape(t, h)
 
+        def gather_fp8(x):  # as gather, moving e4m3 rows with an f32 scale each
+            w = x.shape[1]
+            x32 = x.astype(jnp.float32)
+            scale = jnp.maximum(jnp.max(jnp.abs(x32), axis=1, keepdims=True), 1e-30) / 448.0
+            q = jax.lax.bitcast_convert_type((x32 / scale).astype(jnp.float8_e4m3fn), jnp.uint8)
+            sb = jax.lax.bitcast_convert_type(scale, jnp.uint8).reshape(x.shape[0], 4)
+            width = -(-(w + 4) // 128) * 128
+            row = jnp.concatenate(
+                [q, sb, jnp.zeros((x.shape[0], width - w - 4), jnp.uint8)], axis=1
+            )
+            full = all_gather(row)  # [T, tp, width]
+            qf = jax.lax.bitcast_convert_type(full[..., :w], jnp.float8_e4m3fn)
+            sf = jax.lax.bitcast_convert_type(full[..., w : w + 4], jnp.float32)  # [T, tp]
+            return (qf.astype(jnp.float32) * sf[..., None]).astype(hdt).reshape(t, h)
+
         def gather_packed(x, wts, ids):
             words = jnp.concatenate(
                 [
@@ -673,8 +699,9 @@ class MXFP4EPMoE(EPMoE):
 
         rep = P(None, None)
         if not pack:
+            fn = gather_fp8 if (self.fp8_dispatch and two_step and hdt.itemsize == 2) else gather
             hidden_states = shard_map(
-                gather, mesh=self.mesh, in_specs=P("data", "tensor"), out_specs=rep, check_vma=False
+                fn, mesh=self.mesh, in_specs=P("data", "tensor"), out_specs=rep, check_vma=False
             )(hidden_states)
             return hidden_states, topk_weights, topk_ids
         return shard_map(
