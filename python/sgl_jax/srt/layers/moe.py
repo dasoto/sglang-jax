@@ -1054,11 +1054,14 @@ class EPMoE(nnx.Module):
         i = jnp.arange(cap, dtype=jnp.int32)
         flat = sorted_selected_experts[jnp.minimum(start + i, num_tokens * top_k - 1)]
         valid = i < n_local
+        # Rows of other shards add zero into a spare row, so every index is in
+        # bounds: the v5e scatter emitter crashed on the out-of-bounds drop form.
         tokens = jnp.where(valid, flat // top_k, num_tokens)
         w = jnp.where(valid, jnp.ravel(weights)[flat].astype(jnp.float32), 0.0)
         contrib = intermediate.astype(jnp.float32) * w[:, None]
-        out = jnp.zeros((num_tokens, intermediate.shape[1]), jnp.float32)
-        return out.at[tokens].add(contrib, mode="drop").astype(self.dtype)
+        out = jnp.zeros((num_tokens + 1, intermediate.shape[1]), jnp.float32)
+        out = out.at[tokens].add(contrib, mode="promise_in_bounds")
+        return out[:num_tokens].astype(self.dtype)
 
     def _combine_replicas(self, output, *, tokens_split: bool):
         """Combine with replicas.
