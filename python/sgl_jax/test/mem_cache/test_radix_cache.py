@@ -552,6 +552,56 @@ class TestRadixCache(CustomTestCase):
         self.assertEqual(single.extra_key, "test_key")
         self.assertEqual(single.dp_rank, 2)
 
+    def test_probe_and_touch_prefix_matches_without_splitting(self):
+        """The SUF queue probe returns match_prefix's length but never splits a node."""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator)
+        cache.insert(InsertParams(key=RadixKey([1, 2, 3, 4, 5], None, 0)))
+        cache.insert(InsertParams(key=RadixKey([1, 2, 3, 9], None, 0)))
+        nodes_before = cache.total_size()
+
+        self.assertEqual(cache.probe_and_touch_prefix(RadixKey([1, 2, 3, 4, 5, 6], None, 0)), 5)
+        self.assertEqual(cache.probe_and_touch_prefix(RadixKey([1, 2, 3, 4, 7], None, 0)), 4)
+        self.assertEqual(cache.probe_and_touch_prefix(RadixKey([1, 2, 8], None, 0)), 2)
+        self.assertEqual(cache.probe_and_touch_prefix(RadixKey([7, 8], None, 0)), 0)
+        # Other DP ranks and namespaces see nothing.
+        self.assertEqual(cache.probe_and_touch_prefix(RadixKey([1, 2, 3], None, 1)), 0)
+        self.assertEqual(cache.probe_and_touch_prefix(RadixKey([1, 2, 3], "ns", 0)), 0)
+        self.assertEqual(cache.probe_and_touch_prefix(RadixKey([], None, 0)), 0)
+        # A partial match inside a node leaves the tree unchanged.
+        leaf = cache.root_node.children[(0, 1)]
+        self.assertEqual(len(leaf.key), 3)
+        self.assertEqual(cache.total_size(), nodes_before)
+        for key in ([1, 2, 3, 4, 5, 6], [1, 2, 8]):
+            self.assertEqual(
+                cache.probe_and_touch_prefix(RadixKey(key, None, 0)),
+                len(
+                    cache.match_prefix(MatchPrefixParams(key=RadixKey(key, None, 0))).device_indices
+                ),
+            )
+
+    def test_probe_and_touch_prefix_paged_and_lru(self):
+        """Paged probes count whole pages, and a probe makes its path most recently used."""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator, page_size=4)
+        cache.insert(InsertParams(key=RadixKey(list(range(12)), None, 0)))
+        cache.insert(InsertParams(key=RadixKey([50, 51, 52, 53], None, 0)))
+        self.assertEqual(cache.probe_and_touch_prefix(RadixKey(list(range(11)), None, 0)), 8)
+        self.assertEqual(
+            cache.probe_and_touch_prefix(RadixKey(list(range(8)) + [99] * 4, None, 0)), 8
+        )
+        self.assertEqual(cache.probe_and_touch_prefix(RadixKey([0, 1, 2, 9], None, 0)), 0)
+
+        other = cache.root_node.children[(0, (50, 51, 52, 53))]
+        probed = cache.root_node.children[(0, (0, 1, 2, 3))]
+        cache.probe_and_touch_prefix(RadixKey(list(range(12)), None, 0))
+        self.assertGreater(probed.last_access_time, other.last_access_time)
+
+    def test_probe_and_touch_prefix_disabled(self):
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator, disable=True)
+        self.assertEqual(cache.probe_and_touch_prefix(RadixKey([1, 2, 3], None, 0)), 0)
+
 
 class MockRequest:
     """mock request object for testing cache request functionality"""

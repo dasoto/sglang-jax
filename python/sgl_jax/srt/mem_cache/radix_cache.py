@@ -266,6 +266,51 @@ class RadixCache(BasePrefixCache):
             host_hit_length=0,
         )
 
+    def probe_and_touch_prefix(self, key: RadixKey) -> int:
+        """Cached prefix length of ``key`` in tokens; refreshes the LRU time of matched nodes.
+
+        Read-only, unlike ``match_prefix``: it never splits a node or builds index arrays,
+        and walks by offset instead of slicing the key, so the scheduler can probe every
+        waiting request each step (shortest-uncached-first queue ordering).
+        """
+        if self.disable or len(key) == 0:
+            return 0
+        ids = self.key_convert_fn(key.token_ids)
+        n = len(ids)
+        if self.page_size != 1:
+            n = n // self.page_size * self.page_size
+        step = self.page_size
+        now = time.monotonic()
+        node = self.root_node
+        node.last_access_time = now
+        off = 0
+        while off < n:
+            head = ids[off] if step == 1 else tuple(ids[off : off + step])
+            child = node.children.get(self._probe_child_key(head, key))
+            if child is None:
+                break
+            child.last_access_time = now
+            child_ids = child.key.token_ids
+            limit = min(len(child_ids), n - off)
+            i = 0
+            while i < limit and child_ids[i : i + step] == ids[off + i : off + i + step]:
+                i += step
+            off += i
+            if i < len(child_ids):
+                break
+            node = child
+        return off
+
+    def _probe_child_key(self, head, key: RadixKey):
+        """``get_child_key`` for a precomputed first token (page) of ``key``."""
+        if key.extra_key is None and key.dp_rank is None:
+            return head
+        if key.dp_rank is None:
+            return (key.extra_key, head)
+        if key.extra_key is None:
+            return (key.dp_rank, head)
+        return ((key.extra_key, key.dp_rank), head)
+
     def insert(self, params: InsertParams) -> int:
         key = params.key
         value = params.value
