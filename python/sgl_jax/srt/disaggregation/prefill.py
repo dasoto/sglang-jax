@@ -83,6 +83,46 @@ _KV_GATHER_PAGE_BUCKETS = (
 )
 
 
+# Wire layout for multi-host KV transfer (SGLANG_JAX_PD_WIRE=1): the payload travels
+# sharded over a fixed (4, devices / 4) grid of all devices in (process, id) order,
+# pages over the first axis and a page's token rows over the second, instead of in
+# the sender's (data, tensor) layout. Each host then owns the same block on both
+# sides whatever their DP / DCP layouts, so prefill and decode can differ (e.g. DP8
+# for fast prefill, DP32 for fast decode). Both sides pad to SGLANG_JAX_PD_WIRE_MIN_PAGES.
+_PD_WIRE = os.environ.get("SGLANG_JAX_PD_WIRE", "0") == "1"
+_PD_WIRE_MIN_PAGES = int(os.environ.get("SGLANG_JAX_PD_WIRE_MIN_PAGES", "32"))
+_PD_WIRE_PAGE_SHARDS = 4
+_WIRE_MESH = None
+
+
+def _pd_wire_mesh() -> jax.sharding.Mesh:
+    global _WIRE_MESH
+    if _WIRE_MESH is None:
+        import numpy as _np
+
+        devices = sorted(jax.devices(), key=lambda d: (d.process_index, d.id))
+        if len(devices) % _PD_WIRE_PAGE_SHARDS:
+            raise ValueError(f"PD wire layout needs a multiple of {_PD_WIRE_PAGE_SHARDS} devices")
+        grid = _np.asarray(devices, dtype=object).reshape(_PD_WIRE_PAGE_SHARDS, -1)
+        _WIRE_MESH = jax.sharding.Mesh(grid, ("wire_page", "wire_row"))
+    return _WIRE_MESH
+
+
+def _pd_wire_sharding(stacked_ndim: int) -> jax.sharding.NamedSharding:
+    """Wire sharding of a stacked [layers, pages, rows, packing, dim] payload."""
+    from jax.sharding import PartitionSpec as _P
+
+    tail = (None,) * (stacked_ndim - 3)
+    return jax.sharding.NamedSharding(_pd_wire_mesh(), _P(None, "wire_page", "wire_row", *tail))
+
+
+def _pd_min_pages(kv_pool) -> int:
+    """Smallest padded page count of a transfer (both sides must agree)."""
+    if _PD_WIRE:
+        return _PD_WIRE_MIN_PAGES
+    return int(getattr(kv_pool, "dp_size", 1)) if _is_mla_kv_pool(kv_pool) else 1
+
+
 def _pad_to_page_bucket(num_pages: int, *, min_pages: int = 1) -> int:
     target = max(int(num_pages), int(min_pages))
     for b in _KV_GATHER_PAGE_BUCKETS:
@@ -467,6 +507,8 @@ def local_kv_spec_for_pool(
     buffers = kv_pool.kv_buffer if buffers is None else buffers
     per_layer_tail = buffers[0].shape[1:]
     gshape = (layer_num, padded_pages) + per_layer_tail
+    if _PD_WIRE and _is_mla_kv_pool(kv_pool):
+        return local_spec_for_global(gshape, buffers[0].dtype, _pd_wire_sharding(len(gshape)))
     if _is_mla_kv_pool(kv_pool):
         _, stacked_sharding = _mla_kv_transfer_shardings(kv_pool, padded_pages, per_layer_tail)
         return local_spec_for_global(gshape, buffers[0].dtype, stacked_sharding)
@@ -1170,8 +1212,7 @@ class SchedulerDisaggregationPrefillMixin:
         seqlen = len(req.origin_input_ids)
         num_pages = (seqlen + page_size - 1) // page_size
         is_mla = _is_mla_kv_pool(kv_pool)
-        min_pages = int(getattr(kv_pool, "dp_size", 1)) if is_mla else 1
-        padded_pages = _pad_to_page_bucket(num_pages, min_pages=min_pages)
+        padded_pages = _pad_to_page_bucket(num_pages, min_pages=_pd_min_pages(kv_pool))
         # Only the first num_pages slots of req_to_token are written for this
         # req; the bucket-padding region holds whatever the previous occupant
         # left. Slice the real pages and zero-pad so device_put's cross-process
@@ -1232,6 +1273,8 @@ class SchedulerDisaggregationPrefillMixin:
             # local-mesh array; each P host registers its 1/nproc slice and the
             # matching D host (same jax_process_index) pulls exactly that slice.
             stacked = jnp.stack(layer_kvs, axis=0)
+            if _PD_WIRE and is_mla:
+                stacked = jax.device_put(stacked, _pd_wire_sharding(stacked.ndim))
             stacked.block_until_ready()
             return _global_to_local_shard(stacked)
         # Single-host: return the per-layer list. The D2H staging path

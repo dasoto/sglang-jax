@@ -467,9 +467,7 @@ class _DummyDsaScheduler(
 ):
     """GLM-5 style DSA pools: MLA latent + indexer keys, DCP=2, no recurrent state."""
 
-    def __init__(self, mesh: Mesh, *, page_size: int = 8):
-        dp_size = 2
-        dcp_size = 2
+    def __init__(self, mesh: Mesh, *, page_size: int = 8, dp_size: int = 2, dcp_size: int = 2):
         size = 16 * page_size * dp_size * dcp_size
         self.kv_pool = MLATokenToKVPool(
             size=size,
@@ -646,3 +644,81 @@ def test_dsa_first_token_opt_out(monkeypatch):
     )
     specs = sched._build_kv_spec_for_req(d_req)
     assert set(specs) == {"kv", "idx"}
+
+
+def test_dsa_wire_layout_between_different_dp_layouts(monkeypatch):
+    """SGLANG_JAX_PD_WIRE: P (DP2 x DCP2) and D (DP4, no DCP) exchange the payload in
+    the device-order wire layout; D's pages match P's for latent KV and indexer keys."""
+    from sgl_jax.srt.disaggregation import prefill as prefill_mod
+
+    monkeypatch.setattr(prefill_mod, "_PD_WIRE", True)
+    monkeypatch.setattr(prefill_mod, "_PD_WIRE_MIN_PAGES", 4)
+    monkeypatch.setattr(prefill_mod, "_WIRE_MESH", None)
+    p_mesh = _make_mesh()
+    d_devices = np.array(jax.devices()[:4]).reshape(4, 1)
+    axis_type = jax.sharding.AxisType.Explicit
+    d_mesh = Mesh(d_devices, ("data", "tensor"), axis_types=(axis_type, axis_type))
+    prefill_sched = _DummyDsaScheduler(p_mesh)
+    decode_sched = _DummyDsaScheduler(d_mesh, dp_size=4, dcp_size=1)
+    page_size = 8
+
+    prompt_ids = list(range(10, 30))
+    p_req = Req(
+        rid="req-glm5-wire",
+        origin_input_text="",
+        origin_input_ids=prompt_ids,
+        sampling_params=SamplingParams(max_new_tokens=4, temperature=0.0),
+        dp_rank=1,
+    )
+    p_req.sampling_params.normalize(None)
+    prefill_sched.req_to_token_pool.alloc([p_req])
+    p_kv_indices = prefill_sched.token_to_kv_pool_allocator.alloc(24, dp_rank=1)
+    prefill_sched.req_to_token_pool.write(
+        (p_req.req_pool_idx, slice(0, 20)), p_kv_indices[:20].astype(np.int32)
+    )
+    p_req._pd_first_token_id = 555
+    p_pool = prefill_sched.kv_pool
+    p_global = _globalize_rank_local_page_ids(
+        p_kv_indices[:24:page_size] // page_size,
+        dp_rank=1,
+        dp_size=2,
+        total_pages=int(p_pool.kv_buffer[0].shape[0]),
+        dcp_size=2,
+    )
+    _fill_pages(p_pool.kv_buffer, p_global, p_pool.kv_sharding, base=0)
+    _fill_pages(p_pool.indexer_key_buffer, p_global, p_pool.kv_sharding, base=100)
+
+    d_req = Req(
+        rid="req-glm5-wire",
+        origin_input_text="",
+        origin_input_ids=prompt_ids,
+        sampling_params=SamplingParams(max_new_tokens=4, temperature=0.0),
+        dp_rank=3,
+    )
+    d_req.sampling_params.normalize(None)
+    with patch("jax.process_count", return_value=2):
+        payload = prefill_sched._build_prefill_payload(p_req)
+        specs = decode_sched._build_kv_spec_for_req(d_req)
+        for key in specs:
+            assert payload[key].shape == specs[key].shape, key
+            assert payload[key].dtype == specs[key].dtype, key
+        d_kv_indices = decode_sched.token_to_kv_pool_allocator.alloc(24, dp_rank=3)
+        decode_sched._install_received_kv(d_req, d_kv_indices, payload)
+
+    assert d_req._pd_first_token_id == 555
+    d_pool = decode_sched.kv_pool
+    d_global = _globalize_rank_local_page_ids(
+        d_kv_indices[:24:page_size] // page_size,
+        dp_rank=3,
+        dp_size=4,
+        total_pages=int(d_pool.kv_buffer[0].shape[0]),
+        dcp_size=1,
+    )
+    for p_bufs, d_bufs in (
+        (p_pool.kv_buffer, d_pool.kv_buffer),
+        (p_pool.indexer_key_buffer, d_pool.indexer_key_buffer),
+    ):
+        for l_idx in range(len(p_bufs)):
+            p_np = np.asarray(jax.device_get(p_bufs[l_idx]))
+            d_np = np.asarray(jax.device_get(d_bufs[l_idx]))
+            np.testing.assert_array_equal(d_np[d_global], p_np[p_global])

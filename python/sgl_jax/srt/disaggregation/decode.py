@@ -898,6 +898,7 @@ class SchedulerDisaggregationDecodeMixin:
             _mla_kv_transfer_shardings,
             _pad_to_page_bucket,
             _pd_indexer_buffers,
+            _pd_min_pages,
             _pd_sends_first_token,
             local_kv_spec_for_pool,
             local_spec_for_global,
@@ -909,8 +910,7 @@ class SchedulerDisaggregationDecodeMixin:
         seqlen = len(req.origin_input_ids)
         num_pages = (seqlen + page_size - 1) // page_size
         is_mla = _is_mla_kv_pool(kv_pool)
-        min_pages = int(getattr(kv_pool, "dp_size", 1)) if is_mla else 1
-        padded_pages = _pad_to_page_bucket(num_pages, min_pages=min_pages)
+        padded_pages = _pad_to_page_bucket(num_pages, min_pages=_pd_min_pages(kv_pool))
         if jax.process_count() > 1:
             kv_spec = local_kv_spec_for_pool(kv_pool, kv_pool.layer_num, padded_pages)
         else:
@@ -1056,12 +1056,15 @@ class SchedulerDisaggregationDecodeMixin:
 
         from sgl_jax.srt.disaggregation.prefill import (
             _MLA_KV_CHUNK_LAYERS,
+            _PD_WIRE,
             _globalize_rank_local_page_ids,
             _is_mla_kv_pool,
             _local_to_global_shard,
             _mla_kv_transfer_shardings,
             _pad_to_page_bucket,
             _pd_indexer_buffers,
+            _pd_min_pages,
+            _pd_wire_sharding,
         )
 
         kv_pool = self.token_to_kv_pool_allocator.get_kvcache()
@@ -1081,9 +1084,7 @@ class SchedulerDisaggregationDecodeMixin:
             # Assemble it into the global pool sharding.
             per_layer_tail = target_buffers[0].shape[1:]
             if is_mla:
-                padded_pages = _pad_to_page_bucket(
-                    num_pages, min_pages=int(getattr(kv_pool, "dp_size", 1))
-                )
+                padded_pages = _pad_to_page_bucket(num_pages, min_pages=_pd_min_pages(kv_pool))
                 _, gsh = _mla_kv_transfer_shardings(kv_pool, padded_pages, per_layer_tail)
             else:
                 padded_pages = kv.shape[1]
@@ -1091,7 +1092,12 @@ class SchedulerDisaggregationDecodeMixin:
                 stacked_spec = PartitionSpec(None, None, *pool_pspec[1:])
                 gsh = NamedSharding(kv_pool.mesh, stacked_spec)
             gshape = (len(target_buffers), padded_pages) + per_layer_tail
-            kv = _local_to_global_shard(kv, gshape, gsh)
+            if _PD_WIRE and is_mla:
+                # Arrived in the wire layout; move it into this pool's transfer layout.
+                kv = _local_to_global_shard(kv, gshape, _pd_wire_sharding(len(gshape)))
+                kv = jax.device_put(kv, gsh)
+            else:
+                kv = _local_to_global_shard(kv, gshape, gsh)
 
         kv_indices_np = (
             np.asarray(kv_indices) if not isinstance(kv_indices, np.ndarray) else kv_indices
