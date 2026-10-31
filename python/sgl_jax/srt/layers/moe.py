@@ -48,7 +48,10 @@ MOE_LOCAL_WINDOW = os.environ.get("SGLANG_JAX_MOE_LOCAL_WINDOW", "0") == "1"
 # Needs one expert per shard and no expert-tensor split. Read at trace time.
 MOE_A2A = os.environ.get("SGLANG_JAX_MOE_A2A", "0") == "1"
 # Capacity buckets: each is a lax.switch branch, so keep the list short (compile time).
-_MOE_A2A_BUCKETS = (8, 32, 128)
+# The drop-free cap (one row per local token) is always the last branch.
+_MOE_A2A_BUCKETS = tuple(
+    int(b) for b in os.environ.get("SGLANG_JAX_MOE_A2A_BUCKETS", "8,32,128").split(",") if b
+)
 # Dispatch payload dtype: int8 (per-row scale) or bfloat16 (exact, twice the bytes).
 MOE_A2A_DISPATCH_INT8 = os.environ.get("SGLANG_JAX_MOE_A2A_DTYPE", "int8") == "int8"
 # Dense exchange variants (no control flow, no capacity): reduce-scatter the combine
