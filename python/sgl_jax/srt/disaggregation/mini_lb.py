@@ -168,7 +168,9 @@ class MiniLoadBalancer:
             total = len(request["prompt"])
         return max(total, 256)
 
-    def _select_sticky_p_and_loaded_d(self, request: dict, p_size: int, d_size: int) -> tuple[int, int]:
+    def _select_sticky_p_and_loaded_d(
+        self, request: dict, p_size: int, d_size: int
+    ) -> tuple[int, int]:
         self._ensure_load_arrays(p_size, d_size)
         msgs = request.get("messages")
         candidate_keys: list[object] = []
@@ -176,11 +178,7 @@ class MiniLoadBalancer:
         if isinstance(x_corr_id, str) and x_corr_id:
             candidate_keys.append(("cid", x_corr_id))
         if isinstance(msgs, list) and msgs:
-            sys_prefix = (
-                str(msgs[0].get("content", ""))[:256]
-                if isinstance(msgs[0], dict)
-                else ""
-            )
+            sys_prefix = str(msgs[0].get("content", ""))[:256] if isinstance(msgs[0], dict) else ""
             first_user_content = ""
             for m in msgs:
                 if isinstance(m, dict) and m.get("role") == "user":
@@ -200,13 +198,7 @@ class MiniLoadBalancer:
                     candidate_keys.append(("u0", sys_prefix, first_user_content[:256]))
                 head = msgs[:2] if len(msgs) >= 2 else msgs[:1]
                 candidate_keys.append(
-                    repr(
-                        [
-                            (m.get("role"), m.get("content"))
-                            for m in head
-                            if isinstance(m, dict)
-                        ]
-                    )
+                    repr([(m.get("role"), m.get("content")) for m in head if isinstance(m, dict)])
                 )
 
         p_rank: int | None = None
@@ -249,9 +241,12 @@ class MiniLoadBalancer:
         await self._ensure_dp_sizes()
         p_size = int(self.prefill_dp_size or 1)
         d_size = int(self.decode_dp_size or 1)
-        if p_size != d_size:
+        # The device-order wire layout (SGLANG_JAX_PD_WIRE) lets the two sides run
+        # different DP layouts: the decode rank is then chosen in the decoder's own
+        # range and the prefill rank travels as disagg_prefill_dp_rank.
+        if p_size != d_size and os.getenv("SGLANG_JAX_PD_WIRE", "0") != "1":
             raise RuntimeError(
-                "PD Raiden requires homogeneous DP topology: "
+                "PD Raiden requires homogeneous DP topology without SGLANG_JAX_PD_WIRE=1: "
                 f"prefill dp_size={p_size}, decode dp_size={d_size}"
             )
 
@@ -261,7 +256,7 @@ class MiniLoadBalancer:
             if not 0 <= forced < p_size:
                 raise ValueError(f"SGLANG_JAX_PD_FORCE_DP_RANK={forced} is outside [0, {p_size})")
             p_rank = forced
-            d_rank = forced
+            d_rank = forced % d_size
         elif os.getenv("SGLANG_JAX_PD_STICKY_DP", "0") == "1" and not isinstance(
             request.get("bootstrap_room"), list
         ):
@@ -271,7 +266,7 @@ class MiniLoadBalancer:
             request["bootstrap_room"] = (room // p_size) * p_size + p_rank
         else:
             p_rank = self._room_rank(request["bootstrap_room"], p_size)
-            d_rank = p_rank
+            d_rank = self._room_rank(request["bootstrap_room"], d_size)
 
         prefill_req = request.copy()
         decode_req = request.copy()
@@ -562,7 +557,9 @@ try:
                     failures.append(f"{resp.url}: HTTP {resp.status} {(await resp.text())[:300]}")
         if failures:
             return Response(content="\n".join(failures), status_code=HTTPStatus.BAD_REQUEST)
-        return Response(content="Cache flushed on every prefill and decode server.\n", status_code=200)
+        return Response(
+            content="Cache flushed on every prefill and decode server.\n", status_code=200
+        )
 
     @app.get("/server_info")
     @app.get("/get_server_info")

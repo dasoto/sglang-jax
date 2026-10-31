@@ -1024,3 +1024,45 @@ def test_sticky_p_overhang_invariant_and_loaded_d():
     }
     p_sub1, _ = instance._select_sticky_p_and_loaded_d(req_sub_t1, 8, 8)
     assert p_sub1 == p_sub0  # subagent turn 1 stays sticky to p_sub0
+
+
+class TestAlignDpRequests:
+    def test_heterogeneous_dp_needs_wire_layout(self, lb_instance, monkeypatch):
+        import asyncio
+
+        lb_instance.prefill_dp_size, lb_instance.decode_dp_size = 8, 32
+        monkeypatch.delenv("SGLANG_JAX_PD_STICKY_DP", raising=False)
+        monkeypatch.delenv("SGLANG_JAX_PD_FORCE_DP_RANK", raising=False)
+        monkeypatch.delenv("SGLANG_JAX_PD_WIRE", raising=False)
+        req = {"text": "hi", "bootstrap_room": 45}
+        with pytest.raises(RuntimeError, match="homogeneous"):
+            asyncio.run(lb_instance._align_dp_requests(req))
+
+        monkeypatch.setenv("SGLANG_JAX_PD_WIRE", "1")
+        p, d = asyncio.run(lb_instance._align_dp_requests(req))
+        assert (p["dp_rank"], d["dp_rank"], d["disagg_prefill_dp_rank"]) == (
+            45 % 8,
+            45 % 32,
+            45 % 8,
+        )
+
+        monkeypatch.setenv("SGLANG_JAX_PD_STICKY_DP", "1")
+        for room in (3, 1000, 77):
+            p, d = asyncio.run(
+                lb_instance._align_dp_requests({"text": "x", "bootstrap_room": room})
+            )
+            assert 0 <= p["dp_rank"] < 8 and 0 <= d["dp_rank"] < 32
+            assert d["disagg_prefill_dp_rank"] == p["dp_rank"] == p["bootstrap_room"] % 8
+
+    def test_homogeneous_dp_keeps_ranks_equal(self, lb_instance, monkeypatch):
+        import asyncio
+
+        lb_instance.prefill_dp_size, lb_instance.decode_dp_size = 8, 8
+        monkeypatch.delenv("SGLANG_JAX_PD_STICKY_DP", raising=False)
+        monkeypatch.delenv("SGLANG_JAX_PD_WIRE", raising=False)
+        monkeypatch.setenv("SGLANG_JAX_PD_FORCE_DP_RANK", "5")
+        p, d = asyncio.run(lb_instance._align_dp_requests({"text": "x", "bootstrap_room": 9}))
+        assert p["dp_rank"] == d["dp_rank"] == 5
+        monkeypatch.delenv("SGLANG_JAX_PD_FORCE_DP_RANK")
+        p, d = asyncio.run(lb_instance._align_dp_requests({"text": "x", "bootstrap_room": 9}))
+        assert p["dp_rank"] == d["dp_rank"] == 1
