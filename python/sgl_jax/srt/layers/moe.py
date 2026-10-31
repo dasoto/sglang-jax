@@ -51,6 +51,14 @@ MOE_A2A = os.environ.get("SGLANG_JAX_MOE_A2A", "0") == "1"
 _MOE_A2A_BUCKETS = (8, 32, 128)
 # Dispatch payload dtype: int8 (per-row scale) or bfloat16 (exact, twice the bytes).
 MOE_A2A_DISPATCH_INT8 = os.environ.get("SGLANG_JAX_MOE_A2A_DTYPE", "int8") == "int8"
+# Dense exchange variants (no control flow, no capacity): reduce-scatter the combine
+# over the expert axis along tokens instead of all-reducing it (exact, half the
+# combine traffic; the model layout is restored by a gather within the TP group),
+# and optionally gather the tokens as int8 with per-token scales (half the
+# dispatch traffic, ~1% activation error). Need no expert-tensor split and tokens
+# a multiple of the expert-shard count. Read at trace time.
+MOE_GATHER_RS = os.environ.get("SGLANG_JAX_MOE_GATHER_RS", "0") == "1"
+MOE_GATHER_INT8 = os.environ.get("SGLANG_JAX_MOE_GATHER_INT8", "0") == "1"
 
 
 class EPMoE(nnx.Module):
@@ -551,12 +559,27 @@ class EPMoE(nnx.Module):
             ]
         )
         scatter_on_tensor = "tensor" in out_specs
+        gather_rs = (
+            MOE_GATHER_RS
+            and self.tp_size == 1
+            and self.ep_size > 1
+            and hidden_states.shape[0] % self.ep_size == 0
+        )
+        gather_int8 = gather_rs and MOE_GATHER_INT8
+        if gather_rs:
+            out_specs = P("expert")
+            scatter_on_tensor = False
+        token_scale = None
+        if gather_int8:
+            hidden_states, token_scale = quantize_tensor_simple(hidden_states, jnp.int8, dim=-1)
 
         # Run MoE computation on the expert-parallel mesh
         with jax.sharding.use_abstract_mesh(self.updated_mesh):
             hidden_states_reshard = jax.sharding.reshard(hidden_states, P(None))
             topk_weights_reshard = jax.sharding.reshard(topk_weights, P(None))
             topk_ids_reshard = jax.sharding.reshard(topk_ids, P(None))
+            if token_scale is not None:
+                token_scale = jax.sharding.reshard(token_scale, P(None))
 
             # Normalize scales to GMM's 4D layout [E, k_blocks, 1, out_dim]
             w0_scale = self._normalize_scale_for_gmm(
@@ -576,7 +599,12 @@ class EPMoE(nnx.Module):
             )
 
             result = shard_map(
-                partial(self._forward, scatter_on_tensor=scatter_on_tensor),
+                partial(
+                    self._forward,
+                    scatter_on_tensor=scatter_on_tensor,
+                    scatter_on_expert=gather_rs,
+                    has_token_scale=token_scale is not None,
+                ),
                 mesh=self.moe_mesh,
                 in_specs=(
                     P(None),
@@ -594,6 +622,8 @@ class EPMoE(nnx.Module):
                     P("expert", None, "tensor"),
                     P("expert", None, "tensor"),
                     P("expert", None, None),
+                    # per-token int8 scale of the gathered tokens (or None)
+                    P(None),
                 ),
                 out_specs=out_specs,
                 check_vma=False,
@@ -610,6 +640,7 @@ class EPMoE(nnx.Module):
                 None,
                 None,
                 None,
+                token_scale,
             )
 
         # The shard_map ran under updated_mesh (expert, tensor); land back on
@@ -831,9 +862,14 @@ class EPMoE(nnx.Module):
         w0_kernel_bias=None,
         w1_kernel_bias=None,
         wo_kernel_bias=None,
+        token_scale=None,
         *,
         scatter_on_tensor: bool = False,
+        scatter_on_expert: bool = False,
+        has_token_scale: bool = False,
     ):
+        if has_token_scale:
+            hidden_states = (hidden_states.astype(jnp.float32) * token_scale).astype(self.dtype)
         expert_shard_id = (
             jnp.array(0, dtype=jnp.int32)
             if self.replicate_experts
@@ -915,7 +951,10 @@ class EPMoE(nnx.Module):
             else:
                 output = jax.lax.psum(output, "tensor")
         if self.ep_size > 1:
-            output = self._combine(output)
+            if scatter_on_expert:
+                output = jax.lax.psum_scatter(output, "expert", scatter_dimension=0, tiled=True)
+            else:
+                output = self._combine(output)
 
         return output
 

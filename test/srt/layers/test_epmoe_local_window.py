@@ -94,3 +94,37 @@ def test_a2a_matches_dense_dispatch(monkeypatch, top_k, m, skew):
     scale = np.abs(outs[0]).max()
     assert scale > 0
     np.testing.assert_allclose(outs[1], outs[0], rtol=0, atol=2e-2 * scale)
+
+
+@pytest.mark.parametrize("int8", [False, True])
+@pytest.mark.parametrize("window", [False, True])
+def test_gather_rs_matches_dense_dispatch(monkeypatch, int8, window):
+    """Reduce-scatter combine (SGLANG_JAX_MOE_GATHER_RS) is exact; the int8 token gather
+    (SGLANG_JAX_MOE_GATHER_INT8) is within the activation-quantization error."""
+    mesh = create_device_mesh(
+        ici_parallelism=[1, 8], dcn_parallelism=[1, 1], devices=jax.devices()[:8]
+    )
+    with jax.set_mesh(mesh):
+        layer = moe.EPMoE(
+            hidden_size=32,
+            num_experts=8,
+            num_experts_per_tok=4,
+            ep_size=8,
+            mesh=mesh,
+            intermediate_dim=16,
+            weight_dtype=jnp.float32,
+            dtype=jnp.float32,
+        )
+    rng = np.random.default_rng(7 + int8)
+    x = jnp.asarray(rng.standard_normal((64, 32)) * 0.1, jnp.float32)
+    ids, w = _route(rng, 64, 8, 4, 2.0)
+    monkeypatch.setattr(moe, "MOE_LOCAL_WINDOW", window)
+    outs = []
+    for flag in (False, True):
+        monkeypatch.setattr(moe, "MOE_GATHER_RS", flag)
+        monkeypatch.setattr(moe, "MOE_GATHER_INT8", flag and int8)
+        with jax.set_mesh(mesh):
+            outs.append(np.asarray(layer(x, jnp.asarray(w), jnp.asarray(ids))))
+    scale = np.abs(outs[0]).max()
+    tol = 2e-2 * scale if int8 else 1e-5
+    np.testing.assert_allclose(outs[1], outs[0], rtol=0, atol=tol)
