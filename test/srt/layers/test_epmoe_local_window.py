@@ -196,6 +196,10 @@ def test_replicas_match_single_expert_group(monkeypatch, m, window, int8):
                 dtype=jnp.float32,
             )
             assert layer.experts_per_device == 8 // ep
+            # The weight loader places experts on epmoe_mesh(); it must be the layer's mesh.
+            loader_mesh = moe.epmoe_mesh(mesh, ep)
+            assert loader_mesh.axis_names == layer.moe_mesh.axis_names
+            assert (loader_mesh.devices == layer.moe_mesh.devices).all()
             if m % 8 == 0:
                 x = jax.device_put(jnp.asarray(x_host, jnp.float32), dp)
                 wd = jax.device_put(jnp.asarray(w), dp)

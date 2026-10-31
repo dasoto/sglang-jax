@@ -73,6 +73,24 @@ MOE_GATHER_INT8 = os.environ.get("SGLANG_JAX_MOE_GATHER_INT8", "0") == "1"
 MOE_REPLICAS = int(os.environ.get("SGLANG_JAX_MOE_REPLICAS", "1"))
 
 
+def epmoe_mesh(mesh: Mesh, ep_size: int) -> Mesh:
+    """Expert mesh EPMoE runs on over ``mesh``'s devices; the weight loader uses the
+    same one so loaded experts land on the layer's mesh. With SGLANG_JAX_MOE_REPLICAS
+    the r-th contiguous block of devices is replica r."""
+    devices = mesh.devices.flatten()
+    if MOE_REPLICAS > 1:
+        return jax.sharding.Mesh(
+            devices.reshape(MOE_REPLICAS, ep_size, -1),
+            axis_names=("replica", "expert", "tensor"),
+            axis_types=(jax.sharding.AxisType.Explicit,) * 3,
+        )
+    return jax.sharding.Mesh(
+        devices.reshape(ep_size, -1),
+        axis_names=("expert", "tensor"),
+        axis_types=(jax.sharding.AxisType.Explicit,) * 2,
+    )
+
+
 class EPMoE(nnx.Module):
     def __init__(
         self,
@@ -181,27 +199,16 @@ class EPMoE(nnx.Module):
                 )
             self.experts_per_device = self.num_experts // self.ep_size
 
-            devices = self.mesh.devices.flatten()
+            # Weights are sharded over "expert" only, so every replica holds them all.
+            self.moe_mesh = epmoe_mesh(self.mesh, self.ep_size)
             abstract_mesh = self.mesh.abstract_mesh
             if replicas > 1:
-                # Weights are sharded over "expert" only, so every replica holds them all.
-                axis_types = (jax.sharding.AxisType.Explicit,) * 3
-                self.moe_mesh = jax.sharding.Mesh(
-                    devices.reshape(replicas, self.ep_size, 1),
-                    axis_names=("replica", "expert", "tensor"),
-                    axis_types=axis_types,
-                )
                 self.updated_mesh = abstract_mesh.update(
                     axis_sizes=(replicas, self.ep_size, 1),
                     axis_names=("replica", "expert", "tensor"),
-                    axis_types=axis_types,
+                    axis_types=(jax.sharding.AxisType.Explicit,) * 3,
                 )
             else:
-                self.moe_mesh = jax.sharding.Mesh(
-                    devices.reshape(self.ep_size, self.tp_size),
-                    axis_names=("expert", "tensor"),
-                    axis_types=(jax.sharding.AxisType.Explicit, jax.sharding.AxisType.Explicit),
-                )
                 self.updated_mesh = abstract_mesh.update(
                     axis_sizes=(self.ep_size, self.tp_size), axis_names=("expert", "tensor")
                 )

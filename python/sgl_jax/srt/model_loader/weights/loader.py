@@ -132,16 +132,14 @@ class WeightLoader:
             any(axis == "expert" or isinstance(axis, tuple) and "expert" in axis for axis in axes)
             and "expert" not in mesh.axis_names
         ):
+            from sgl_jax.srt.layers.moe import epmoe_mesh
+
             ep = getattr(
                 getattr(self.model_config, "hf_config", None),
                 "ep_size",
                 getattr(self.model_config, "ep_size", 1),
             )
-            mesh = Mesh(
-                mesh.devices.reshape(ep, -1),
-                ("expert", "tensor"),
-                axis_types=(jax.sharding.AxisType.Explicit,) * 2,
-            )
+            mesh = epmoe_mesh(mesh, ep)
         return jax.sharding.NamedSharding(mesh, P(*axes))
 
     def _expand(self, mappings):
@@ -485,16 +483,14 @@ class WeightLoader:
                 )
                 and "expert" not in mesh.axis_names
             ):
+                from sgl_jax.srt.layers.moe import epmoe_mesh
+
                 ep = getattr(
                     getattr(self.model_config, "hf_config", None),
                     "ep_size",
                     getattr(self.model_config, "ep_size", 1),
                 )
-                mesh = Mesh(
-                    mesh.devices.reshape(ep, -1),
-                    ("expert", "tensor"),
-                    axis_types=(jax.sharding.AxisType.Explicit,) * 2,
-                )
+                mesh = epmoe_mesh(mesh, ep)
             self._assign(
                 leaf,
                 self._dummy_array(value.shape, value.dtype, jax.sharding.NamedSharding(mesh, spec)),
