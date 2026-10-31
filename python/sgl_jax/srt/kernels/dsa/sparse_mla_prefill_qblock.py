@@ -468,6 +468,8 @@ def prefill_write_and_attend_ragged_qblock(
     query_block: int = 256,
     interpret: bool = False,
     return_lse: bool = False,
+    q_sparse=None,
+    skip_write: bool = False,
 ):
     """Packed-ragged self-write + **blocked** sparse-MLA prefill.
 
@@ -475,35 +477,41 @@ def prefill_write_and_attend_ragged_qblock(
     :func:`sparse_mla_prefill.prefill_write_and_attend_ragged` (same signature
     plus ``query_block``); only the attend execution shape differs.
     ``return_lse`` appends the ``[T, H]`` log-sum-exp (see
-    :func:`sparse_mla_attention_qblock`).
+    :func:`sparse_mla_attention_qblock`). ``q_sparse`` passes the query already
+    concatenated as ``[T, H, kv_lora_rank + rope]`` (``ql``/``qpe`` unused), and
+    ``skip_write`` skips the self-write for callers that wrote the rows already.
     """
-    T, H, Dv = ql.shape
-    rope = qpe.shape[-1]
+    if q_sparse is None:
+        q_sparse = jnp.concatenate([ql, qpe], axis=-1)  # [T, H, Dv+rope]
+    T, H, _ = q_sparse.shape
+    Dv = kv_lora_rank
     ps = page_size
     Pn, pspk, pk, Dk_pad = cache.shape
     S = seq_lens.shape[0]
 
-    q_sparse = jnp.concatenate([ql, qpe], axis=-1)  # [T, H, Dv+rope]
-
-    # self-write: per-token scatter to out_cache_loc (identical to the
-    # per-query wrapper; mode="drop"+wrap_negative_indices=False drops -1 pads).
-    row = jnp.zeros((T, Dk_pad), cache.dtype)
-    row = row.at[:, :Dv].set(kvc.astype(cache.dtype))
-    row = row.at[:, Dv : Dv + rope].set(kpe.reshape(T, rope).astype(cache.dtype))
-    # Scatter directly into the 4D cache. The flat-view round-trip
-    # (reshape [Pn*ps, D] -> scatter -> reshape back) materialises TWO full
-    # relayout copies of the cache per call (the 4D pool and the 2D view get
-    # different tilings) — measured 13.8% of 110k prefill device time. 3D
-    # index math on ``loc`` is free; padded loc == -1 stays dropped (negative
-    # page index with wrap_negative_indices=False).
-    cache_new = paged_write_back(
-        cache,
-        row,
-        loc.astype(jnp.int32),
-        page_size=ps,
-        r_cap=T // ps + S + 34,
-        interpret=interpret,
-    )
+    if skip_write:
+        cache_new = cache
+    else:
+        rope = kpe.shape[-1]
+        # self-write: per-token scatter to out_cache_loc (identical to the
+        # per-query wrapper; mode="drop"+wrap_negative_indices=False drops -1 pads).
+        row = jnp.zeros((T, Dk_pad), cache.dtype)
+        row = row.at[:, :Dv].set(kvc.astype(cache.dtype))
+        row = row.at[:, Dv : Dv + rope].set(kpe.reshape(T, rope).astype(cache.dtype))
+        # Scatter directly into the 4D cache. The flat-view round-trip
+        # (reshape [Pn*ps, D] -> scatter -> reshape back) materialises TWO full
+        # relayout copies of the cache per call (the 4D pool and the 2D view get
+        # different tilings) — measured 13.8% of 110k prefill device time. 3D
+        # index math on ``loc`` is free; padded loc == -1 stays dropped (negative
+        # page index with wrap_negative_indices=False).
+        cache_new = paged_write_back(
+            cache,
+            row,
+            loc.astype(jnp.int32),
+            page_size=ps,
+            r_cap=T // ps + S + 34,
+            interpret=interpret,
+        )
 
     # token -> request id (same convention as the per-query ragged wrapper)
     t = jnp.arange(T, dtype=jnp.int32)

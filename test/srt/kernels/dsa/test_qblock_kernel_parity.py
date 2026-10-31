@@ -285,9 +285,7 @@ def _ragged_case(seq_lens_list, K, seed=0):
         loc=jnp.asarray(loc),
         seq_lens=jnp.asarray(seq_lens_list, jnp.int32),
         cu_q_lens=jnp.asarray(np.arange(num_seqs + 1) * S_pad, jnp.int32),
-        cu_kv_lens=jnp.asarray(
-            np.arange(num_seqs + 1) * pages_per_seq * _PS, jnp.int32
-        ),
+        cu_kv_lens=jnp.asarray(np.arange(num_seqs + 1) * pages_per_seq * _PS, jnp.int32),
         page_indices=jnp.asarray(phys.reshape(-1)),
         real=real,
     )
@@ -330,11 +328,38 @@ def test_ragged_qblock_vs_deployed(seq_lens_list, qb):
     assert d_o < 2e-3, f"ragged qblock vs deployed ragged drifted: {d_o}"
 
 
+def test_ragged_qblock_preconcatenated_query_and_skip_write():
+    """q_sparse (query concatenated by the caller) + skip_write on a cache the caller
+    already wrote match the default path (DCP prefill uses this form)."""
+    c = _ragged_case([200, 129], K=4, seed=17)
+    kw = dict(kv_lora_rank=_KV_LORA, page_size=_PS, sm_scale=_SC, interpret=True, query_block=16)
+    args = (
+        c["ql"],
+        c["qpe"],
+        c["kvc"],
+        c["kpe"],
+        c["cache"],
+        c["topk_pages"],
+        c["positions"],
+        c["loc"],
+        c["seq_lens"],
+        c["cu_q_lens"],
+        c["cu_kv_lens"],
+        c["page_indices"],
+    )
+    o_ref, cache_ref = prefill_write_and_attend_ragged_qblock(*args, **kw)
+    q = jnp.concatenate([c["ql"], c["qpe"]], axis=-1)
+    o_pre, cache_pre = prefill_write_and_attend_ragged_qblock(
+        None, None, c["kvc"], c["kpe"], cache_ref, *args[5:], q_sparse=q, skip_write=True, **kw
+    )
+    real = c["real"]
+    assert cache_pre is cache_ref
+    np.testing.assert_array_equal(np.asarray(o_pre)[real], np.asarray(o_ref)[real])
+
+
 # ── TSA (token-sharded attention): sharded slices vs one full-chunk call ────
 
-prefill_write_and_attend_ragged_qblock_tsa = (
-    qb_mod.prefill_write_and_attend_ragged_qblock_tsa
-)
+prefill_write_and_attend_ragged_qblock_tsa = qb_mod.prefill_write_and_attend_ragged_qblock_tsa
 
 
 @pytest.mark.parametrize(
@@ -394,9 +419,7 @@ def test_tsa_sharded_vs_full(seq_lens_list, shards, qb):
     o_tsa = np.concatenate(outs, 0)
     real = c["real"]
     d_o = np.abs(o_tsa[real] - np.asarray(o_full)[real]).max()
-    print(
-        f"[tsa shards={shards} qb={qb}] |o_tsa-o_full|={d_o:.3e} |cache diff|={d_c:.3e}"
-    )
+    print(f"[tsa shards={shards} qb={qb}] |o_tsa-o_full|={d_o:.3e} |cache diff|={d_c:.3e}")
     assert d_c == 0.0, "every shard must self-write the identical full-chunk cache"
     assert d_o < 2e-3, f"TSA sharded attend drifted from full-chunk qblock: {d_o}"
 
@@ -453,9 +476,7 @@ def test_umax_reduced_warns_once(caplog):
 
     caplog.clear()
     with caplog.at_level("WARNING", logger=qb_mod.__name__):
-        sparse_mla_attention_qblock(
-            c["q"], c["kv"], c["indices"], c["positions"], **common
-        )
+        sparse_mla_attention_qblock(c["q"], c["kv"], c["indices"], c["positions"], **common)
     assert not [
         r for r in caplog.records if "u_max" in r.getMessage()
     ], "default u_max must not warn"
