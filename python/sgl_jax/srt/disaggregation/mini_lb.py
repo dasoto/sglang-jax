@@ -550,13 +550,19 @@ try:
             lb._d_decoding_reqs.clear()
             lb._d_active_chars.clear()
             lb._d_total_reqs.clear()
+        # A backend refuses while it still holds requests; pass that on so callers retry.
+        failures = []
         async with aiohttp.ClientSession() as session:
             tasks = []
             for server in chain(lb.prefill_urls, lb.decode_urls):
                 tasks.append(session.post(f"{server}/flush_cache"))
             for response in asyncio.as_completed(tasks):
-                await response
-        return Response(status_code=200)
+                resp = await response
+                if resp.status != 200:
+                    failures.append(f"{resp.url}: HTTP {resp.status} {(await resp.text())[:300]}")
+        if failures:
+            return Response(content="\n".join(failures), status_code=HTTPStatus.BAD_REQUEST)
+        return Response(content="Cache flushed on every prefill and decode server.\n", status_code=200)
 
     @app.get("/server_info")
     @app.get("/get_server_info")
