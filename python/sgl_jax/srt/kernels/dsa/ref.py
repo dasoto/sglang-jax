@@ -30,6 +30,8 @@ def build_index_share_map(
     """
     if indexer_types is None:
         indexer_types = ["full"] * num_layers
+    if len(indexer_types) > num_layers:  # --model-layer-nums keeps the first layers
+        indexer_types = list(indexer_types)[:num_layers]
     assert len(indexer_types) == num_layers
 
     full_slot: dict[int, int] = {}
