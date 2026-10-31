@@ -117,17 +117,19 @@ def build_block_unit_tables(
 
 
 def _qblock_kernel(
-    q_ref,  # [1, 1, QBHp, Dk_pad] VMEM  (q*H+h rows; zero-padded)
-    units_ref,  # [1, 1, 1, U_pad]  SMEM  block union unit ids (-1 pad)
-    cnt_ref,  # [1, 1, 1, 1]        SMEM  block union size (loop bound)
-    qpos_ref,  # [1, 1, 1, QBHp]    VMEM  per-row query position (-1 on pad rows)
-    kvlen_ref,  # [1, 1, 1, QBHp]   VMEM  per-row kv length bound
-    base_ref,  # [1, 1, 1, QBHp]    VMEM  per-row page-table base, in TOKENS
-    mem_ref,  # [1, 1, U_pad, QBHp] VMEM  int8 membership by union slot
-    kv_hbm,  # flat: [B, T(+RBF), Dk_pad]; paged: 4D pool or [1, Pn*PS, Dk_pad] HBM
-    pt_ref,  # [1, 1, 1, PTW]      SMEM  packed page table (paged only)
-    o_ref,  # [1, 1, QBHp, Dv]
-    *rest,  # [lse_ref [1, 1, 1, QBHp] when return_lse], kv_scratch, sem
+    q_ref,  # [1, 1, QBHp, Dk_pad] VMEM  (q*H+h rows; zero-padded); [.., Dv] if split_q
+    *refs,
+    # [qr_ref [1, 1, QBHp, Dk_pad - Dv] VMEM rope query when split_q]
+    # units_ref [1, 1, 1, U_pad]  SMEM  block union unit ids (-1 pad)
+    # cnt_ref   [1, 1, 1, 1]      SMEM  block union size (loop bound)
+    # qpos_ref  [1, 1, 1, QBHp]   VMEM  per-row query position (-1 on pad rows)
+    # kvlen_ref [1, 1, 1, QBHp]   VMEM  per-row kv length bound
+    # base_ref  [1, 1, 1, QBHp]   VMEM  per-row page-table base, in TOKENS
+    # mem_ref   [1, 1, U_pad, QBHp] VMEM int8 membership by union slot
+    # kv_hbm    flat: [B, T(+RBF), Dk_pad]; paged: 4D pool or [1, Pn*PS, Dk_pad] HBM
+    # pt_ref    [1, 1, 1, PTW]    SMEM  packed page table (paged only)
+    # o_ref     [1, 1, QBHp, Dv]
+    # [lse_ref  [1, 1, 1, QBHp] when return_lse], kv_scratch, sem
     sm_scale: float,
     Dv: int,
     RB: int,
@@ -136,7 +138,11 @@ def _qblock_kernel(
     PS: int,  # page size (paged only; == RB in v1 paged mode)
     PTW: int,
     return_lse: bool = False,
+    split_q: bool = False,
 ):
+    qr_ref, refs = (refs[0], refs[1:]) if split_q else (None, refs)
+    (units_ref, cnt_ref, qpos_ref, kvlen_ref, base_ref, mem_ref, kv_hbm, pt_ref, o_ref) = refs[:9]
+    rest = refs[9:]
     lse_ref, kv_scratch, sem = rest if return_lse else (None, *rest)
     if kv_hbm.ndim == 4:
         # Paged pool passed in its native word-packed shape. Flattening the
@@ -158,7 +164,8 @@ def _qblock_kernel(
     """
     b = pl.program_id(0)
     QBHp = q_ref.shape[2]
-    q = q_ref[0, 0]  # [QBHp, Dk_pad]
+    q = q_ref[0, 0]  # [QBHp, Dk_pad], or [QBHp, Dv] latent part when split_q
+    qr = qr_ref[0, 0] if split_q else None  # [QBHp, Dk_pad - Dv] rope part
     cnt = cnt_ref[0, 0, 0, 0]
     qpos_row = qpos_ref[0, 0]  # [1, QBHp] int32
     kvlen_row = kvlen_ref[0, 0]  # [1, QBHp] int32
@@ -223,13 +230,14 @@ def _qblock_kernel(
         kv_blk = kv_scratch[slot]  # [RBF, Dk_pad]
 
         # score: [RBF,Dk]·[QBHp,Dk] -> [RBF, QBHp] (keys sublane, queries lane)
-        s = (
-            jax.lax.dot_general(
-                kv_blk, q, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
-            )
-            * sm_scale
-        )
-        s = s + bias
+        nt = (((1,), (1,)), ((), ()))
+        if split_q:
+            s = jax.lax.dot_general(
+                kv_blk[:, :Dv], q, nt, preferred_element_type=jnp.float32
+            ) + jax.lax.dot_general(kv_blk[:, Dv:], qr, nt, preferred_element_type=jnp.float32)
+        else:
+            s = jax.lax.dot_general(kv_blk, q, nt, preferred_element_type=jnp.float32)
+        s = s * sm_scale + bias
 
         # flash-softmax over keys = axis 0 (the sublane axis)
         m_cur = jnp.max(s, axis=0)  # [QBHp]
@@ -277,6 +285,7 @@ def sparse_mla_attention_qblock(
     page_indices=None,  # [total_pages] int32 packed physical page ids
     return_lse: bool = False,
     out_dtype=jnp.float32,
+    q_rope=None,  # [B, S, H, rope]: q is then only the [B, S, H, kv_lora_rank] latent part
 ):
     """Blocked sparse MLA-latent attention (query-batching kernel).
 
@@ -304,8 +313,19 @@ def sparse_mla_attention_qblock(
     ``return_lse`` also returns the per-(query, head) log-sum-exp of the scaled
     scores, ``[B, S, H]`` fp32 (-inf where no key is attended), so partial
     results over disjoint key sets can be merged.
+
+    ``q_rope`` passes the query in two parts: ``q`` is then the latent part
+    ``[B, S, H, kv_lora_rank]`` and ``q_rope`` the rope part. The kernel scores
+    each part against its slice of the cache row, so the caller never builds
+    (and the wrapper never pads) a concatenated ``[.., kv_lora_rank + rope]``
+    query; only the small rope part is padded to the cache row's tail width.
     """
     B, S, H, Dk = q.shape
+    split_q = q_rope is not None
+    if split_q:
+        if Dk != kv_lora_rank or Dk % 128 != 0:
+            raise ValueError(f"split query: latent width {Dk} must be kv_lora_rank % 128")
+        Dk = Dk + q_rope.shape[-1]
     K = indices.shape[2]
     Dv = kv_lora_rank
     RB = read_block
@@ -384,9 +404,17 @@ def sparse_mla_attention_qblock(
 
     # q -> [B, nQB, QBHp, Dk_pad] (row = q*H + h), zero pad rows/features
     Sp = nQB * QB
-    q4 = jnp.pad(q, ((0, 0), (0, Sp - S), (0, 0), (0, Dk_pad - Dk)))
-    q4 = q4.reshape(B, nQB, QBH, Dk_pad)
-    q4 = jnp.pad(q4, ((0, 0), (0, 0), (0, QBHp - QBH), (0, 0)))
+
+    def _q_blocks(x, width):
+        x = jnp.pad(x, ((0, 0), (0, Sp - S), (0, 0), (0, width - x.shape[-1])))
+        x = x.reshape(B, nQB, QBH, width)
+        return jnp.pad(x, ((0, 0), (0, 0), (0, QBHp - QBH), (0, 0)))
+
+    if split_q:
+        q4 = _q_blocks(q, Dv)  # no feature pad: a free reshape when S and QBH are aligned
+        qr4 = _q_blocks(q_rope, Dk_pad - Dv)
+    else:
+        q4 = _q_blocks(q, Dk_pad)
 
     def _rows(vec, fill):
         # [B, S] -> [B, nQB, 1, QBHp] with H-expansion and `fill` on pad rows
@@ -410,6 +438,7 @@ def sparse_mla_attention_qblock(
         PS=ps,
         PTW=PTW,
         return_lse=return_lse,
+        split_q=split_q,
     )
     smem = pltpu.SMEM
     row_spec = pl.BlockSpec((1, 1, 1, QBHp), lambda b, n: (b, n, 0, 0))
@@ -418,11 +447,16 @@ def sparse_mla_attention_qblock(
     if return_lse:
         out_specs = [out_specs, row_spec]
         out_shape = [out_shape, jax.ShapeDtypeStruct((B, nQB, 1, QBHp), jnp.float32)]
+    q_specs = [pl.BlockSpec((1, 1, QBHp, q4.shape[-1]), lambda b, n: (b, n, 0, 0))]  # q
+    q_args = [q4]
+    if split_q:
+        q_specs.append(pl.BlockSpec((1, 1, QBHp, Dk_pad - Dv), lambda b, n: (b, n, 0, 0)))
+        q_args.append(qr4)
     out = pl.pallas_call(
         kernel,
         grid=(B, nQB),
         in_specs=[
-            pl.BlockSpec((1, 1, QBHp, Dk_pad), lambda b, n: (b, n, 0, 0)),  # q
+            *q_specs,
             pl.BlockSpec((1, 1, 1, U_pad), lambda b, n: (b, n, 0, 0), memory_space=smem),
             pl.BlockSpec((1, 1, 1, 1), lambda b, n: (b, n, 0, 0), memory_space=smem),
             row_spec,  # qpos rows
@@ -439,7 +473,7 @@ def sparse_mla_attention_qblock(
             pltpu.SemaphoreType.DMA((_NBUF,)),
         ],
         interpret=interpret,
-    )(q4, units4, counts4, pos_rows, kvlen_rows, base_rows, memt, kv2, pt_arg)
+    )(*q_args, units4, counts4, pos_rows, kvlen_rows, base_rows, memt, kv2, pt_arg)
 
     if return_lse:
         out, lse = out
@@ -473,6 +507,7 @@ def prefill_write_and_attend_ragged_qblock(
     q_sparse=None,
     skip_write: bool = False,
     out_dtype=jnp.float32,
+    split_query: bool = False,
 ):
     """Packed-ragged self-write + **blocked** sparse-MLA prefill.
 
@@ -485,8 +520,13 @@ def prefill_write_and_attend_ragged_qblock(
     may carry zero features up to the cache's padded width, which skips the
     kernel's query pad copy), ``skip_write`` skips the self-write for callers that
     wrote the rows already, and ``out_dtype`` is the attention output dtype.
+    ``split_query`` hands ``ql`` and ``qpe`` to the kernel as two parts instead of
+    concatenating them (no [T, H, Dv+rope] query copy).
     """
-    if q_sparse is None:
+    q_rope = None
+    if split_query:
+        q_sparse, q_rope = ql, qpe
+    elif q_sparse is None:
         q_sparse = jnp.concatenate([ql, qpe], axis=-1)  # [T, H, Dv+rope]
     T, H, _ = q_sparse.shape
     Dv = kv_lora_rank
@@ -541,6 +581,7 @@ def prefill_write_and_attend_ragged_qblock(
         interpret=interpret,
         return_lse=return_lse,
         out_dtype=out_dtype,
+        q_rope=None if q_rope is None else q_rope.reshape(1, T, H, q_rope.shape[2]),
     )
     if return_lse:
         out, lse = out

@@ -405,6 +405,28 @@ def test_ragged_qblock_padded_query_and_out_dtype():
     np.testing.assert_array_equal(np.asarray(lse_bf)[real], np.asarray(lse_ref)[real])
 
 
+@pytest.mark.parametrize("qb", [16, 48])
+def test_ragged_qblock_split_query(qb):
+    """split_query (latent and rope query as two kernel inputs, no concatenated
+    query) matches the concatenated path, including blocks straddling requests."""
+    c = _ragged_case([200, 512, 1, 129], K=4, seed=23)
+    kw = dict(kv_lora_rank=_KV_LORA, page_size=_PS, sm_scale=_SC, interpret=True, query_block=qb)
+    args = (c["ql"], c["qpe"], c["kvc"], c["kpe"], c["cache"], c["topk_pages"], c["positions"])
+    args += (c["loc"], c["seq_lens"], c["cu_q_lens"], c["cu_kv_lens"], c["page_indices"])
+    o_ref, cache_ref, lse_ref = prefill_write_and_attend_ragged_qblock(*args, return_lse=True, **kw)
+    o_split, cache_split, lse_split = prefill_write_and_attend_ragged_qblock(
+        *args, return_lse=True, split_query=True, **kw
+    )
+    real = c["real"]
+    np.testing.assert_array_equal(np.asarray(cache_split), np.asarray(cache_ref))
+    np.testing.assert_allclose(
+        np.asarray(o_split)[real], np.asarray(o_ref)[real], rtol=1e-5, atol=1e-6
+    )
+    np.testing.assert_allclose(
+        np.asarray(lse_split)[real], np.asarray(lse_ref)[real], rtol=1e-5, atol=1e-5
+    )
+
+
 # ── TSA (token-sharded attention): sharded slices vs one full-chunk call ────
 
 prefill_write_and_attend_ragged_qblock_tsa = qb_mod.prefill_write_and_attend_ragged_qblock_tsa
