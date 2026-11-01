@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import random
@@ -81,6 +82,12 @@ def _list_prefills_with_retry(client, attempts: int | None = None, delay_s: floa
             )
             time.sleep(delay_s * (1.0 + random.random()))
     raise AssertionError("unreachable")
+
+
+@functools.partial(jax.jit, static_argnums=(2,))
+def _layer_chunk(kv: jax.Array, start: jax.Array, size: int) -> jax.Array:
+    """``kv[start:start + size]`` along the layer axis, ``start`` traced."""
+    return jax.lax.dynamic_slice_in_dim(kv, start, size, axis=0)
 
 
 def _prefill_wire_enabled() -> bool:
@@ -1139,7 +1146,9 @@ class SchedulerDisaggregationDecodeMixin:
             n_layers = len(target_buffers)
             for start in range(0, n_layers, _MLA_KV_CHUNK_LAYERS):
                 end = min(n_layers, start + _MLA_KV_CHUNK_LAYERS)
-                chunk = kv[start:end]
+                # One slice program per (bucket, chunk size); a static kv[start:end]
+                # compiled one per chunk offset.
+                chunk = _layer_chunk(kv, start, end - start)
                 if wire_to is not None:
                     chunk = jax.device_put(chunk, wire_to)
                 target_buffers[start:end] = write_all_mla_kv_layers(

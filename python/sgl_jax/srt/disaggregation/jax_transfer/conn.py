@@ -594,11 +594,8 @@ class JaxTransferKVReceiver(KVReceiver, StateHolder):
     def commit(self, install: Callable[[object], None]) -> None:
         if self.state != KVPoll.SUCCESS or self._results is None:
             raise RuntimeError("cannot commit an incomplete JAX transfer")
-        install(
-            self._results["kv"]
-            if tuple(self._results.keys()) == ("kv",)
-            else self._results
-        )
+        results, self._results = self._results, None  # the pool owns the KV once installed
+        install(results["kv"] if tuple(results.keys()) == ("kv",) else results)
 
     def abort(self) -> None:
         self.fail(reason="abort")
