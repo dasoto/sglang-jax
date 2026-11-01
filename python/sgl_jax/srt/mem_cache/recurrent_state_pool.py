@@ -73,6 +73,50 @@ def recurrent_state_dtype() -> RecurrentStateDType:
     )
 
 
+# SGLANG_JAX_RECURRENT_COW_COMPACT=1: copy_slots touches only the rows that clone a slot (src != 0),
+# in blocks of _COW_BLOCK rows inside a loop that runs zero times on steps without a clone. The full
+# form gathers and scatters every padded batch row's state on every extend step (about 6 ms per step
+# for Kimi-K3's 69 KDA layers on v6e-128), although a step rarely admits more than one cache hit.
+# Read when the forward is traced.
+_COW_BLOCK = 8
+
+
+def _cow_compact_enabled() -> bool:
+    return os.environ.get("SGLANG_JAX_RECURRENT_COW_COMPACT", "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+def _compact_clone(buf, src, dst):
+    """``buf`` with slot ``dst[i]`` set to slot ``src[i]`` wherever ``src[i] != 0``.
+
+    Clone rows go first (stable order), then blocks of _COW_BLOCK rows are copied; the trip
+    count is the number of blocks holding a clone row. Block entries past the clone rows read
+    and write the per-rank dummy slot 0 (its own value). Sources are tree slots and
+    destinations running slots, so a block never reads a slot an earlier block wrote.
+    """
+    need = src != 0
+    order = jnp.argsort(jnp.logical_not(need).astype(jnp.int32), stable=True)
+    pad = (-order.shape[0]) % _COW_BLOCK
+    if pad:
+        order = jnp.concatenate([order, jnp.zeros((pad,), order.dtype)])
+    n = jnp.sum(need.astype(jnp.int32))
+    trailing = (1,) * (buf.ndim - 1)
+
+    def body(i, b):
+        sel = jax.lax.dynamic_slice_in_dim(order, i * _COW_BLOCK, _COW_BLOCK)
+        ok = i * _COW_BLOCK + jnp.arange(_COW_BLOCK) < n
+        s = jnp.where(ok, src[sel], 0)
+        d = jnp.where(ok, dst[sel], 0)
+        val = jnp.where((s == 0).reshape((-1,) + trailing), b[d], b[s])
+        return jax.lax.optimization_barrier(b.at[d].set(val))
+
+    return jax.lax.fori_loop(0, (n + _COW_BLOCK - 1) // _COW_BLOCK, body, buf)
+
+
 @register_pytree_node_class
 class RecurrentStatePool:
 
@@ -248,15 +292,21 @@ class RecurrentStatePool:
         mesh = self.mesh
         data_axis = self.data_partition_axis
 
+        compact = _cow_compact_enabled()
+
         def _temporal(buf, src, dst):
             # Donated-buffer aliasing barriers: without them the scatter races the
             # gather under multi-host SPMD -> NaN. Value-preserving; do not remove.
             buf = jax.lax.optimization_barrier(buf)
+            if compact:
+                return jax.lax.optimization_barrier(_compact_clone(buf, src, dst))
             val = jnp.where((src == 0).reshape(-1, 1, 1, 1), buf[dst], buf[src])
             return jax.lax.optimization_barrier(buf.at[dst].set(val))
 
         def _conv(buf, src, dst):
             buf = jax.lax.optimization_barrier(buf)  # see _temporal
+            if compact:
+                return jax.lax.optimization_barrier(_compact_clone(buf, src, dst))
             val = jnp.where((src == 0).reshape(-1, 1, 1), buf[dst], buf[src])
             return jax.lax.optimization_barrier(buf.at[dst].set(val))
 

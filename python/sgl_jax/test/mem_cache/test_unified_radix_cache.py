@@ -1669,6 +1669,72 @@ class TestUnifiedRadixCacheRecurrent(CustomTestCase):
         self.assertEqual(float(rec[3].reshape(-1)[0]), 2.0)
         self.assertEqual(float(rec[8].reshape(-1)[0]), 7.0)
 
+    def test_copy_slots_compact_matches_full(self):
+        """SGLANG_JAX_RECURRENT_COW_COMPACT=1 clones exactly what the full form clones.
+
+        Per DP rank: 12 rows with distinct running (dst) slots, of which 0, 1, 8 (one block),
+        11 or all 12 clone from distinct tree slots; one and two DP ranks.
+        """
+        rows, size = 12, 64
+        for dp in (1, 2):
+            m = (
+                mesh
+                if dp == 1
+                else create_device_mesh(ici_parallelism=[2, -1], dcn_parallelism=[1, 1])
+            )
+            with jax.sharding.set_mesh(m):
+                pool = RecurrentStatePool(
+                    linear_recurrent_layer_ids=[0, 1],
+                    size=size,
+                    num_heads=8,
+                    head_dim=16,
+                    conv_kernel_size=self.conv_kernel_size,
+                    mesh=m,
+                    dp_size=dp,
+                )
+                rng = np.random.default_rng(dp)
+                for layer in range(pool.num_linear_recurrent_layers):
+                    rec = pool.recurrent_buffers[layer]
+                    pool.recurrent_buffers[layer] = jax.device_put(
+                        rng.standard_normal(rec.shape).astype(np.asarray(rec).dtype),
+                        pool.recurrent_sharding,
+                    )
+                    conv = pool.conv_buffers[layer][0]
+                    pool.conv_buffers[layer][0] = jax.device_put(
+                        rng.standard_normal(conv.shape).astype(np.asarray(conv).dtype),
+                        pool.conv_sharding,
+                    )
+                data_sh = jax.sharding.NamedSharding(m, jax.sharding.PartitionSpec("data"))
+                for n_clone in (0, 1, 8, 11, 12):
+                    src = np.zeros((dp, rows), np.int32)
+                    dst = np.zeros((dp, rows), np.int32)
+                    for r in range(dp):
+                        perm = rng.permutation(np.arange(1, size // dp + 1, dtype=np.int32))
+                        dst[r] = perm[:rows]
+                        src[r, rng.choice(rows, n_clone, replace=False)] = perm[
+                            rows : rows + n_clone
+                        ]
+                    s_idx = jax.device_put(src.reshape(-1), data_sh)
+                    d_idx = jax.device_put(dst.reshape(-1), data_sh)
+                    out = {}
+                    for flag in ("0", "1"):
+                        os.environ["SGLANG_JAX_RECURRENT_COW_COMPACT"] = flag
+                        try:
+                            rec, conv = jax.jit(lambda a, b, p=pool: p.copy_slots(a, b))(
+                                s_idx, d_idx
+                            )
+                        finally:
+                            os.environ.pop("SGLANG_JAX_RECURRENT_COW_COMPACT", None)
+                        out[flag] = [np.asarray(x) for x in rec] + [np.asarray(c[0]) for c in conv]
+                    for full, compact in zip(out["0"], out["1"]):
+                        np.testing.assert_array_equal(compact, full, err_msg=f"dp={dp} n={n_clone}")
+                    if n_clone:  # the clones happened at all
+                        r0 = int(np.nonzero(src[0])[0][0])
+                        np.testing.assert_array_equal(
+                            out["1"][0][dst[0, r0]],
+                            np.asarray(pool.recurrent_buffers[0])[src[0, r0]],
+                        )
+
 
 class _ExtraBufferReq:
     """Req surrogate carrying the extra-buffer ping-pong fields, enough to drive
