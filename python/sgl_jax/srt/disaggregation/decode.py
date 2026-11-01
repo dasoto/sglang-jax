@@ -26,11 +26,9 @@ from sgl_jax.srt.disaggregation.base.transfer import (
 )
 from sgl_jax.srt.disaggregation.bootstrap import BootstrapClient, PrefillInfoCache
 from sgl_jax.srt.disaggregation.common.capacity import per_rank_inflight_limit
+from sgl_jax.srt.disaggregation.common.memlog import maybe_log_device_memory
 from sgl_jax.srt.managers.schedule_batch import ScheduleBatch, get_disagg_transport_id
-from sgl_jax.srt.mem_cache.memory_pool import (
-    write_all_mla_kv_layers,
-    write_kv_layer,
-)
+from sgl_jax.srt.mem_cache.memory_pool import write_all_mla_kv_layers, write_kv_layer
 from sgl_jax.srt.model_executor.forward_batch_info import ForwardMode
 
 if TYPE_CHECKING:
@@ -252,6 +250,7 @@ class SchedulerDisaggregationDecodeMixin:
         wd = self.disagg_decode_watchdog
         wd.start()
         while True:
+            maybe_log_device_memory("decode")
             wd.beat("recv_requests")
             recv_reqs = (
                 self._comm_backend.recv_requests()
@@ -357,6 +356,7 @@ class SchedulerDisaggregationDecodeMixin:
         wd.start()
 
         while True:
+            maybe_log_device_memory("decode")
             wd.beat("recv_requests")
             recv_reqs = (
                 self._comm_backend.recv_requests()

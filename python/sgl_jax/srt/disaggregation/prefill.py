@@ -20,6 +20,7 @@ from sgl_jax.srt.disaggregation.base.transfer import (
     PrefillTransferContext,
     TransferBackend,
 )
+from sgl_jax.srt.disaggregation.common.memlog import maybe_log_device_memory
 from sgl_jax.srt.managers.schedule_batch import get_disagg_transport_id
 
 if TYPE_CHECKING:
@@ -683,6 +684,7 @@ class SchedulerDisaggregationPrefillMixin:
         self._disagg_prefill_compute = {}
         self._disagg_prefill_deferred_releases = {}
         while True:
+            maybe_log_device_memory("prefill")
             recv_reqs = (
                 self._comm_backend.recv_requests()
                 if self._comm_backend is not None
@@ -732,6 +734,7 @@ class SchedulerDisaggregationPrefillMixin:
         """Prefill-only event loop."""
 
         while True:
+            maybe_log_device_memory("prefill")
             recv_reqs = (
                 self._comm_backend.recv_requests()
                 if self._comm_backend is not None
@@ -976,7 +979,9 @@ class SchedulerDisaggregationPrefillMixin:
         """
         if not getattr(self, "_pd_sync_prefill_this_tick", False):
             return []
-        from sgl_jax.srt.disaggregation.common.multihost_sync import synced_terminal_rooms
+        from sgl_jax.srt.disaggregation.common.multihost_sync import (
+            synced_terminal_rooms,
+        )
 
         queue = self.disagg_prefill_queue
         with queue._lock:
