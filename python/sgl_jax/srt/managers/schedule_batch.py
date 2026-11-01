@@ -47,6 +47,7 @@ from sgl_jax.srt.mem_cache.common import (
     alloc_token_slots,
     evict_from_tree_cache,
     release_kv_cache,
+    retry_dcp_alloc,
 )
 from sgl_jax.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sgl_jax.srt.mem_cache.radix_cache import RadixKey, build_radix_key
@@ -1197,6 +1198,18 @@ class ScheduleBatch:
         out_cache_loc = self.token_to_kv_pool_allocator.alloc_decode(
             seq_lens, last_loc, dp_rank=dp_rank
         )
+        if out_cache_loc is None:
+            out_cache_loc, retry_state = retry_dcp_alloc(
+                self.tree_cache,
+                num_tokens,
+                dp_rank,
+                lambda: self.token_to_kv_pool_allocator.alloc_decode(
+                    seq_lens, last_loc, dp_rank=dp_rank
+                ),
+                backup_state,
+            )
+            if out_cache_loc is not None and backup_state:
+                state = retry_state
         if out_cache_loc is None:
             error_msg = (
                 f"Decode out of memory. Try to lower your batch size.\n"
