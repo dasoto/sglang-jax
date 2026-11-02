@@ -1,0 +1,19 @@
+# INT4 MoE / INT8 linear dynamic quantization config
+# - Linear layers use per-channel int8 quantization.
+# - MoE expert weights use int4 with one scale per 128 contraction rows per output column,
+#   so a chip holds twice as many experts as with int8 (e.g. EP64 x 4 replicas on 256 chips).
+
+quantization:
+  is_static_checkpoint: false
+  weight_block_size: [128, 128]
+
+  linear:
+    rules:
+      - module_path: '.*'
+        weight_dtype: 'int8'
+        activation_dtype: null
+        weight_block_size: null
+
+  moe:
+    weight_dtype: 'int4'
+    activation_dtype: null
