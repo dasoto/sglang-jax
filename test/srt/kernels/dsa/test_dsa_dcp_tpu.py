@@ -334,3 +334,37 @@ def test_dcp_merge_topk_pruned_is_exact(case):
         np.take_along_axis(vals, order, 1) > -np.inf, np.take_along_axis(idx, order, 1), -1
     )
     np.testing.assert_array_equal(np.sort(got, axis=1), np.sort(want, axis=1))
+
+
+@pytest.mark.parametrize("t", [8, 300])  # decode-sized (gather) and prefill-sized (all-reduce)
+def test_dcp_lse_combine_matches_softmax_merge(t):
+    """Cross-rank combine of partial attention: each rank's share exp(lse_r - m) / sum,
+    applied after the W_UV projection, summed and scattered by head. Ranks with no keys
+    for a query (lse -inf) contribute nothing."""
+    from sgl_jax.srt.layers.attention.dsa_sparse_backend import _dcp_lse_combine
+
+    ranks, h, d, dv = 4, 8, 16, 8
+    mesh = Mesh(np.array(jax.devices()[:ranks]), ("tensor",))
+    rng = np.random.default_rng(7)
+    o = rng.standard_normal((ranks, t, h, d)).astype(np.float32)
+    lse = rng.standard_normal((ranks, t, h)).astype(np.float32) * 3
+    lse[1, : t // 2] = -np.inf  # rank 1 holds no keys for the first half of the queries
+    lse[:, -1, 0] = -np.inf  # no rank holds keys for this (query, head)
+    w_uv = rng.standard_normal((d, h, dv)).astype(np.float32) * 0.1
+    combine = jax.jit(
+        jax.shard_map(
+            lambda o_, l_, w_: _dcp_lse_combine(o_[0], l_[0], h // ranks, w_uv=w_),
+            mesh=mesh,
+            in_specs=(P("tensor"), P("tensor"), P()),
+            out_specs=P(None, "tensor", None),
+            check_vma=False,
+        )
+    )
+    got = np.asarray(combine(jnp.asarray(o), jnp.asarray(lse), jnp.asarray(w_uv)))
+    m = np.max(lse, axis=0)
+    m = np.where(np.isneginf(m), 0.0, m)
+    e = np.where(np.isneginf(lse), 0.0, np.exp(lse - m))
+    s = e.sum(axis=0)
+    w = e / np.where(s > 0, s, 1.0)
+    want = np.einsum("rth,rthd,dhv->thv", w, o, w_uv)
+    np.testing.assert_allclose(got, want, rtol=1e-4, atol=1e-5)
