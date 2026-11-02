@@ -317,6 +317,20 @@ def _build_non_hybrid_memory_pools(token_to_kv_pool) -> MemoryPools:
 
 class ModelRunnerKVCacheMixin:
 
+    def _dsa_latent_kv_dtype(self: ModelRunner):
+        """int8 when SGLANG_JAX_DSA_KV_INT8=1 stores the MLA latent cache as int8 rows
+        with power-of-two scales (DSA with decode context parallelism only), else None."""
+        if os.environ.get("SGLANG_JAX_DSA_KV_INT8", "0") != "1":
+            return None
+        if (
+            self.server_args.attention_backend != "dsa_sparse"
+            or getattr(self.server_args, "dcp_size", 1) <= 1
+        ):
+            raise ValueError(
+                "SGLANG_JAX_DSA_KV_INT8=1 needs --attention-backend dsa_sparse and --dcp-size > 1"
+            )
+        return jnp.int8
+
     def _dsa_indexer_cache_params(self: ModelRunner) -> tuple[int, int]:
         """``(indexer_key_dim, num_indexer_layers)``, or ``(0, 0)`` when no DSA
         indexer key cache is allocated.
@@ -360,6 +374,7 @@ class ModelRunnerKVCacheMixin:
                 indexer_key_dim=indexer_key_dim,
                 num_indexer_layers=num_indexer_layers,
                 dcp_size=getattr(self.server_args, "dcp_size", 1),
+                latent_dtype=self._dsa_latent_kv_dtype(),
             )
 
         swa_num_kv_heads = getattr(self.model_config.hf_config, "swa_num_key_value_heads", None)
@@ -789,6 +804,9 @@ class ModelRunnerKVCacheMixin:
             if indexer_key_dim > 0:
                 dsa_kwargs["indexer_key_dim"] = indexer_key_dim
                 dsa_kwargs["num_indexer_layers"] = num_indexer_layers
+            latent_dtype = self._dsa_latent_kv_dtype()
+            if latent_dtype is not None:
+                dsa_kwargs["latent_dtype"] = latent_dtype
 
             return self._maybe_wrap_hybrid_kv_pool(
                 MLATokenToKVPool,

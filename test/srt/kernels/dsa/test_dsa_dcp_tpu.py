@@ -39,7 +39,7 @@ INDEX_TOPK = 256  # 2 pages per prefill query, 256-token decode top-k
 
 
 class Setup:
-    def __init__(self, mesh, dcp):
+    def __init__(self, mesh, dcp, latent_dtype=None):
         size = 64 * PS
         self.pool = MLATokenToKVPool(
             size=size,
@@ -53,6 +53,7 @@ class Setup:
             dcp_size=dcp,
             indexer_key_dim=IDX_D,
             num_indexer_layers=1,
+            latent_dtype=latent_dtype,
         )
         self.alloc = PagedTokenToKVPoolAllocator(
             size=size, page_size=PS, kvcache=self.pool, dp_size=1
@@ -266,6 +267,91 @@ def test_dsa_dcp4_prefill_absorb_matches_dcp1():
     pos = np.concatenate([np.arange(p, p + n) for p, n in zip(prefix, new)])
     o4, o1 = both(seq_lens, new, prefix, pos)
     _close(o4, o1, "absorb chunked extend")
+
+
+def _dequantized_rows(kvc, kpe):
+    """bf16 latent / rope rows equal to what an int8 cache stores for (kvc, kpe)."""
+    from sgl_jax.srt.kernels.mla.v2.kernel import (
+        dequantize_latent_rows_int8,
+        quantize_latent_rows_int8,
+    )
+
+    rows = quantize_latent_rows_int8(kvc, kpe, LKV + 128)
+    rows = dequantize_latent_rows_int8(rows, LKV, jnp.bfloat16)
+    return rows[:, :LKV], rows[:, LKV : LKV + ROPE]
+
+
+@pytest.mark.parametrize("absorb", [False, True])
+def test_dsa_dcp4_int8_rows_match_dequantized_bf16(absorb):
+    """SGLANG_JAX_DSA_KV_INT8: a dcp=4 pool of int8 latent rows attends what a bf16 pool
+    fed the dequantized rows attends (extend, decode steps across a page boundary,
+    chunked extend), within bf16 rounding; the error against unquantized rows is
+    reported. Both int8 kernels (MLA v2 attend-only decode, qblock prefill) compile here."""
+    mesh = Mesh(np.array(jax.local_devices()[:4]).reshape(1, 4), ("data", "tensor"))
+    rng = np.random.default_rng(20261102)
+    s8, sd, sb = Setup(mesh, 4, jnp.int8), Setup(mesh, 4), Setup(mesh, 4)
+    w = None
+    if absorb:
+        w_uk = jnp.asarray(rng.standard_normal((LKV, HEADS, 192)) / np.sqrt(192), jnp.bfloat16)
+        w_uv = jnp.asarray(rng.standard_normal((LKV, HEADS, 256)) / np.sqrt(LKV), jnp.bfloat16)
+        w = (w_uk, w_uv)
+
+    def run(mode, seq_lens, ext_lens, prefix, pos):
+        n = int(np.sum(ext_lens)) if ext_lens is not None else len(seq_lens)
+        x = _inputs(rng, n)
+        use_w = w if mode == ForwardMode.EXTEND else None
+        if use_w is not None:
+            x = (jnp.asarray(rng.standard_normal((n, HEADS, 192)) * 0.3, jnp.bfloat16),) + x[1:]
+        xd = x[:2] + _dequantized_rows(x[2], x[3]) + x[4:]
+        outs = []
+        for st, xi in ((s8, x), (sd, xd), (sb, x)):
+            if mode == ForwardMode.DECODE:
+                loc = st.alloc.alloc_decode(seq_lens, [t[-1] for t in st.tokens])
+                for i in range(len(seq_lens)):
+                    st.tokens[i].append(int(loc[i]))
+            else:
+                last = [t[-1] for t in st.tokens] if prefix else [-1] * len(seq_lens)
+                loc = st.alloc.alloc_extend(prefix or [0] * len(seq_lens), seq_lens, last, n)
+                c = np.cumsum([0] + list(ext_lens))
+                if not prefix:
+                    st.tokens = [[] for _ in seq_lens]
+                for i in range(len(seq_lens)):
+                    st.tokens[i].extend(int(v) for v in loc[c[i] : c[i + 1]])
+            outs.append(_step(mesh, st, mode, seq_lens, ext_lens, loc, pos, xi, use_w))
+        return outs
+
+    def check(outs, what):
+        o8, od, ob = outs
+        scale = max(np.abs(od).max(), 1e-3)
+        err_d, err_b = np.abs(o8 - od).max(), np.abs(o8 - ob).max()
+        print(
+            f"[dsa-dcp int8] {what}: max|int8-deq|={err_d:.3e} max|int8-bf16|={err_b:.3e} (max|out|={scale:.3e})"
+        )
+        assert err_d <= 1e-2 * scale, what
+        assert err_b <= 6e-2 * scale, what
+
+    seq_lens = [700, 128, 1000]
+    check(
+        run(
+            ForwardMode.EXTEND,
+            seq_lens,
+            seq_lens,
+            None,
+            np.concatenate([np.arange(k) for k in seq_lens]),
+        ),
+        "extend",
+    )
+    for step in range(3):
+        seq_lens = [k + 1 for k in seq_lens]
+        check(
+            run(ForwardMode.DECODE, seq_lens, None, None, np.array(seq_lens) - 1),
+            f"decode step {step}",
+        )
+    new = [300, 64, 129]
+    prefix = list(seq_lens)
+    seq_lens = [p + k for p, k in zip(prefix, new)]
+    pos = np.concatenate([np.arange(p, p + k) for p, k in zip(prefix, new)])
+    check(run(ForwardMode.EXTEND, seq_lens, new, prefix, pos), "chunked extend")
 
 
 @pytest.mark.parametrize("recall", [0.0, 0.95])

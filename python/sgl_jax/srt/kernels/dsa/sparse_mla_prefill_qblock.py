@@ -39,6 +39,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from sgl_jax.srt.kernels.mla.v2.kernel import INT8_SCALE_LANE, int8_scale_from_bytes
+
 logger = logging.getLogger(__name__)
 
 _SENTINEL = jnp.iinfo(jnp.int32).max
@@ -114,6 +116,26 @@ def build_block_unit_tables(
         .astype(jnp.int8)
     )
     return blk_units, blk_member, blk_counts
+
+
+def _dequant_int8_rows(kv_blk, Dv: int):
+    """int8 cache rows [R, Dk_pad] -> (latent [R, Dv], rope [R, Dk_pad - Dv]) in bf16,
+    each part times its power-of-two row scale, scale lanes zeroed (INT8_SCALE_LANE)."""
+    tail = kv_blk[:, Dv:].astype(jnp.int32)
+    lane = jax.lax.broadcasted_iota(jnp.int32, tail.shape, 1)
+    scales = int8_scale_from_bytes(tail)
+    ones = jnp.ones((tail.shape[1], 128), jnp.bfloat16)
+
+    def lanes_of(k):
+        # every lane <- the scale at lane k (a single nonzero term: exact)
+        v = jnp.where(lane == k, scales, 0.0).astype(jnp.bfloat16)
+        return jnp.dot(v, ones, preferred_element_type=jnp.float32)  # [R, 128]
+
+    s_lat = jnp.concatenate([lanes_of(INT8_SCALE_LANE)] * (Dv // 128), axis=1)
+    s_pe = jnp.concatenate([lanes_of(INT8_SCALE_LANE + 1)] * (tail.shape[1] // 128), axis=1)
+    lat = kv_blk[:, :Dv].astype(jnp.float32) * s_lat
+    rope = tail.astype(jnp.float32) * jnp.where(lane < INT8_SCALE_LANE, s_pe, 0.0)
+    return lat.astype(jnp.bfloat16), rope.astype(jnp.bfloat16)
 
 
 def _qblock_kernel(
@@ -228,13 +250,19 @@ def _qblock_kernel(
 
         _copy(j, slot).wait()
         kv_blk = kv_scratch[slot]  # [RBF, Dk_pad]
+        kv_int8 = kv_blk.dtype == jnp.int8
+        if kv_int8:
+            k_lat, k_rope = _dequant_int8_rows(kv_blk, Dv)
+        else:
+            k_lat, k_rope = kv_blk[:, :Dv], kv_blk[:, Dv:]
 
         # score: [RBF,Dk]·[QBHp,Dk] -> [RBF, QBHp] (keys sublane, queries lane)
         nt = (((1,), (1,)), ((), ()))
-        if split_q:
+        if split_q or kv_int8:
+            q_lat, q_rope = (q, qr) if split_q else (q[:, :Dv], q[:, Dv:])
             s = jax.lax.dot_general(
-                kv_blk[:, :Dv], q, nt, preferred_element_type=jnp.float32
-            ) + jax.lax.dot_general(kv_blk[:, Dv:], qr, nt, preferred_element_type=jnp.float32)
+                k_lat, q_lat, nt, preferred_element_type=jnp.float32
+            ) + jax.lax.dot_general(k_rope, q_rope, nt, preferred_element_type=jnp.float32)
         else:
             s = jax.lax.dot_general(kv_blk, q, nt, preferred_element_type=jnp.float32)
         s = s * sm_scale + bias
@@ -246,10 +274,10 @@ def _qblock_kernel(
         p = jnp.exp(s - corr[None, :])  # [RBF, QBHp]
         alpha = jnp.where(jnp.isneginf(m_new), 1.0, jnp.exp(m_i - m_new))
         l_new = l_i * alpha + jnp.sum(p, axis=0)
-        v_blk = kv_blk[:, :Dv]  # [RBF, Dv]
+        v_blk = k_lat  # [RBF, Dv]
         # acc[qh, dv] += sum_r p[r, qh] * v[r, dv]  (contract the key axis)
         acc = acc * alpha[:, None] + jax.lax.dot_general(
-            p.astype(kv_blk.dtype),
+            p.astype(v_blk.dtype),
             v_blk,
             (((0,), (0,)), ((), ())),
             preferred_element_type=jnp.float32,
@@ -536,6 +564,8 @@ def prefill_write_and_attend_ragged_qblock(
 
     if skip_write:
         cache_new = cache
+    elif cache.dtype == jnp.int8:
+        raise NotImplementedError("int8 cache rows are written by the caller (skip_write=True)")
     else:
         rope = kpe.shape[-1]
         # self-write: per-token scatter to out_cache_loc (identical to the
@@ -627,6 +657,8 @@ def prefill_write_and_attend_ragged_qblock_tsa(
 
     q_sparse = jnp.concatenate([ql, qpe], axis=-1)  # [Tq, H, Dv+rope]
 
+    if cache.dtype == jnp.int8:
+        raise NotImplementedError("TSA prefill does not write int8 cache rows")
     row = jnp.zeros((Tkv, Dk_pad), cache.dtype)
     row = row.at[:, :Dv].set(kvc.astype(cache.dtype))
     row = row.at[:, Dv : Dv + rope].set(kpe.reshape(Tkv, rope).astype(cache.dtype))

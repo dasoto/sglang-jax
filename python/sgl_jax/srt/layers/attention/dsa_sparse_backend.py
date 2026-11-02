@@ -38,7 +38,10 @@ from sgl_jax.srt.kernels.dsa.streamindex_topk import (
     streamindex_page_topk,
     streamindex_topk,
 )
-from sgl_jax.srt.kernels.mla.v2.kernel import mla_ragged_paged_attention
+from sgl_jax.srt.kernels.mla.v2.kernel import (
+    mla_ragged_paged_attention,
+    quantize_latent_rows_int8,
+)
 from sgl_jax.srt.layers.attention.mla_backend import MLAAttentionBackend
 from sgl_jax.srt.utils.profiling_utils import named_scope
 
@@ -334,6 +337,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
 
         kv_cache = token_to_kv_pool.get_fused_kv_buffer(layer_id)
         idx_cache = token_to_kv_pool.get_indexer_key_buffer(slot) if is_full else None
+        if kv_cache.dtype == jnp.int8 and self.dcp_size <= 1:
+            raise NotImplementedError("an int8 latent KV cache needs --dcp-size > 1")
 
         sm_scale = (
             (1.0 / jnp.sqrt(self.qk_nope_head_dim + self.qk_rope_head_dim))
@@ -1534,11 +1539,16 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             kv_len_local = (jnp.maximum(n_owned, 1) * ps).astype(jnp.int32)
             ql_all = jax.lax.all_gather(ql_, "tensor", axis=1, tiled=True)
             qpe_all = jax.lax.all_gather(qpe_, "tensor", axis=1, tiled=True)
+            new_kvc, new_kpe = kvc_, kpe_
+            if cache_.dtype == jnp.int8:
+                # The attend-only mode never reads the new rows (written above).
+                new_kvc = jnp.zeros(kvc_.shape, jnp.int8)
+                new_kpe = jnp.zeros(kpe_.shape, jnp.int8)
             o, cache_, lse = mla_ragged_paged_attention(
                 ql_all,
                 qpe_all,
-                kvc_,
-                kpe_,
+                new_kvc,
+                new_kpe,
                 cache_,
                 kv_len_local,
                 local_pages.reshape(-1),
@@ -1695,7 +1705,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
 
 
 def _fused_latent_rows(kvc: jax.Array, kpe: jax.Array, cache: jax.Array) -> jax.Array:
-    """[T, lkv] + [T, rope] -> fused cache rows [T, Dk_pad] (latent | rope | zeros)."""
+    """[T, lkv] + [T, rope] -> fused cache rows [T, Dk_pad] (latent | rope | zeros);
+    quantized rows for an int8 cache (quantize_latent_rows_int8)."""
+    if cache.dtype == jnp.int8:
+        return quantize_latent_rows_int8(kvc, kpe, cache.shape[-1])
     T, lkv = kvc.shape
     rope = kpe.shape[-1]
     row = jnp.zeros((T, cache.shape[-1]), cache.dtype)

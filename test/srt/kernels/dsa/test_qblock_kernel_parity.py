@@ -598,3 +598,79 @@ def test_lse_merges_disjoint_page_splits():
     lse_comb = np.where(w_sum > 0, m + np.log(np.where(w_sum > 0, w_sum, 1.0)), -np.inf)
     np.testing.assert_allclose(lse_comb, np.asarray(lse_full), rtol=1e-4, atol=1e-4)
     assert np.all(np.isneginf(np.asarray(lse_full)[0, 5]))
+
+
+# ── int8 latent rows (SGLANG_JAX_DSA_KV_INT8): int8 cache vs dequantized bf16 cache ──
+
+
+def _int8_caches(c):
+    """int8 rows of the case's kv written at its slots, and a bf16 cache holding
+    their dequantized values (the int8 path must attend exactly these)."""
+    from sgl_jax.srt.kernels.mla.v2.kernel import (
+        dequantize_latent_rows_int8,
+        quantize_latent_rows_int8,
+    )
+
+    kvc, kpe = c["kvc"].astype(jnp.bfloat16), c["kpe"].astype(jnp.bfloat16)
+    rows = np.asarray(quantize_latent_rows_int8(kvc, kpe * 20.0, _DK_PAD))
+    num_pages = c["cache"].shape[0]
+    flat = np.zeros((num_pages * _PS, _DK_PAD), np.int8)
+    loc = np.asarray(c["loc"])
+    flat[loc[loc >= 0]] = rows[loc >= 0]
+    deq = dequantize_latent_rows_int8(jnp.asarray(flat), _KV_LORA, jnp.bfloat16)
+    return (
+        jnp.asarray(flat).reshape(num_pages, _PS // 4, 4, _DK_PAD),
+        deq.reshape(num_pages, _PS // 2, 2, _DK_PAD),
+    )
+
+
+@pytest.mark.parametrize("split", [True, False])
+def test_ragged_qblock_int8_rows_match_dequantized_cache(split):
+    c = _ragged_case([200, 512, 1, 129], K=4, seed=29)
+    cache8, cache_deq = _int8_caches(c)
+    ql, qpe = c["ql"].astype(jnp.bfloat16), c["qpe"].astype(jnp.bfloat16)
+    kw = dict(kv_lora_rank=_KV_LORA, page_size=_PS, sm_scale=_SC, interpret=True, query_block=16)
+    kw.update(return_lse=True, skip_write=True, split_query=split)
+    if not split:
+        kw["q_sparse"] = jnp.concatenate([ql, qpe], axis=-1)
+    tail = (c["topk_pages"], c["positions"], c["loc"], c["seq_lens"], c["cu_q_lens"])
+    tail += (c["cu_kv_lens"], c["page_indices"])
+    o8, cache_out, lse8 = prefill_write_and_attend_ragged_qblock(
+        ql, qpe, None, None, cache8, *tail, **kw
+    )
+    ob, _, lseb = prefill_write_and_attend_ragged_qblock(
+        ql, qpe, None, None, cache_deq, *tail, **kw
+    )
+    real = c["real"]
+    assert cache_out is cache8
+    o8, ob = np.asarray(o8)[real], np.asarray(ob)[real]
+    if split:
+        # same two dots on identical (dequantized) operands
+        np.testing.assert_array_equal(o8, ob)
+        np.testing.assert_array_equal(np.asarray(lse8)[real], np.asarray(lseb)[real])
+    else:
+        # one concatenated score dot vs nope + rope dots; p is rounded to bf16 for P @ V
+        assert np.abs(o8 - ob).max() < 2e-3 * np.abs(ob).max()
+        np.testing.assert_allclose(
+            np.asarray(lse8)[real], np.asarray(lseb)[real], rtol=1e-5, atol=1e-5
+        )
+
+
+def test_ragged_qblock_int8_rejects_self_write():
+    c = _ragged_case([130], K=2, seed=31)
+    cache8, _ = _int8_caches(c)
+    tail = (c["topk_pages"], c["positions"], c["loc"], c["seq_lens"], c["cu_q_lens"])
+    tail += (c["cu_kv_lens"], c["page_indices"])
+    with pytest.raises(NotImplementedError, match="skip_write"):
+        prefill_write_and_attend_ragged_qblock(
+            c["ql"],
+            c["qpe"],
+            c["kvc"],
+            c["kpe"],
+            cache8,
+            *tail,
+            kv_lora_rank=_KV_LORA,
+            page_size=_PS,
+            sm_scale=_SC,
+            interpret=True,
+        )

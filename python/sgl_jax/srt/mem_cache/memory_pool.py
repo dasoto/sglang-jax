@@ -1884,6 +1884,7 @@ class MLATokenToKVPool(KVCache):
         indexer_key_dim: int = 0,
         num_indexer_layers: int = 0,
         dcp_size: int = 1,
+        latent_dtype: jnp.dtype | None = None,
     ) -> int:
         """Return the pool's conservative capacity coefficient before allocation."""
         if page_size <= 0:
@@ -1897,14 +1898,15 @@ class MLATokenToKVPool(KVCache):
         if num_indexer_layers and not indexer_key_dim:
             raise ValueError("indexer layers require a positive indexer_key_dim")
 
+        latent_dtype = dtype if latent_dtype is None else latent_dtype
         latent_shape = cls._latent_cache_shape(
             total_num_pages=1,
             page_size=page_size,
-            dtype=dtype,
+            dtype=latent_dtype,
             kv_lora_rank=kv_lora_rank,
             qk_rope_head_dim=qk_rope_head_dim,
         )
-        bytes_per_page = cls._shape_bytes(latent_shape, dtype) * num_latent_layers
+        bytes_per_page = cls._shape_bytes(latent_shape, latent_dtype) * num_latent_layers
         if num_indexer_layers:
             indexer_shape = cls._indexer_cache_shape(
                 total_num_pages=1,
@@ -1933,8 +1935,11 @@ class MLATokenToKVPool(KVCache):
         indexer_key_dim: int = 0,
         num_indexer_layers: int = 0,
         abstract: bool = False,
+        latent_dtype: jnp.dtype | None = None,
     ):
         super().__init__(size, page_size, dtype, layer_num, mesh, start_layer, end_layer)
+        # The latent buffers may be int8 (DSA DCP int8 rows); the indexer keys keep `dtype`.
+        self.latent_dtype = dtype if latent_dtype is None else latent_dtype
         self.kv_lora_rank = kv_lora_rank
         self.qk_rope_head_dim = qk_rope_head_dim
         self.kv_partition_axis = kv_partition_axis
@@ -1963,6 +1968,7 @@ class MLATokenToKVPool(KVCache):
             "kv_sharding": self.kv_sharding,
             "indexer_key_dim": self.indexer_key_dim_raw,
             "num_indexer_layers": self.num_indexer_layers,
+            "latent_dtype": self.latent_dtype,
         }
         return (children, aux_data)
 
@@ -1994,6 +2000,7 @@ class MLATokenToKVPool(KVCache):
         obj.dcp_size = aux_data.get("dcp_size", 1)
         obj.kv_sharding = aux_data["kv_sharding"]
         obj.num_indexer_layers = aux_data.get("num_indexer_layers", 0)
+        obj.latent_dtype = aux_data.get("latent_dtype", obj.dtype)
         obj.nope_dim, obj.rope_dim = cls._aligned_latent_dims(
             obj.kv_lora_rank, obj.qk_rope_head_dim
         )
@@ -2035,29 +2042,29 @@ class MLATokenToKVPool(KVCache):
         buffer_shape = self._latent_cache_shape(
             total_num_pages=total_num_pages,
             page_size=self.page_size,
-            dtype=self.dtype,
+            dtype=self.latent_dtype,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
         )
-        per_layer_bytes = self._shape_bytes(buffer_shape, self.dtype)
+        per_layer_bytes = self._shape_bytes(buffer_shape, self.latent_dtype)
         logger.info(
             "MLA KV cache shape per layer: %s, dtype: %s, %.2f GB",
             buffer_shape,
-            self.dtype,
+            jnp.dtype(self.latent_dtype),
             per_layer_bytes / GB,
         )
 
-        def allocate_buffers(shape, count):
+        def allocate_buffers(shape, count, dtype=self.dtype):
             if abstract:
                 return [
-                    jax.ShapeDtypeStruct(shape, self.dtype, sharding=self.kv_sharding)
+                    jax.ShapeDtypeStruct(shape, dtype, sharding=self.kv_sharding)
                     for _ in range(count)
                 ]
-            allocate = _get_kv_zero_allocator(shape, self.dtype, self.kv_sharding)
+            allocate = _get_kv_zero_allocator(shape, dtype, self.kv_sharding)
             return [allocate() for _ in range(count)]
 
         with jax.set_mesh(self.mesh):
-            self.kv_buffer = allocate_buffers(buffer_shape, self.layer_num)
+            self.kv_buffer = allocate_buffers(buffer_shape, self.layer_num, self.latent_dtype)
 
             self.indexer_key_buffer = []
             if self.indexer_key_dim > 0 and self.num_indexer_layers > 0:
@@ -2107,11 +2114,11 @@ class MLATokenToKVPool(KVCache):
         shape = self._latent_cache_shape(
             total_num_pages=total_num_pages,
             page_size=self.page_size,
-            dtype=self.dtype,
+            dtype=self.latent_dtype,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
         )
-        return self._shape_bytes(shape, self.dtype)
+        return self._shape_bytes(shape, self.latent_dtype)
 
     def _indexer_buffer_bytes(self) -> int:
         """Bytes for ONE DSA indexer key buffer; 0 when none is allocated."""

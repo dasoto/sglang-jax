@@ -601,3 +601,47 @@ def test_apply_token_constraints_small_capacity(pages, expected_pages, monkeypat
         cap = ModelRunnerKVCacheMixin._apply_token_constraints(runner, pages * 64, None, 1)
         assert cap == expected_pages * 64
         assert (cap // 64 + 1) % 4 == 0
+
+
+def test_int8_latent_rows_budget_and_pool(monkeypatch):
+    """SGLANG_JAX_DSA_KV_INT8=1: the latent cache is int8 rows (4 tokens per word) while
+    the indexer keys stay bf16; budget, allocation, report and pytree agree."""
+    from sgl_jax.srt.kernels.mla.v2.kernel import get_kv_cache_shape
+
+    monkeypatch.setenv("SGLANG_JAX_DSA_KV_INT8", "1")
+    runner = _CellSizeRunner("dsa_sparse", num_layers=8)
+    runner.server_args.dcp_size = 2
+    _, num_indexer_layers = runner._dsa_indexer_cache_params()
+    latent_page = int(np.prod(get_kv_cache_shape(1, 128, 640, jnp.int8)))  # int8: 1 byte
+    indexer_page = _allocated_bytes_per_page(128)
+    page_bytes = latent_page * 8 + indexer_page * num_indexer_layers
+    assert runner._compute_cell_size() == -(-page_bytes // (128 * 2))
+    assert latent_page * 2 == _allocated_bytes_per_page(640)
+
+    pool = MLATokenToKVPool(
+        size=256,
+        page_size=128,
+        dtype=jnp.bfloat16,
+        kv_lora_rank=512,
+        qk_rope_head_dim=64,
+        layer_num=2,
+        mesh=_single_device_mesh(),
+        indexer_key_dim=128,
+        num_indexer_layers=1,
+        latent_dtype=jnp.int8,
+    )
+    assert pool.kv_buffer[0].dtype == jnp.int8 and pool.kv_buffer[0].shape[1:] == (32, 4, 640)
+    assert pool.indexer_key_buffer[0].dtype == jnp.bfloat16
+    assert pool.get_kv_size_bytes() == _resident_bytes(pool)
+    leaves, tree = jax.tree_util.tree_flatten(pool)
+    restored = jax.tree_util.tree_unflatten(tree, leaves)
+    assert restored.latent_dtype == jnp.int8 and restored.dtype == jnp.bfloat16
+
+
+@pytest.mark.parametrize("backend, dcp", [("dsa_sparse", 1), ("fa", 2)])
+def test_int8_latent_rows_need_dsa_with_dcp(monkeypatch, backend, dcp):
+    monkeypatch.setenv("SGLANG_JAX_DSA_KV_INT8", "1")
+    runner = _CellSizeRunner(backend, num_layers=8)
+    runner.server_args.dcp_size = dcp
+    with pytest.raises(ValueError, match="SGLANG_JAX_DSA_KV_INT8"):
+        runner._compute_cell_size()

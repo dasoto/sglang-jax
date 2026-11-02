@@ -101,6 +101,61 @@ def get_kv_cache_shape(
     )
 
 
+# int8 latent cache rows (DSA decode context parallelism, SGLANG_JAX_DSA_KV_INT8).
+# A row holds int8 values with one power-of-two scale for the latent part and one
+# for the rope part, scale = 2**(byte - 127). The two biased-exponent bytes sit at
+# lanes INT8_SCALE_LANE and INT8_SCALE_LANE + 1 of the rope segment's zero padding.
+# Power-of-two scales keep every dequantized value exact in bf16, so attention over
+# an int8 cache equals attention over a bf16 cache holding the dequantized rows.
+INT8_SCALE_LANE = 64
+
+
+def int8_scale_from_bytes(byte):
+    """f32 power-of-two scales from biased-exponent bytes (int32; 0 -> 0.0)."""
+    return lax.bitcast_convert_type(jnp.minimum(byte & 0xFF, 254) << 23, jnp.float32)
+
+
+def quantize_latent_rows_int8(kv_c: jax.Array, k_pe: jax.Array, row_dim: int) -> jax.Array:
+    """[T, kv_lora_rank] latent + [T, rope] rope -> int8 cache rows [T, row_dim]."""
+    T, lkv = kv_c.shape
+    rope = k_pe.shape[-1]
+    nope_dim = align_to(lkv, 128)
+    if rope > INT8_SCALE_LANE or row_dim < nope_dim + INT8_SCALE_LANE + 2:
+        raise ValueError(
+            f"int8 latent rows need rope <= {INT8_SCALE_LANE} and two scale lanes in the "
+            f"rope padding ({rope=}, {row_dim=})"
+        )
+
+    def quantize(x):
+        x = x.astype(jnp.float32)
+        amax = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
+        # 2**e: the smallest power of two with amax / 2**e <= 127 (frexp: m in [0.5, 1)).
+        _, e = jnp.frexp(amax / 127.0)
+        e = jnp.clip(e, -126, 127)
+        q = jnp.clip(jnp.round(jnp.ldexp(x, -e)), -127, 127).astype(jnp.int8)
+        byte = e + 127
+        return q, jnp.where(byte >= 128, byte - 256, byte).astype(jnp.int8)
+
+    q_lat, b_lat = quantize(kv_c)
+    q_pe, b_pe = quantize(k_pe.reshape(T, rope))
+    lane = nope_dim + INT8_SCALE_LANE
+    row = jnp.zeros((T, row_dim), jnp.int8)
+    row = row.at[:, :lkv].set(q_lat)
+    row = row.at[:, nope_dim : nope_dim + rope].set(q_pe)
+    return row.at[:, lane : lane + 2].set(jnp.concatenate([b_lat, b_pe], axis=1))
+
+
+def dequantize_latent_rows_int8(rows: jax.Array, nope_dim: int, dtype=jnp.float32) -> jax.Array:
+    """int8 cache rows [..., row_dim] -> dequantized rows with the scale lanes zeroed."""
+    byte = rows.astype(jnp.int32)
+    lane = nope_dim + INT8_SCALE_LANE
+    s_lat = int8_scale_from_bytes(byte[..., lane : lane + 1])
+    s_pe = int8_scale_from_bytes(byte[..., lane + 1 : lane + 2])
+    col = jnp.arange(rows.shape[-1])
+    scale = jnp.where(col < nope_dim, s_lat, jnp.where(col < lane, s_pe, 0.0))
+    return (rows.astype(jnp.float32) * scale).astype(dtype)
+
+
 class MlaCase(Enum):
     """Represents the different cases for MLA.
 
@@ -209,9 +264,14 @@ def static_validate_inputs(
             f"Expected {cache_kv.dtype=} to be equal to {new_k_pe.dtype=}."
         )
 
-    # Integer kv quantization is currently not supported.
-    if not jnp.issubdtype(cache_kv.dtype, jnp.floating):
-        raise ValueError(f"Expected {cache_kv.dtype=} to be a floating point.")
+    # Integer kv quantization: only the int8 latent row format (INT8_SCALE_LANE).
+    if cache_kv.dtype == jnp.int8:
+        if actual_r_dim > INT8_SCALE_LANE or r_dim < INT8_SCALE_LANE + 2:
+            raise ValueError(f"int8 kv rows need {actual_r_dim=} <= {INT8_SCALE_LANE}")
+        if k_scale is not None or v_scale is not None:
+            raise ValueError("int8 kv rows carry their own scales; k_scale/v_scale unsupported")
+    elif not jnp.issubdtype(cache_kv.dtype, jnp.floating):
+        raise ValueError(f"Expected {cache_kv.dtype=} to be a floating point or int8.")
 
     if kv_packing != get_dtype_packing(cache_kv.dtype):
         raise ValueError(f"{kv_packing=} does not match with {cache_kv.dtype=}")
@@ -348,6 +408,7 @@ def _mla_ragged_paged_attention_kernel(
     assert get_dtype_packing(kv_dtype) == kv_packing
     assert lkv_dim % 128 == 0
     assert r_dim % 128 == 0
+    kv_int8 = kv_dtype == jnp.int8
     bkv_sz_per_kv_packing = bkv_p * page_size_per_kv_packing
     bkv_sz = bkv_sz_per_kv_packing * kv_packing
     page_size = page_size_per_kv_packing * kv_packing
@@ -401,9 +462,23 @@ def _mla_ragged_paged_attention_kernel(
             return jnp.where(bkv_idx == 0, jnp.full_like(ref, init_val), ref[...])
 
         # Follow FlashAttention-2 forward pass.
-        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
-        k = jnp.concatenate([kv_c, k_pe], axis=-1)
-        s = jnp.einsum("bnd,bmd->bnm", q, k, preferred_element_type=jnp.float32)
+        if kv_int8:
+            # Score the raw int8 values (exact in bf16) and apply each key's
+            # power-of-two latent / rope scale to the scores, and the latent one to p.
+            s_lat_row, s_pe_row = int8_scale_rows(k_pe)
+            kv_c = kv_c.astype(jnp.float32).astype(ql_nope.dtype)
+            # The scale lanes meet the zero padding of q_pe.
+            k_pe = k_pe.astype(jnp.float32).astype(q_pe.dtype)
+            s = s_lat_row * jnp.einsum(
+                "bnd,bmd->bnm", ql_nope, kv_c, preferred_element_type=jnp.float32
+            )
+            s += s_pe_row * jnp.einsum(
+                "bnd,bmd->bnm", q_pe, k_pe, preferred_element_type=jnp.float32
+            )
+        else:
+            q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+            k = jnp.concatenate([kv_c, k_pe], axis=-1)
+            s = jnp.einsum("bnd,bmd->bnm", q, k, preferred_element_type=jnp.float32)
         s *= sm_scale
         if k_scale is not None:
             s *= k_scale
@@ -478,7 +553,8 @@ def _mla_ragged_paged_attention_kernel(
         if page_seq_positions_ref is not None:
             p = jnp.where(mask, 0.0, p)
 
-        pv = jnp.einsum("bnm,bmd->bnd", p, kv_c, preferred_element_type=jnp.float32)
+        p_v = p * s_lat_row if kv_int8 else p
+        pv = jnp.einsum("bnm,bmd->bnd", p_v, kv_c, preferred_element_type=jnp.float32)
         if v_scale is not None:
             pv *= v_scale
 
@@ -490,6 +566,26 @@ def _mla_ragged_paged_attention_kernel(
         o_prev = load_with_init(head_acc_ref, 0.0)
         o_curr = broadcast_minor(exp_m_diff, o_prev.shape) * o_prev + pv
         head_acc_ref[...] = o_curr
+
+    def int8_scale_rows(k_pe):
+        """Per-key latent / rope scales of int8 rows as [batch_size, 1, bkv_sz] rows.
+
+        A one-hot [8, r_dim] matmul moves the two scale lanes of every key onto the
+        key (lane) axis of the scores; one nonzero term per output keeps it exact
+        (power-of-two scales are exact in bf16).
+        """
+        lane = lax.broadcasted_iota(jnp.int32, k_pe.shape, 2)
+        scales = int8_scale_from_bytes(k_pe.astype(jnp.int32))
+        scales = jnp.where(
+            (lane == INT8_SCALE_LANE) | (lane == INT8_SCALE_LANE + 1), scales, 0.0
+        ).astype(jnp.bfloat16)
+        sel_shape = (k_pe.shape[0], 8, k_pe.shape[2])
+        sel = (
+            lax.broadcasted_iota(jnp.int32, sel_shape, 2)
+            == INT8_SCALE_LANE + lax.broadcasted_iota(jnp.int32, sel_shape, 1)
+        ).astype(jnp.bfloat16)
+        rows = jnp.einsum("bkd,bmd->bkm", sel, scales, preferred_element_type=jnp.float32)
+        return rows[:, 0:1], rows[:, 1:2]
 
     def _async_copy(src, dst, sem, wait):
         if debug_mode:
@@ -1727,6 +1823,11 @@ def mla_ragged_paged_attention(
         debug_mode=debug_mode,
     )
 
+    if cache_kv.dtype == jnp.int8 and page_seq_positions is None:
+        raise NotImplementedError(
+            "int8 kv cache rows are only read in the attend-only DCP mode (page_seq_positions)"
+        )
+
     _, actual_num_q_heads, actual_lkv_dim = ql_nope.shape
     actual_r_dim = q_pe.shape[-1]
 
@@ -2061,7 +2162,11 @@ def mla_ragged_paged_attention(
                 def _page_body(p_idx, mla_state):
                     m_prev, l_prev, acc_prev = mla_state
                     phys_page = page_indices[p_idx]
-                    page_kv = flat_cache[phys_page].astype(jnp.float32)
+                    page_kv = flat_cache[phys_page]
+                    if page_kv.dtype == jnp.int8:
+                        page_kv = dequantize_latent_rows_int8(page_kv, nope_dim)
+                    else:
+                        page_kv = page_kv.astype(jnp.float32)
                     k_c_p = page_kv[:, :actual_lkv_dim]
                     k_pe_p = page_kv[:, nope_dim : nope_dim + actual_r_dim]
                     k_vec = jnp.concatenate([k_c_p, k_pe_p], axis=-1)
