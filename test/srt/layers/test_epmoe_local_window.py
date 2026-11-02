@@ -462,6 +462,8 @@ def test_quantize_loaded_weight_matches_quantize_weights(config):
     full.quantize_weights()
     for name in ("wi_0", "wi_1", "wo", "wi_0_scale", "wi_1_scale", "wo_scale"):
         a, b = getattr(full, name).value, getattr(on_load, name).value
+        if "int4" in config and name.endswith("_scale"):
+            assert b.dtype == jnp.bfloat16, name  # int4 block scales kept in the layer dtype
         assert a.dtype == b.dtype and a.shape == b.shape, name
         assert a.sharding.spec == b.sharding.spec, name
         np.testing.assert_array_equal(

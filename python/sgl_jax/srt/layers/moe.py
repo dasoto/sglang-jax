@@ -560,6 +560,10 @@ class EPMoE(nnx.Module):
                 w0_scale = w0_scale.reshape(w0_scale.shape[0], 1, 1, w0_scale.shape[1])
                 w1_scale = w1_scale.reshape(w1_scale.shape[0], 1, 1, w1_scale.shape[1])
                 wo_scale = wo_scale.reshape(wo_scale.shape[0], 1, 1, wo_scale.shape[1])
+            if is_int4_dtype(self.quantized_dtype):
+                w0_scale, w1_scale, wo_scale = (
+                    x.astype(self.dtype) for x in (w0_scale, w1_scale, wo_scale)
+                )
 
             if hasattr(self, "wi_0_scale"):
                 del self.wi_0_scale
@@ -605,6 +609,10 @@ class EPMoE(nnx.Module):
                 scale = scale[:, :, None, :]
             else:
                 scale = scale.reshape(scale.shape[0], 1, 1, scale.shape[1])
+            if is_int4_dtype(self.quantized_dtype):
+                # Same scale dtype as int4 static checkpoints: block scales in fp32 cost
+                # ~0.35 GB per chip at 4 experts x 75 layers, which comes out of the KV pool.
+                scale = scale.astype(self.dtype)
             if name == "wo":
                 weight_spec, scale_spec = P("expert", "tensor", None), self._get_wo_scale_sharding(
                     scale
