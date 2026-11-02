@@ -31,7 +31,6 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
     quantize_tensor_simple,
 )
 
-
 # Local-window dispatch for EPMoE: an expert sees each token at most once, so the
 # rows routed to one shard's experts fit in M * min(top_k, experts_per_device)
 # sorted rows starting at the shard's first local row. Gathering only that window,
@@ -46,6 +45,10 @@ MOE_LOCAL_WINDOW = os.environ.get("SGLANG_JAX_MOE_LOCAL_WINDOW", "0") == "1"
 # ever dropped. 0 disables it. Read at trace time.
 MOE_WINDOW_CF = float(os.environ.get("SGLANG_JAX_MOE_WINDOW_CF", "0"))
 _SMALL_WINDOW_ALIGN = 256
+# Accumulate the small-window combine in the layer dtype instead of fp32: a token gets
+# at most experts_per_device rows on a shard and the cross-shard sum is in the layer
+# dtype anyway, while the fp32 [tokens, hidden] buffer cost two extra passes per layer.
+MOE_COMBINE_BF16 = os.environ.get("SGLANG_JAX_MOE_COMBINE_BF16", "0") == "1"
 # All-to-all EPMoE exchange: each shard keeps its slice of the tokens, sends every
 # routed row (int8, per-row scale) to the shard holding its expert, runs the local
 # expert over the received rows and sends the results back (bf16). Replaces the
@@ -1058,8 +1061,9 @@ class EPMoE(nnx.Module):
         # bounds: the v5e scatter emitter crashed on the out-of-bounds drop form.
         tokens = jnp.where(valid, flat // top_k, num_tokens)
         w = jnp.where(valid, jnp.ravel(weights)[flat].astype(jnp.float32), 0.0)
-        contrib = intermediate.astype(jnp.float32) * w[:, None]
-        out = jnp.zeros((num_tokens + 1, intermediate.shape[1]), jnp.float32)
+        acc_dtype = self.dtype if MOE_COMBINE_BF16 else jnp.float32
+        contrib = (intermediate.astype(jnp.float32) * w[:, None]).astype(acc_dtype)
+        out = jnp.zeros((num_tokens + 1, intermediate.shape[1]), acc_dtype)
         out = out.at[tokens].add(contrib, mode="promise_in_bounds")
         return out[:num_tokens].astype(self.dtype)
 

@@ -346,3 +346,39 @@ def test_out_of_range_expert_id_drops_rows(monkeypatch, window, replicas, cf, in
     tol = 2e-2 * scale if int8 else 1e-5
     np.testing.assert_allclose(outs[1][~pad], outs[0][~pad], rtol=0, atol=tol)
     np.testing.assert_array_equal(outs[1][pad], 0.0)
+
+
+def test_small_window_bf16_combine_matches_fp32(monkeypatch):
+    """SGLANG_JAX_MOE_COMBINE_BF16 accumulates the small-window combine in the layer
+    dtype; on a bf16 layer it stays within bf16 rounding of the fp32 accumulation."""
+    mesh = create_device_mesh(
+        ici_parallelism=[2, 4], dcn_parallelism=[1, 1], devices=jax.devices()[:8]
+    )
+    monkeypatch.setattr(moe, "MOE_LOCAL_WINDOW", True)
+    monkeypatch.setattr(moe, "MOE_GATHER_RS", True)
+    monkeypatch.setattr(moe, "MOE_REPLICAS", 2)
+    monkeypatch.setattr(moe, "MOE_WINDOW_CF", 1.25)
+    monkeypatch.setattr(moe, "_SMALL_WINDOW_ALIGN", 16)
+    with jax.set_mesh(mesh):
+        layer = moe.EPMoE(
+            hidden_size=32,
+            num_experts=8,
+            num_experts_per_tok=4,
+            ep_size=4,
+            mesh=mesh,
+            intermediate_dim=16,
+            weight_dtype=jnp.bfloat16,
+            dtype=jnp.bfloat16,
+        )
+    m = 256
+    rng = np.random.default_rng(31)
+    ids, w = _route(rng, m, 8, 4, 0.0)
+    x = jnp.asarray(rng.standard_normal((m, 32)) * 0.1, jnp.bfloat16)
+    outs = []
+    for bf16 in (False, True):
+        monkeypatch.setattr(moe, "MOE_COMBINE_BF16", bf16)
+        with jax.set_mesh(mesh):
+            outs.append(np.asarray(layer(x, jnp.asarray(w), jnp.asarray(ids)), np.float32))
+    scale = np.abs(outs[0]).max()
+    assert scale > 0
+    np.testing.assert_allclose(outs[1], outs[0], rtol=0, atol=2e-2 * scale)
