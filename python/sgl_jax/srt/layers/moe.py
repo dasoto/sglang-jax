@@ -1116,8 +1116,7 @@ class EPMoE(nnx.Module):
         pre_gather_q = getattr(self, "pre_gather_quant_dtype", None)
         if window is not None:
             # Rows [start, start + cap) of the expert-sorted order: the local experts'
-            # n_local rows first, then rows the GEMM leaves to a non-local group (or to
-            # the last local expert, whose extra rows _unpermute masks out).
+            # n_local rows first, then rows the GEMM leaves to a non-local group.
             start, n_local, cap = window
             pos = jnp.minimum(start + jnp.arange(cap, dtype=jnp.int32), token_indices.shape[0] - 1)
             if pre_gather_q is not None:
@@ -1131,7 +1130,13 @@ class EPMoE(nnx.Module):
                 experts < group_offset + self.experts_per_device
             )
             group_sizes = jnp.where(is_local, group_sizes, 0)
-            group_sizes = group_sizes.at[-1].add(cap - n_local)
+            # The window's rows past n_local go to a trailing group that no shard owns:
+            # the GEMM walks groups only up to its last local one, so they are skipped.
+            # (Added to the last expert instead, the shard holding it computed the whole
+            # window every layer while every other shard waited at the combine.)
+            group_sizes = jnp.concatenate(
+                [group_sizes, jnp.reshape(cap - n_local, (1,)).astype(group_sizes.dtype)]
+            )
         elif pre_gather_q is not None:
             x_q, x_scale = quantize_tensor_simple(inputs_2d, pre_gather_q, dim=-1)
             x = x_q[token_indices]
