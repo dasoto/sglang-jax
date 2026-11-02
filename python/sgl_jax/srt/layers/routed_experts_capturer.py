@@ -687,5 +687,11 @@ class _ExpertDistributionRecorder:
             "logical_count": logical_counts,
             "timestamp": timestamp,
         }
-        np.save(filename, output_data)
+        # A failed dump must not take the server down: it runs on the D2H sync thread.
+        try:
+            os.makedirs(os.path.dirname(filename) or ".", exist_ok=True)
+            np.save(filename, output_data)
+        except OSError:
+            logger.exception("Expert distribution dump to %s failed", filename)
+            return
         logger.info("Expert distribution dumped to %s", filename)

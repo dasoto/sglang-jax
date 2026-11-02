@@ -82,6 +82,23 @@ def _load_shared_expert(inputs, *, mesh, quantized_dtype):
         return weight, scale.reshape(1, 1, -1)
 
 
+def _eplb_physical_to_logical(layer_idx: int) -> np.ndarray | None:
+    """This layer's EPLB placement (physical slot -> logical expert), if one is active.
+
+    The placement only exists when ``--ep-dispatch-algorithm`` is set; it covers the
+    ``num_hidden_layers`` decoder layers, not the NextN layer.
+    """
+    from sgl_jax.srt.eplb.expert_location import get_global_expert_location_metadata
+
+    metadata = get_global_expert_location_metadata()
+    if metadata is None:
+        return None
+    physical_to_logical_map = np.asarray(jax.device_get(metadata.physical_to_logical_map))
+    if layer_idx >= physical_to_logical_map.shape[0]:
+        return None
+    return physical_to_logical_map[layer_idx]
+
+
 # No-op: FP32 accumulation logic removed to keep native BF16 execution.
 
 
@@ -1111,6 +1128,15 @@ def _prepare_fused_shared_experts(mappings, blocks):
 
 
 class Glm5ForCausalLM(nnx.Module):
+    @classmethod
+    def get_expert_location_config(cls, hf_config) -> dict:
+        """EPLB fields; GLM-5 names its routed-expert count ``n_routed_experts``."""
+        return {
+            "num_experts": int(getattr(hf_config, "n_routed_experts", 0)),
+            "num_layers": int(getattr(hf_config, "num_hidden_layers", 0)),
+            "num_groups": int(getattr(hf_config, "n_group", 1) or 1),
+        }
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -1344,7 +1370,7 @@ class Glm5ForCausalLM(nnx.Module):
                 num_experts=num_logical_experts,
                 expert_type_names=("gate_proj", "up_proj", "down_proj"),
                 moe_backend=moe_backend,
-                physical_to_logical_map=None,  # Handle physical mapping if needed later
+                physical_to_logical_map=_eplb_physical_to_logical(layer_idx),
             )
 
             if is_static_quant:
