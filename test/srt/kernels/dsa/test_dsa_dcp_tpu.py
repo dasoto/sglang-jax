@@ -296,3 +296,41 @@ def test_dcp_merge_topk_exact_and_approx(recall):
         hits = np.mean([len(set(g) & set(w)) / k for g, w in zip(got, want)])
         assert hits >= 0.9, hits
         assert (got >= 0).all()
+
+
+@pytest.mark.parametrize("case", ["iid", "skewed", "short", "tiny"])
+def test_dcp_merge_topk_pruned_is_exact(case):
+    """The pruned merge (cand below the local width) returns the exact top-k: from the
+    pruned set when no rank overflows it, through the full merge when one does (skewed),
+    and with -1 slots when fewer than k candidates are finite (tiny)."""
+    from sgl_jax.srt.layers.attention.dsa_sparse_backend import _dcp_merge_topk
+
+    mesh = Mesh(np.array(jax.devices()[:4]), ("tensor",))
+    t, k, cand, ranks, width = 8, 128, 64, 4, 512
+    rng = np.random.default_rng(5)
+    vals = rng.standard_normal((t, ranks, width)).astype(np.float32)
+    if case == "skewed":
+        vals[:, 1] += 10.0  # rank 1 holds the whole global top-k
+    if case == "short":
+        vals[:, :, 40:] = -np.inf  # 160 finite candidates, all inside the pruned set
+    if case == "tiny":
+        vals[:, :, 20:] = -np.inf  # 80 finite candidates < k
+    vals = -np.sort(-vals, axis=2)  # each rank's local top-k comes sorted
+    idx = np.arange(ranks * width, dtype=np.int32).reshape(1, ranks, width).repeat(t, 0)
+    idx = np.where(vals > -np.inf, idx, -1)
+    vals, idx = vals.reshape(t, -1), idx.reshape(t, -1)
+    merge = jax.jit(
+        jax.shard_map(
+            functools.partial(_dcp_merge_topk, k=k, recall=0.0, cand=cand),
+            mesh=mesh,
+            in_specs=(P(None, "tensor"), P(None, "tensor")),
+            out_specs=P(None, None),
+            check_vma=False,
+        )
+    )
+    got = np.asarray(merge(jnp.asarray(vals), jnp.asarray(idx)))
+    order = np.argsort(-vals, axis=1, kind="stable")[:, :k]
+    want = np.where(
+        np.take_along_axis(vals, order, 1) > -np.inf, np.take_along_axis(idx, order, 1), -1
+    )
+    np.testing.assert_array_equal(np.sort(got, axis=1), np.sort(want, axis=1))

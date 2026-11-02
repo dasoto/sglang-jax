@@ -168,6 +168,11 @@ _DCP_PREFILL_QB = int(os.environ.get("DSA_DCP_PREFILL_QB", "16"))
 # top_k sorts on every layer; approx_max_k keeps a small candidate set first.
 _DCP_MERGE_RECALL = float(os.environ.get("DSA_DCP_MERGE_RECALL", "0"))
 _DCP_MERGE_APPROX_MIN = 4096
+# Exact pruned cross-rank merge (0 = off): each rank first contributes only its C best
+# candidates, so decode sorts dcp x C instead of dcp x index_topk values per query (the
+# 65,536-wide top_k and its index gather were ~30% of a v5e decode step at DCP32). When a
+# rank holds more than C candidates at or above the pruned k-th value, the full merge runs.
+_DCP_MERGE_CAND = int(os.environ.get("DSA_DCP_MERGE_CAND", "0"))
 # dtype of the DCP output reduce-scatter (each rank's softmax-weighted partial).
 # bfloat16 halves the prefill combine traffic ([T, heads, kv_lora_rank] per layer).
 _DCP_COMBINE_DTYPE = jnp.dtype(os.environ.get("DSA_DCP_COMBINE_DTYPE", "float32"))
@@ -1735,7 +1740,11 @@ def _dcp_local_page_table(
 
 
 def _dcp_merge_topk(
-    vals: jax.Array, idx: jax.Array, k: int, recall: float | None = None
+    vals: jax.Array,
+    idx: jax.Array,
+    k: int,
+    recall: float | None = None,
+    cand: int | None = None,
 ) -> jax.Array:
     """Global top-k from each rank's local top-k: all-gather (score, index) over
     ``tensor`` and select again. Descending order, -1 for empty slots.
@@ -1743,7 +1752,30 @@ def _dcp_merge_topk(
     With ``recall`` in (0, 1) a large candidate set is first reduced by
     approx_max_k (unsorted candidates, no internal sort) and the exact top_k runs
     on that smaller set; a missed entry is replaced by the next-best candidate.
+
+    With ``cand`` (default ``DSA_DCP_MERGE_CAND``) below the local width, each rank
+    first contributes only its first ``cand`` candidates (its best, since the local
+    top-k comes sorted). The k-th best of those values is a lower bound on the global
+    k-th value; if no rank has another finite candidate at or above it, the global
+    top-k lies inside the pruned set and the result is exact. Otherwise every rank of
+    the DCP group (they agree through a pmax) runs the full merge.
     """
+    cand = _DCP_MERGE_CAND if cand is None else cand
+    if 0 < cand < vals.shape[1]:
+        cv = jax.lax.all_gather(vals[:, :cand], "tensor", axis=1, tiled=True)
+        if cv.shape[1] >= k:
+            ci = jax.lax.all_gather(idx[:, :cand], "tensor", axis=1, tiled=True)
+            top_vals, pos = jax.lax.top_k(cv, k)
+            rest = vals[:, cand:]
+            beyond = jnp.sum((rest >= top_vals[:, k - 1 :]) & (rest > -jnp.inf), axis=1)
+            overflow = jax.lax.pmax(jnp.max(beyond), "tensor") > 0
+
+            def pruned():
+                return jnp.where(top_vals > -jnp.inf, jnp.take_along_axis(ci, pos, axis=1), -1)
+
+            return jax.lax.cond(
+                overflow, lambda: _dcp_merge_topk(vals, idx, k, recall, cand=0), pruned
+            )
     vals = jax.lax.all_gather(vals, "tensor", axis=1, tiled=True)
     idx = jax.lax.all_gather(idx, "tensor", axis=1, tiled=True)
     recall = _DCP_MERGE_RECALL if recall is None else recall
