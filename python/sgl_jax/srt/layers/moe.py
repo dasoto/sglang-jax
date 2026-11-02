@@ -106,6 +106,40 @@ def epmoe_mesh(mesh: Mesh, ep_size: int) -> Mesh:
     )
 
 
+def _moe_block_size_k(
+    *,
+    hidden_size: int,
+    intermediate_dim: int,
+    weight_block_size: list[int] | tuple[int, int] | None,
+) -> int | None:
+    """Extract the contracting-dimension block size for MoE weights.
+
+    EPMoE only block-quantizes along the GEMM ``K`` dimension, so for a
+    configured ``(block_n, block_k)`` we consume only ``block_k`` here.
+    The divisibility checks keep the later GMM scale layout well-defined.
+    """
+    if weight_block_size is None:
+        return None
+    if not (isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2):
+        raise ValueError(
+            f"EPMoE weight_block_size must be a 2-element list [block_n, block_k], "
+            f"got {weight_block_size}"
+        )
+
+    block_size_k = int(weight_block_size[1])
+    if block_size_k <= 0:
+        raise ValueError(f"EPMoE weight_block_size[1] must be > 0, got {block_size_k}")
+    if hidden_size % block_size_k != 0:
+        raise ValueError(
+            f"EPMoE hidden_size={hidden_size} not divisible by block_size_k={block_size_k}"
+        )
+    if intermediate_dim % block_size_k != 0:
+        raise ValueError(
+            f"EPMoE intermediate_dim={intermediate_dim} not divisible by block_size_k={block_size_k}"
+        )
+    return block_size_k
+
+
 class EPMoE(nnx.Module):
     def __init__(
         self,
@@ -397,41 +431,10 @@ class EPMoE(nnx.Module):
 
     def quantize_weights(self, is_static: bool = False, *, abstract: bool = False):
         """Quantize MoE weights in-place or initialize params for static loading."""
-        if self.quantized_dtype is None:
+        if self.quantized_dtype is None or getattr(self, "_quantize_on_load", False):
             return
 
-        def _get_block_size_k(
-            *,
-            hidden_size: int,
-            intermediate_dim: int,
-            weight_block_size: list[int] | tuple[int, int] | None,
-        ) -> int | None:
-            """Extract the contracting-dimension block size for MoE weights.
-
-            EPMoE only block-quantizes along the GEMM ``K`` dimension, so for a
-            configured ``(block_n, block_k)`` we consume only ``block_k`` here.
-            The divisibility checks keep the later GMM scale layout well-defined.
-            """
-            if weight_block_size is None:
-                return None
-            if not (isinstance(weight_block_size, (list, tuple)) and len(weight_block_size) == 2):
-                raise ValueError(
-                    f"EPMoE weight_block_size must be a 2-element list [block_n, block_k], "
-                    f"got {weight_block_size}"
-                )
-
-            block_size_k = int(weight_block_size[1])
-            if block_size_k <= 0:
-                raise ValueError(f"EPMoE weight_block_size[1] must be > 0, got {block_size_k}")
-            if hidden_size % block_size_k != 0:
-                raise ValueError(
-                    f"EPMoE hidden_size={hidden_size} not divisible by block_size_k={block_size_k}"
-                )
-            if intermediate_dim % block_size_k != 0:
-                raise ValueError(
-                    f"EPMoE intermediate_dim={intermediate_dim} not divisible by block_size_k={block_size_k}"
-                )
-            return block_size_k
+        _get_block_size_k = _moe_block_size_k
 
         mesh_context = (
             jax.sharding.use_abstract_mesh(self.moe_mesh.abstract_mesh)
@@ -578,6 +581,43 @@ class EPMoE(nnx.Module):
                 wo_scale,
                 out_sharding=self._get_wo_scale_sharding(wo_scale),
             )
+
+    def quantize_loaded_weight(self, name: str, value: jax.Array) -> jax.Array:
+        """Quantize one expert weight ("wi_0", "wi_1" or "wo") as the loader delivers it.
+
+        With SGLANG_JAX_MOE_QUANTIZE_ON_LOAD the weight loader hands each layer's BF16
+        expert tensors here instead of storing them, so online quantization never holds
+        every layer's BF16 experts at once (int4 at EP64 x 4 replicas would need 22.6 GB
+        per 16 GB v5e chip). Same result as quantize_weights() after a full load.
+        """
+        if name == "wo":
+            intermediate_dim, hidden_size = value.shape[1], value.shape[2]
+        else:
+            hidden_size, intermediate_dim = value.shape[1], value.shape[2]
+        block_size_k = _moe_block_size_k(
+            hidden_size=hidden_size,
+            intermediate_dim=intermediate_dim,
+            weight_block_size=self.weight_block_size,
+        )
+        with jax.set_mesh(self.moe_mesh):
+            q, scale = quantize_tensor(self.quantized_dtype, value, axis=1, block_size=block_size_k)
+            if block_size_k is not None:
+                scale = scale[:, :, None, :]
+            else:
+                scale = scale.reshape(scale.shape[0], 1, 1, scale.shape[1])
+            if name == "wo":
+                weight_spec, scale_spec = P("expert", "tensor", None), self._get_wo_scale_sharding(
+                    scale
+                )
+            else:
+                weight_spec, scale_spec = P("expert", None, "tensor"), P(
+                    "expert", None, None, "tensor"
+                )
+            setattr(self, name, nnx.Param(q, out_sharding=weight_spec))
+            if hasattr(self, f"{name}_scale"):
+                delattr(self, f"{name}_scale")
+            setattr(self, f"{name}_scale", nnx.Param(scale, out_sharding=scale_spec))
+        return q
 
     @named_scope
     def __call__(

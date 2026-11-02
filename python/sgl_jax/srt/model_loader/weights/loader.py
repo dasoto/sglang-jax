@@ -238,6 +238,7 @@ class WeightLoader:
         if budget <= 0:
             raise ValueError("SGLANG_WEIGHT_LOAD_MAX_INFLIGHT_BYTES must be positive")
         warned_oversized = False
+        quantize_on_load = self._mark_moe_quantize_on_load()
         try:
             for name, spec in tqdm(active, desc="Loading weights"):
                 oversized = False
@@ -291,11 +292,25 @@ class WeightLoader:
                     (spec.target_path,) if isinstance(spec.target_path, str) else spec.target_path
                 )
                 values = list(outputs)
-                pending.extend(values)
                 if len(values) != len(targets):
                     raise ValueError(f"Recipe output count mismatch: {name}")
-                for path, value, expected in zip(targets, values, schemas[name]):
-                    self._assign(self._get_param(params, path), value, expected, path)
+                for i, (path, value, expected) in enumerate(zip(targets, values, schemas[name])):
+                    owner, _, attr = path.rpartition(".")
+                    module = self._get_param(params, owner) if quantize_on_load and owner else None
+                    if getattr(module, "_quantize_on_load", False) and attr in (
+                        "wi_0",
+                        "wi_1",
+                        "wo",
+                    ):
+                        if (value.shape, value.dtype) != (expected.shape, expected.dtype):
+                            raise ValueError(
+                                f"Loaded target {path}: got {value.shape}/{value.dtype}, "
+                                f"expected {expected.shape}/{expected.dtype}"
+                            )
+                        values[i] = module.quantize_loaded_weight(attr, value)
+                    else:
+                        self._assign(self._get_param(params, path), value, expected, path)
+                pending.extend(values)
                 pending_bytes += sum(
                     sum(s.data.nbytes for s in v.addressable_shards) for v in values
                 )
@@ -653,6 +668,31 @@ class WeightLoader:
                     unmatched[:10],
                 )
         return active, writers, skipped, unexpected, schemas
+
+    def _mark_moe_quantize_on_load(self) -> bool:
+        """SGLANG_JAX_MOE_QUANTIZE_ON_LOAD=1 with online MoE quantization: EPMoE weights are
+        quantized one tensor at a time as they load (see EPMoE.quantize_loaded_weight)."""
+        quant_cfg = getattr(self.model_config, "quantization_config", None)
+        if (
+            os.environ.get("SGLANG_JAX_MOE_QUANTIZE_ON_LOAD") != "1"
+            or quant_cfg is None
+            or quant_cfg.is_static_checkpoint
+            or not quant_cfg.has_moe_quantization()
+        ):
+            return False
+        from sgl_jax.srt.layers.moe import EPMoE
+
+        marked = 0
+        for _, module in nnx.iter_graph(self.model):
+            if isinstance(module, EPMoE) and not module.replicate_experts:
+                if module.quantized_dtype is None:
+                    module.quantized_dtype = quant_cfg.get_moe_weight_dtype()
+                    module.activation_quantized_dtype = quant_cfg.get_moe_activation_dtype()
+                    module.weight_block_size = getattr(quant_cfg, "weight_block_size", None)
+                module._quantize_on_load = True
+                marked += 1
+        logger.info("Quantizing %d MoE layers as their weights load", marked)
+        return marked > 0
 
     @staticmethod
     def _get_param(params, path: str):

@@ -420,3 +420,50 @@ def test_window_levels_match_full_window(monkeypatch, skew, replicas):
             outs.append(np.asarray(layer(x, jnp.asarray(w), jnp.asarray(ids))))
     assert np.abs(outs[0]).max() > 0
     np.testing.assert_allclose(outs[1], outs[0], rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        "int8_moe_block_128_linear_channel_dynamic.yaml",
+        "int4_moe_block_128_linear_channel_dynamic.yaml",
+    ],
+)
+def test_quantize_loaded_weight_matches_quantize_weights(config):
+    """SGLANG_JAX_MOE_QUANTIZE_ON_LOAD quantizes each expert tensor as it loads; the
+    weights and scales equal quantize_weights() after a full BF16 load."""
+    from sgl_jax.srt.configs.quantization_config import QuantizationConfig
+
+    quant = QuantizationConfig.from_yaml(config)
+    mesh = create_device_mesh(
+        ici_parallelism=[1, 4], dcn_parallelism=[1, 1], devices=jax.devices()[:4]
+    )
+    layers = []
+    for _ in range(2):
+        with jax.set_mesh(mesh):
+            layers.append(
+                moe.EPMoE(
+                    hidden_size=256,
+                    num_experts=8,
+                    num_experts_per_tok=2,
+                    ep_size=4,
+                    mesh=mesh,
+                    intermediate_dim=256,
+                    weight_dtype=jnp.bfloat16,
+                    dtype=jnp.bfloat16,
+                    quantization_config=quant,
+                )
+            )
+    full, on_load = layers
+    on_load._quantize_on_load = True
+    for name in ("wi_0", "wi_1", "wo"):
+        on_load.quantize_loaded_weight(name, getattr(on_load, name).value)
+    on_load.quantize_weights()  # skipped: already quantized on load
+    full.quantize_weights()
+    for name in ("wi_0", "wi_1", "wo", "wi_0_scale", "wi_1_scale", "wo_scale"):
+        a, b = getattr(full, name).value, getattr(on_load, name).value
+        assert a.dtype == b.dtype and a.shape == b.shape, name
+        assert a.sharding.spec == b.sharding.spec, name
+        np.testing.assert_array_equal(
+            np.asarray(a.astype(jnp.float32)), np.asarray(b.astype(jnp.float32)), err_msg=name
+        )
