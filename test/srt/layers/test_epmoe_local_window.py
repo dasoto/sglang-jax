@@ -382,3 +382,41 @@ def test_small_window_bf16_combine_matches_fp32(monkeypatch):
     scale = np.abs(outs[0]).max()
     assert scale > 0
     np.testing.assert_allclose(outs[1], outs[0], rtol=0, atol=2e-2 * scale)
+
+
+@pytest.mark.parametrize("skew", [0.0, 1.5, 4.0])
+@pytest.mark.parametrize("replicas", [1, 2])
+def test_window_levels_match_full_window(monkeypatch, skew, replicas):
+    """SGLANG_JAX_MOE_WINDOW_LEVELS: each shard takes the smallest of the doubling small
+    windows that holds its rows (or the full window); results match the full window."""
+    mesh = create_device_mesh(
+        ici_parallelism=[2, 4], dcn_parallelism=[1, 1], devices=jax.devices()[:8]
+    )
+    monkeypatch.setattr(moe, "MOE_LOCAL_WINDOW", True)
+    monkeypatch.setattr(moe, "MOE_GATHER_RS", True)
+    monkeypatch.setattr(moe, "MOE_REPLICAS", replicas)
+    monkeypatch.setattr(moe, "_SMALL_WINDOW_ALIGN", 16)
+    ep = 8 // replicas
+    with jax.set_mesh(mesh):
+        layer = moe.EPMoE(
+            hidden_size=32,
+            num_experts=8,
+            num_experts_per_tok=2,
+            ep_size=ep,
+            mesh=mesh,
+            intermediate_dim=16,
+            weight_dtype=jnp.float32,
+            dtype=jnp.float32,
+        )
+    m = 512
+    rng = np.random.default_rng(37)
+    ids, w = _route(rng, m, 8, 2, skew)
+    x = jnp.asarray(rng.standard_normal((m, 32)) * 0.1, jnp.float32)
+    outs = []
+    for cf, levels in ((0.0, 1), (1.0, 3)):
+        monkeypatch.setattr(moe, "MOE_WINDOW_CF", cf)
+        monkeypatch.setattr(moe, "MOE_WINDOW_LEVELS", levels)
+        with jax.set_mesh(mesh):
+            outs.append(np.asarray(layer(x, jnp.asarray(w), jnp.asarray(ids))))
+    assert np.abs(outs[0]).max() > 0
+    np.testing.assert_allclose(outs[1], outs[0], rtol=1e-5, atol=1e-5)

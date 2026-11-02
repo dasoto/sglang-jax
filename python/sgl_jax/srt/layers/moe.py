@@ -45,6 +45,11 @@ MOE_LOCAL_WINDOW = os.environ.get("SGLANG_JAX_MOE_LOCAL_WINDOW", "0") == "1"
 # ever dropped. 0 disables it. Read at trace time.
 MOE_WINDOW_CF = float(os.environ.get("SGLANG_JAX_MOE_WINDOW_CF", "0"))
 _SMALL_WINDOW_ALIGN = 256
+# Small-window sizes per layer: CF x expected rows, then doubling, before the full window
+# (SGLANG_JAX_MOE_WINDOW_LEVELS=1 keeps the single small window). A shard whose experts got
+# up to ~5x their expected rows (typical for GLM-5.3's hottest expert) otherwise falls back
+# to the full window, and every other shard waits for it at the combine.
+MOE_WINDOW_LEVELS = max(1, int(os.environ.get("SGLANG_JAX_MOE_WINDOW_LEVELS", "1")))
 # Accumulate the small-window combine in the layer dtype instead of fp32: a token gets
 # at most experts_per_device rows on a shard and the cross-shard sum is in the layer
 # dtype anyway, while the fp32 [tokens, hidden] buffer cost two extra passes per layer.
@@ -1009,11 +1014,22 @@ class EPMoE(nnx.Module):
         )
         if small_cap is not None:
             start, n_local, _ = window
-            output = jax.lax.cond(
-                n_local <= small_cap,
-                lambda: compute((start, n_local, small_cap), scatter_combine=True),
-                lambda: compute(window),
-            )
+            sizes = [small_cap]
+            while len(sizes) < MOE_WINDOW_LEVELS and sizes[-1] * 2 < cap:
+                sizes.append(sizes[-1] * 2)
+            if len(sizes) == 1:
+                output = jax.lax.cond(
+                    n_local <= small_cap,
+                    lambda: compute((start, n_local, small_cap), scatter_combine=True),
+                    lambda: compute(window),
+                )
+            else:
+                # The smallest window that holds this shard's rows, else the full window.
+                level = jnp.sum(jnp.asarray(sizes, jnp.int32) < n_local)
+                branches = [
+                    (lambda s=s: compute((start, n_local, s), scatter_combine=True)) for s in sizes
+                ] + [lambda: compute(window)]
+                output = jax.lax.switch(level, branches)
         else:
             output = compute(window)
 
