@@ -284,6 +284,22 @@ class _RoutedExpertsCapturerReal(RoutedExpertsCapturer):
         ):
             return
 
+        if (
+            jax.process_count() > 1
+            and self._dist_recorder is not None
+            and not self.enable_host_buffer
+            and self._balance_analyzer is None
+        ):
+            # Multi-host: the global top-k arrays span other hosts' devices, so the
+            # recorder counts the rows held by this host's shards (a sample of the
+            # batch: this host's DP groups).
+            self._dist_recorder.add_local_shards(
+                topk_ids,
+                model_worker_batch.real_bs_per_dp,
+                model_worker_batch.per_dp_bs_size,
+            )
+            return
+
         topk_ids_cpu = jax.device_get(topk_ids)
         if self.enable_host_buffer:
             self._sync_fwd_experts_buffer_DtoH(
@@ -600,6 +616,40 @@ class _ExpertDistributionRecorder:
                 self._physical_counts.fill(0)
                 self._steps_accumulated = 0
 
+    def add_local_shards(self, topk_ids: list, real_bs_per_dp: list[int], per_dp_bs_size: int):
+        """Count the valid rows of this host's addressable shards (multi-host)."""
+        if not topk_ids:
+            return
+        with self._lock:
+            for layer_idx, arr in enumerate(topk_ids):
+                if arr is None:
+                    continue
+                seen = set()
+                for shard in arr.addressable_shards:
+                    rows = shard.index[0] if shard.index else slice(None)
+                    start = rows.start or 0
+                    if start in seen:
+                        continue
+                    seen.add(start)
+                    data = np.asarray(shard.data)
+                    n = data.shape[0]
+                    for dp_rank, real_bs in enumerate(real_bs_per_dp):
+                        lo = max(start, dp_rank * per_dp_bs_size)
+                        hi = min(start + n, dp_rank * per_dp_bs_size + max(real_bs, 0))
+                        if hi <= lo:
+                            continue
+                        ids = data[lo - start : hi - start].reshape(-1)
+                        ids = ids[ids >= 0]
+                        if ids.size:
+                            self._physical_counts[layer_idx] += np.bincount(
+                                ids, minlength=self.physical_expert_counts
+                            )[: self.physical_expert_counts]
+            self._steps_accumulated += 1
+            if self._steps_accumulated >= self.buffer_size:
+                self.dump()
+                self._physical_counts.fill(0)
+                self._steps_accumulated = 0
+
     def reset(self):
         with self._lock:
             self._physical_counts.fill(0)
@@ -626,7 +676,7 @@ class _ExpertDistributionRecorder:
 
         # Only process 0 saves to file
         # if jax.process_index() == 0:
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         base_path = self.output_file
         if base_path.endswith(".npy"):
             filename = base_path.replace(".npy", f"_{timestamp}.npy")
