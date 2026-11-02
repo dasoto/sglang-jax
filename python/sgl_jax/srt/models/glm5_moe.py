@@ -1,4 +1,5 @@
 import logging
+import os
 from functools import partial
 from typing import Any
 
@@ -39,6 +40,11 @@ from sgl_jax.srt.utils.quantization.quantization_utils import (
 logger = logging.getLogger(__name__)
 
 _INDEXER_ROPE_CONCAT = envs.SGLANG_JAX_INDEXER_ROPE_CONCAT.get()
+# Padded token rows (DP chunk padding in prefill, batch-bucket padding in decode) share one
+# hidden state, so they all route to the same experts and pile onto those chips. With
+# SGLANG_JAX_MOE_MASK_PAD=1 they get an out-of-range expert id, which EPMoE's permute sorts
+# after every real expert, so no expert shard computes them.
+_MOE_MASK_PAD = os.environ.get("SGLANG_JAX_MOE_MASK_PAD", "0") == "1"
 
 
 @partial(jax.jit, static_argnames=("quantized_dtype",))
@@ -990,13 +996,20 @@ class Glm5DecoderLayer(nnx.Module):
                 dispatch_info=dispatch_info,
             )
 
+            moe_ids, moe_weights = topk_ids, topk_weights
+            if _MOE_MASK_PAD and isinstance(self.mlp, EPMoE):
+                valid = forward_batch.get_token_valid_mask(hidden_states.shape[0])
+                if valid is not None:
+                    moe_ids = jnp.where(valid[:, None], topk_ids, self.mlp.num_experts)
+                    moe_weights = jnp.where(valid[:, None], topk_weights, 0)
+
             moe_kwargs = {}
             if isinstance(self.mlp, EPMoE) and moe_layers.MOE_GATHER_RS:
                 # Keep the MoE output in the attention's token layout (DP-sharded):
                 # the default fully replicated output turns the reduce-scatter
                 # combine back into an all-reduce over every expert shard.
                 moe_kwargs["out_sharding"] = jax.typeof(hidden_states).sharding
-            hidden_states = self.mlp(hidden_states, topk_weights, topk_ids, **moe_kwargs)
+            hidden_states = self.mlp(hidden_states, moe_weights, moe_ids, **moe_kwargs)
 
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output

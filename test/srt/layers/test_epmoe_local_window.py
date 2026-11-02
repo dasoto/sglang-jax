@@ -291,3 +291,58 @@ def test_group_sizes_match_bincount():
     ids, _ = _route(np.random.default_rng(5), 37, 8, 4, 2.0)
     _, _, _, group_sizes = layer._permute(jnp.zeros((37, 32), jnp.float32), jnp.asarray(ids))
     np.testing.assert_array_equal(np.asarray(group_sizes), np.bincount(ids.ravel(), minlength=8))
+
+
+@pytest.mark.parametrize("window", [False, True])
+@pytest.mark.parametrize("replicas", [1, 2])
+@pytest.mark.parametrize("cf", [0.0, 1.25])
+@pytest.mark.parametrize("int8", [False, True])
+def test_out_of_range_expert_id_drops_rows(monkeypatch, window, replicas, cf, int8):
+    """Rows routed to expert id ``num_experts`` (how GLM-5 masks padded tokens) sort
+    after every real expert and are computed by no shard: valid rows match a run where
+    the padded rows keep real experts with zero weight, and padded rows come out zero."""
+    mesh = create_device_mesh(
+        ici_parallelism=[2, 4], dcn_parallelism=[1, 1], devices=jax.devices()[:8]
+    )
+    monkeypatch.setattr(moe, "MOE_LOCAL_WINDOW", window)
+    monkeypatch.setattr(moe, "MOE_GATHER_RS", True)
+    monkeypatch.setattr(moe, "MOE_GATHER_INT8", int8)
+    monkeypatch.setattr(moe, "MOE_REPLICAS", replicas)
+    monkeypatch.setattr(moe, "MOE_WINDOW_CF", cf)
+    monkeypatch.setattr(moe, "_SMALL_WINDOW_ALIGN", 16)
+    with jax.set_mesh(mesh):
+        layer = moe.EPMoE(
+            hidden_size=32,
+            num_experts=8,
+            num_experts_per_tok=4,
+            ep_size=8 // replicas,
+            mesh=mesh,
+            intermediate_dim=16,
+            weight_dtype=jnp.float32,
+            dtype=jnp.float32,
+        )
+    m = 64
+    rng = np.random.default_rng(29)
+    ids, w = _route(rng, m, 8, 4, 2.0)
+    pad = rng.random(m) < 0.3
+    x_host = rng.standard_normal((m, 32)) * 0.1
+    x_host[pad] = x_host[pad][0]  # padded rows share one hidden state
+    w_zero = np.where(pad[:, None], 0.0, w).astype(np.float32)
+    ids_masked = np.where(pad[:, None], 8, ids).astype(np.int32)
+    dp = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("data", None))
+    outs = []
+    for route in (ids, ids_masked):
+        with jax.set_mesh(mesh):
+            x = jax.device_put(jnp.asarray(x_host, jnp.float32), dp)
+            y = layer(
+                x,
+                jax.device_put(jnp.asarray(w_zero), dp),
+                jax.device_put(jnp.asarray(route), dp),
+                out_sharding=jax.typeof(x).sharding,
+            )
+        outs.append(np.asarray(y))
+    scale = np.abs(outs[0][~pad]).max()
+    assert scale > 0
+    tol = 2e-2 * scale if int8 else 1e-5
+    np.testing.assert_allclose(outs[1][~pad], outs[0][~pad], rtol=0, atol=tol)
+    np.testing.assert_array_equal(outs[1][pad], 0.0)
