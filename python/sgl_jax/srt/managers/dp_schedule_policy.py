@@ -73,6 +73,7 @@ def pick_cache_aware_dp(
     item_input: int = 0,
     item_output: int = 0,
     max_spill_tokens: int | None = None,
+    miss_policy: str = "shape",
 ) -> int | None:
     """Cache-affinity DP policy with shape-aware miss fallback.
 
@@ -88,7 +89,10 @@ def pick_cache_aware_dp(
     2. Otherwise route to the least-loaded rank among the *holders* -- ranks whose
        cached prefix covers more than ``CACHE_THRESHOLD`` of the prompt -- so a hot
        prefix spreads across all its holders by load.
-    3. No holders (or no usable ``prompt_len``) -> shape-aware fallback.
+    3. No holders (or no usable ``prompt_len``) -> shape-aware fallback, or with
+       ``miss_policy="count"`` the rank with the fewest unfinished requests: a new
+       session stays on its rank, and decode steps pad every rank to the busiest
+       one's request count, so balancing counts matters more than tokens there.
 
     Holder and large-skew load order is ``(running, tokens, rank)``. Eligibility
     (the per-rank admission cap) is decided by the caller; this only chooses among
@@ -115,6 +119,8 @@ def pick_cache_aware_dp(
         if holders:
             return least_loaded(holders)
 
+    if miss_policy == "count":
+        return least_loaded(eligible)
     return pick_shape_aware_dp(eligible, input_counts, output_counts, item_input, item_output)
 
 

@@ -84,6 +84,14 @@ def test_no_cached_match_falls_back_to_shape_aware():
     )
 
 
+def test_no_cached_match_count_policy_picks_fewest_requests():
+    # Same loads as above: the count policy ignores token shapes and takes the rank
+    # with fewer unfinished requests; ties go to fewer tokens.
+    args = dict(input_counts=[0, 900], output_counts=[900, 0], item_input=0, item_output=700)
+    assert pick([0, 1], [0, 1], [0, 1], {0: 0, 1: 0}, 512, miss_policy="count", **args) == 0
+    assert pick([0, 1], [2, 2], [50, 10], {0: 0, 1: 0}, 512, miss_policy="count", **args) == 1
+
+
 def test_below_threshold_match_is_not_a_holder():
     # 100/512 < 0.5 -> rank 0 is not a holder; route by load to the idle rank 1.
     counts = [5, 0]
@@ -120,8 +128,18 @@ def test_hot_prefix_spills_when_owning_rank_is_full():
 
 def _sticky(eligible, matches, prompt_len, max_spill_tokens):
     counts = [0] * 4
-    return pick(eligible, counts, counts, matches, prompt_len, counts, counts, 0, 0,
-                max_spill_tokens=max_spill_tokens)
+    return pick(
+        eligible,
+        counts,
+        counts,
+        matches,
+        prompt_len,
+        counts,
+        counts,
+        0,
+        0,
+        max_spill_tokens=max_spill_tokens,
+    )
 
 
 def test_sticky_defers_when_full_rank_holds_a_much_longer_prefix():

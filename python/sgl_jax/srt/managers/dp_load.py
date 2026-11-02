@@ -106,6 +106,9 @@ class DpRouter:
         )
         max_defer = _env_int("SGLANG_JAX_DP_MAX_DEFER_ROUNDS")
         self.max_defer_rounds = _DEFAULT_MAX_DEFER_ROUNDS if max_defer is None else max_defer
+        # Where a request with no cache holder goes: "shape" (token load) or "count"
+        # (fewest unfinished requests), see ``pick_cache_aware_dp``.
+        self.miss_policy = os.environ.get("SGLANG_JAX_DP_MISS_POLICY", "shape").strip() or "shape"
 
     def assign(self, req) -> int | None:
         """Choose or preserve a DP rank, then record its load exactly once.
@@ -220,6 +223,7 @@ class DpRouter:
             input_tokens,
             output_tokens,
             max_spill_tokens=self.max_spill_tokens if sticky else None,
+            miss_policy=self.miss_policy,
         )
         if rank is None and sticky:
             req._dp_defer_rounds = deferrals + 1
