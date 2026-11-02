@@ -173,6 +173,9 @@ _DCP_MERGE_APPROX_MIN = 4096
 # 65,536-wide top_k and its index gather were ~30% of a v5e decode step at DCP32). When a
 # rank holds more than C candidates at or above the pruned k-th value, the full merge runs.
 _DCP_MERGE_CAND = int(os.environ.get("DSA_DCP_MERGE_CAND", "0"))
+# Token count from which the DCP output combine normalizes with all-reduces instead of
+# gathering every rank's log-sum-exp (prefill-sized batches).
+_DCP_LSE_REDUCE_MIN_TOKENS = 256
 # dtype of the DCP output reduce-scatter (each rank's softmax-weighted partial).
 # bfloat16 halves the prefill combine traffic ([T, heads, kv_lora_rank] per layer).
 _DCP_COMBINE_DTYPE = jnp.dtype(os.environ.get("DSA_DCP_COMBINE_DTYPE", "float32"))
@@ -1633,9 +1636,9 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 q_nope = jax.lax.all_gather(ql_, "tensor", axis=1, tiled=True)
                 q_pe = jax.lax.all_gather(qpe_.astype(ql_.dtype), "tensor", axis=1, tiled=True)
                 w_uk = jax.lax.all_gather(w_[0], "tensor", axis=1, tiled=True)
-                q_lat = jnp.einsum(
-                    "thd,rhd->thr", q_nope, w_uk, preferred_element_type=jnp.float32
-                ).astype(ql_.dtype)
+                # bf16 output: the MXU accumulates in fp32 either way, and an fp32
+                # result cost a separate [T, H, lkv] cast pass per layer.
+                q_lat = jnp.einsum("thd,rhd->thr", q_nope, w_uk, preferred_element_type=ql_.dtype)
             else:
                 # Concatenate this rank's heads before the all-gather: concatenating
                 # the gathered [T, H, 576] query cost a full extra pass per layer.
@@ -1803,17 +1806,31 @@ def _dcp_lse_combine(
     returning [T, heads_local, Dv].
     """
     lse = lse.astype(jnp.float32)
-    lse_all = jax.lax.all_gather(lse, "tensor")  # [dcp, T, H]
-    m = jnp.max(lse_all, axis=0)
-    m = jnp.where(jnp.isneginf(m), 0.0, m)
-    w_all = jnp.where(jnp.isneginf(lse_all), 0.0, jnp.exp(lse_all - m))
-    w_sum = jnp.sum(w_all, axis=0)
-    w = jnp.where(jnp.isneginf(lse), 0.0, jnp.exp(lse - m)) / jnp.where(w_sum > 0, w_sum, 1.0)
-    scaled = o.astype(jnp.float32) * w[..., None]
+    if lse.shape[0] >= _DCP_LSE_REDUCE_MIN_TOKENS:
+        # Prefill: two [T, H] all-reduces move far fewer bytes than gathering every
+        # rank's [T, H] (16.8 MB per layer at T=2048, 64 heads, DCP32).
+        m = jax.lax.pmax(lse, "tensor")
+        m = jnp.where(jnp.isneginf(m), 0.0, m)
+        e = jnp.where(jnp.isneginf(lse), 0.0, jnp.exp(lse - m))
+        w_sum = jax.lax.psum(e, "tensor")
+    else:
+        # Decode: one latency-bound gather beats two.
+        lse_all = jax.lax.all_gather(lse, "tensor")  # [dcp, T, H]
+        m = jnp.max(lse_all, axis=0)
+        m = jnp.where(jnp.isneginf(m), 0.0, m)
+        w_all = jnp.where(jnp.isneginf(lse_all), 0.0, jnp.exp(lse_all - m))
+        w_sum = jnp.sum(w_all, axis=0)
+        e = jnp.where(jnp.isneginf(lse), 0.0, jnp.exp(lse - m))
+    w = e / jnp.where(w_sum > 0, w_sum, 1.0)
     if w_uv is not None:
+        # The softmax share is one scalar per (token, head), so it can scale the
+        # projected [T, H, Dv] output instead of an fp32 copy of the [T, H, lkv] input.
         scaled = jnp.einsum(
-            "thr,rhd->thd", scaled.astype(w_uv.dtype), w_uv, preferred_element_type=jnp.float32
+            "thr,rhd->thd", o.astype(w_uv.dtype), w_uv, preferred_element_type=jnp.float32
         )
+        scaled = scaled * w[..., None]
+    else:
+        scaled = o.astype(jnp.float32) * w[..., None]
     scaled = scaled.astype(_DCP_COMBINE_DTYPE)
     out = jax.lax.psum_scatter(scaled, "tensor", scatter_dimension=1, tiled=True)
     assert out.shape[1] == heads_local
