@@ -2153,8 +2153,10 @@ class Scheduler(
                 if parked.to_finish is not None:
                     continue  # aborted; finalized once its last chunk is back
                 waited = step - getattr(parked, "_chunk_preempted_at", step)
-                if self.chunked_reqs[rank] is None and (
-                    not short[rank] or waited >= _CHUNK_PREEMPT_MAX_ROUNDS
+                if (
+                    self.chunked_reqs[rank] is None
+                    and (not short[rank] or waited >= _CHUNK_PREEMPT_MAX_ROUNDS)
+                    and self._chunk_fits(rank)
                 ):
                     preempted[rank] = None
                     parked._chunk_rounds_since_resume = 0
@@ -2174,6 +2176,15 @@ class Scheduler(
             req._chunk_preempted_at = step
             now.append(rank)
         return now
+
+    def _chunk_fits(self, rank: int) -> bool:
+        """Whether rank's free plus evictable KV holds one more prefill chunk: add_chunked_req
+        does not wait for space, so a preempted chunk resumes only when it fits."""
+        alloc = self.token_to_kv_pool_allocator
+        if not hasattr(alloc, "available_size"):
+            return True
+        free = alloc.available_size(dp_rank=rank) + self.tree_cache.evictable_size(dp_rank=rank)
+        return free >= (self.chunked_prefill_size or 0) + self.page_size
 
     def get_next_batch_to_run(self) -> ScheduleBatch | None:
         if self.pd == "pathways":
@@ -2387,6 +2398,14 @@ class Scheduler(
             running_bs_per_dp if self.is_mixed_chunk else 0,
             dp_size=self.dp_size,
         )
+        # Keep room for each preempted request's next chunk, so admitting short requests
+        # cannot leave its resume without KV.
+        offsets = getattr(adder, "rem_total_token_offset", None)
+        if offsets is not None and self.chunked_prefill_size:
+            for dp_rank, req in enumerate(preempted):
+                if req is not None:
+                    offsets[dp_rank] += self.chunked_prefill_size
+                    adder.cur_rem_token_offset[dp_rank] += self.chunked_prefill_size
 
         # Process existing chunked requests for each DP rank
         for dp_rank in range(self.dp_size):
@@ -2527,6 +2546,8 @@ class Scheduler(
         for dp_rank in preempted_now:
             if adder.can_run_list[dp_rank] or adder.new_chunked_reqs[dp_rank] is not None:
                 continue
+            if not self._chunk_fits(dp_rank):
+                continue  # stays preempted until decodes free KV
             req = preempted[dp_rank]
             preempted[dp_rank] = None
             req.init_next_round_input()

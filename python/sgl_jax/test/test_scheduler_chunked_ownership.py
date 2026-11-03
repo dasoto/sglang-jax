@@ -814,6 +814,38 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
                 sent = scheduler.send_to_tokenizer.send_pyobj.call_args.args[0]
                 self.assertEqual(sent.rid, long_req.rid)
 
+    def test_chunk_preempt_resumes_only_when_a_chunk_fits(self):
+        for free, resumed in ((1, False), (100, True)):
+            with self.subTest(free=free):
+                long_req = self._long_chunk(rounds=0)
+                scheduler = self._preempt_setup(step=3)
+                scheduler.token_to_kv_pool_allocator = SimpleNamespace(
+                    available_size=lambda dp_rank, free=free: free
+                )
+                scheduler.tree_cache.evictable_size = lambda dp_rank: 0
+                scheduler.preempted_chunked_reqs = [long_req]
+                long_req._chunk_preempted_at = 1
+                adder = self._adder(chunk_ret=long_req)
+
+                self._run_prefill(scheduler, adder)
+
+                self.assertEqual(adder.add_chunked_req.called, resumed)
+                self.assertIs(scheduler.chunked_reqs[0], long_req if resumed else None)
+                self.assertIs(scheduler.preempted_chunked_reqs[0], None if resumed else long_req)
+
+    def test_chunk_preempt_reserves_the_next_chunk_while_short_requests_run(self):
+        long_req, short_req = self._long_chunk(), self._short_req()
+        scheduler = self._preempt_setup(chunked=long_req, waiting=[short_req])
+        adder = self._adder(admit=short_req)
+        adder.rem_total_token_offset = [5]
+        adder.cur_rem_token_offset = [5]
+
+        self._run_prefill(scheduler, adder)
+
+        self.assertIs(scheduler.preempted_chunked_reqs[0], long_req)
+        self.assertEqual(adder.rem_total_token_offset, [5 + scheduler.chunked_prefill_size])
+        self.assertEqual(adder.cur_rem_token_offset, [5 + scheduler.chunked_prefill_size])
+
     def test_retract_requeues_preempted_chunk(self):
         long_req = self._long_chunk()
         scheduler = self._preempt_setup()
