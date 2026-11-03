@@ -113,14 +113,16 @@ def _attend(backend, kv, idx, out_loc, positions, ql, qpe, kvc, kpe, qi, ki, wi,
     return o, fused.kv, fused.idx
 
 
-def _step(mesh, st, mode, seq_lens, ext_lens, out_loc, positions, inputs, absorb=None):
+def _step(
+    mesh, st, mode, seq_lens, ext_lens, out_loc, positions, inputs, absorb=None, meta_mode=None
+):
     batch = SimpleNamespace(
         dp_size=1,
         per_dp_bs_size=len(seq_lens),
         seq_lens=np.array(seq_lens, np.int32),
         extend_seq_lens=None if ext_lens is None else np.array(ext_lens, np.int32),
         cache_loc=_cache_loc(st.tokens, seq_lens),
-        forward_mode=mode,
+        forward_mode=meta_mode or mode,
     )
     st.backend.forward_metadata = st.backend.get_forward_metadata(batch)
     rep = NamedSharding(mesh, P("data"))
@@ -267,6 +269,54 @@ def test_dsa_dcp4_prefill_absorb_matches_dcp1():
     pos = np.concatenate([np.arange(p, p + n) for p, n in zip(prefix, new)])
     o4, o1 = both(seq_lens, new, prefix, pos)
     _close(o4, o1, "absorb chunked extend")
+
+
+@pytest.mark.parametrize("mode", [ForwardMode.TARGET_VERIFY, ForwardMode.DRAFT_EXTEND])
+def test_dsa_dcp4_spec_batch_matches_dcp1(mode):
+    """Speculative TARGET_VERIFY / DRAFT_EXTEND batches (G causal draft tokens per request,
+    extend-shaped metadata as the fused spec path builds it) under dcp=4 match dcp=1. dcp=1
+    writes the allocated slots (out_cache_loc); dcp=4 derives them from the page table, so
+    the decode step after the batch also checks that its rows landed in the same slots."""
+    mesh = Mesh(np.array(jax.local_devices()[:4]).reshape(1, 4), ("data", "tensor"))
+    rng = np.random.default_rng(20261104)
+    s1, s4 = Setup(mesh, 1), Setup(mesh, 4)
+    seq_lens = [700, 128, 1000]
+    for st in (s1, s4):
+        loc = st.alloc.alloc_extend([0, 0, 0], seq_lens, [-1, -1, -1], sum(seq_lens))
+        c = np.cumsum([0] + seq_lens)
+        st.tokens = [list(loc[c[i] : c[i + 1]]) for i in range(3)]
+        st.loc = loc
+    pos = np.concatenate([np.arange(n) for n in seq_lens])
+    x = _inputs(rng, sum(seq_lens))
+    _step(mesh, s1, ForwardMode.EXTEND, seq_lens, seq_lens, s1.loc, pos, x)
+    _step(mesh, s4, ForwardMode.EXTEND, seq_lens, seq_lens, s4.loc, pos, x)
+
+    g = 4  # draft tokens per request; request 1 crosses into its second page
+    prefix = list(seq_lens)
+    seq_lens = [p + g for p in prefix]
+    for st in (s1, s4):
+        last = [t[-1] for t in st.tokens]
+        st.loc = st.alloc.alloc_extend(prefix, seq_lens, last, 3 * g)
+        for i in range(3):
+            st.tokens[i].extend(int(v) for v in st.loc[i * g : (i + 1) * g])
+    pos = np.concatenate([np.arange(p, p + g) for p in prefix])
+    x = _inputs(rng, 3 * g)
+    kw = dict(meta_mode=ForwardMode.EXTEND)
+    o1 = _step(mesh, s1, mode, seq_lens, [g] * 3, s1.loc, pos, x, **kw)
+    o4 = _step(mesh, s4, mode, seq_lens, [g] * 3, s4.loc, pos, x, **kw)
+    _close(o4, o1, f"{mode.name} batch")
+
+    seq_lens = [n + 1 for n in seq_lens]
+    for st in (s1, s4):
+        last = [t[-1] for t in st.tokens]
+        st.loc = st.alloc.alloc_decode(seq_lens, last)
+        for i in range(3):
+            st.tokens[i].append(int(st.loc[i]))
+    x = _inputs(rng, 3)
+    pos = np.array(seq_lens) - 1
+    o1 = _step(mesh, s1, ForwardMode.DECODE, seq_lens, None, s1.loc, pos, x)
+    o4 = _step(mesh, s4, ForwardMode.DECODE, seq_lens, None, s4.loc, pos, x)
+    _close(o4, o1, f"decode after {mode.name}")
 
 
 def _dequantized_rows(kvc, kpe):

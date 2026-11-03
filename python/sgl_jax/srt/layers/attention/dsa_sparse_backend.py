@@ -1337,10 +1337,11 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         mla_absorb=None,
     ):
         mode = forward_batch.forward_mode
-        if mode.is_target_verify() or mode.is_draft_extend():
-            raise NotImplementedError(
-                "DSA with --dcp-size does not support speculative decoding yet"
-            )
+        # Speculative TARGET_VERIFY / DRAFT_EXTEND batches are extend-shaped (G causal
+        # query tokens per request on a linear draft chain), so they take the extend path.
+        is_spec = mode.is_target_verify() or mode.is_draft_extend()
+        if is_spec and bool(getattr(forward_batch, "spec_kvshare_readonly", False)):
+            raise NotImplementedError("SGLANG_JAX_MTP_KVSHARE is not supported with --dcp-size")
         if is_full and q_idx is None:
             raise NotImplementedError("DSA with --dcp-size needs an indexer on every full layer")
         if not (_INDEXER_KERNEL and _INDEXER_KERNEL_PREFILL and _PREFILL_SPARSE):
@@ -1349,7 +1350,12 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 "and DSA_PREFILL_SPARSE=1"
             )
         is_decode = mode.is_decode()
-        loc = forward_batch.out_cache_loc.astype(jnp.int32)
+        if is_spec:
+            # out_cache_loc of a spec batch holds the next allocation, not the slots of
+            # its tokens; take them from the page table like the decode-form spec path.
+            loc = self._dcp_spec_slots(md, q.shape[0], dpa)
+        else:
+            loc = forward_batch.out_cache_loc.astype(jnp.int32)
         reuse = is_full and dsa_topk_reuse and dsa_topk_pages_in is not None
         topk, topk_pages = None, None
         if is_full:
@@ -1377,13 +1383,25 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 raise ValueError("mla_absorb is only supported on the DCP prefill path")
             o, kv_cache = self._dcp_run_sparse_decode(*args)
         else:
-            o, kv_cache = self._dcp_run_sparse_prefill(*args, mla_absorb=mla_absorb)
+            o, kv_cache = self._dcp_run_sparse_prefill(*args, mla_absorb=mla_absorb, loc=loc)
         fresh = is_full and not reuse
         return o, DSAFusedCache(
             kv=kv_cache,
             idx=idx_cache,
             topk=topk if (fresh and is_decode) else None,
             topk_pages=topk_pages if fresh else None,
+        )
+
+    def _dcp_spec_slots(self, md, num_tokens: int, dpa) -> jax.Array:
+        """Global KV slot of every token of a spec batch (-1 on bucket padding)."""
+        page_size = self.page_size
+        t_local = num_tokens // self.mesh.shape[dpa]
+
+        def _run(sl_, cuq_, cukv_, pi_):
+            return _spec_token_slots(sl_, cuq_, cukv_, pi_, t_local, page_size)
+
+        return jax.shard_map(_run, in_specs=(P(dpa),) * 4, out_specs=P(dpa), check_vma=False)(
+            md.seq_lens, md.cu_q_lens, md.cu_kv_lens, md.page_indices
         )
 
     def _dcp_index(self, q_idx, k_idx, idx_weights, idx_cache, loc, dpa, md, *, mode):
@@ -1593,6 +1611,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         md,
         forward_batch,
         mla_absorb=None,
+        loc=None,
     ):
         """Prefill/mixed: owned writes up front, then the blocked sparse-prefill
         kernel over each query's owned selected pages with all heads (other pages
@@ -1695,7 +1714,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             cache,
             topk_pages,
             forward_batch.positions.astype(jnp.int32),
-            forward_batch.out_cache_loc.astype(jnp.int32),
+            forward_batch.out_cache_loc.astype(jnp.int32) if loc is None else loc,
             md.seq_lens,
             md.cu_q_lens,
             md.cu_kv_lens,
