@@ -665,6 +665,170 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         self.assertEqual(scheduler.chunked_reqs, [None])
         self.assertEqual(scheduler._pending_chunked_abort_reqs, [None])
 
+    # -- chunk preemption (SGLANG_JAX_CHUNK_PREEMPT) ---------------------------------
+
+    def _preempt_setup(self, chunked=None, waiting=(), step=0):
+        scheduler, _ = self._make_scheduler([[]], active_reqs=chunked)
+        scheduler.per_dp_max_running_requests = 256
+        scheduler.tree_cache.supports_recurrent = lambda: False
+        scheduler.waiting_queue = list(waiting)
+        scheduler._prefill_sched_step = step
+        scheduler.log_prefill_stats = Mock()
+        scheduler.req_to_token_pool = None
+        scheduler.model_config = SimpleNamespace(vocab_size=100)
+        scheduler.mesh = None
+        scheduler.embedding_pool = None
+        return scheduler
+
+    def _long_chunk(self, rid="long", total=20000, done=4096, rounds=4):
+        req = self._make_req(rid, list(range(total)), list(range(done)))
+        req.init_next_round_input = Mock()
+        req._chunk_rounds_since_resume = rounds
+        return req
+
+    def _short_req(self, rid="short", uncached=2000):
+        req = self._make_req(rid, list(range(uncached + 100)), [])
+        req._uncached_prefill_tokens = uncached
+        req.init_next_round_input = Mock()
+        return req
+
+    def _adder(self, admit=None, add_one=AddReqResult.CONTINUE, chunk_ret=None):
+        adder = SimpleNamespace(
+            can_run_list={0: []},
+            pending_h2d=[],
+            new_chunked_reqs=[None],
+            add_chunked_req=Mock(return_value=chunk_ret),
+        )
+
+        def add_one_req(req):
+            if admit is not None and req is admit:
+                adder.can_run_list[0].append(req)
+            return add_one
+
+        adder.add_one_req = Mock(side_effect=add_one_req)
+        return adder
+
+    def _run_prefill(self, scheduler, adder):
+        with (
+            patch("sgl_jax.srt.managers.scheduler._CHUNK_PREEMPT", True),
+            patch("sgl_jax.srt.managers.scheduler.PrefillAdder", return_value=adder),
+            patch("sgl_jax.srt.managers.scheduler.ScheduleBatch.init_new") as init_new,
+        ):
+            return scheduler.get_new_batch_prefill(), init_new
+
+    def test_chunk_preempt_yields_long_chunk_to_short_request(self):
+        long_req, short_req = self._long_chunk(), self._short_req()
+        scheduler = self._preempt_setup(chunked=long_req, waiting=[short_req])
+        adder = self._adder(admit=short_req)
+
+        batch, init_new = self._run_prefill(scheduler, adder)
+
+        self.assertIsNotNone(batch)
+        adder.add_chunked_req.assert_not_called()
+        adder.add_one_req.assert_called_once_with(short_req)
+        self.assertIs(scheduler.preempted_chunked_reqs[0], long_req)
+        self.assertEqual(scheduler.chunked_reqs, [None])
+        self.assertEqual(scheduler.waiting_queue, [])
+        self.assertEqual(init_new.call_args.kwargs["chunked_reqs"], [None])
+        self.assertEqual(long_req.is_chunked, 0)
+        self.assertIn((0, long_req), list(scheduler._iter_dp_requests()))
+
+    def test_chunk_preempt_resumes_once_no_short_request_waits(self):
+        long_req = self._long_chunk(rounds=0)
+        waiting_long = self._short_req("other-long", uncached=50000)
+        scheduler = self._preempt_setup(waiting=[waiting_long], step=3)
+        scheduler.preempted_chunked_reqs = [long_req]
+        long_req._chunk_preempted_at = 1
+        adder = self._adder(chunk_ret=long_req)
+
+        batch, _ = self._run_prefill(scheduler, adder)
+
+        self.assertIsNone(batch)  # the mocked adder schedules nothing
+        adder.add_chunked_req.assert_called_once_with(long_req)
+        adder.add_one_req.assert_not_called()
+        self.assertEqual(scheduler.preempted_chunked_reqs, [None])
+        self.assertIs(scheduler.chunked_reqs[0], long_req)
+        self.assertEqual(long_req._chunk_rounds_since_resume, 1)
+
+    def test_chunk_preempt_resumes_in_the_same_round_when_nothing_is_admitted(self):
+        long_req, short_req = self._long_chunk(), self._short_req()
+        scheduler = self._preempt_setup(chunked=long_req, waiting=[short_req])
+        adder = self._adder(add_one=AddReqResult.NO_TOKEN, chunk_ret=long_req)
+
+        self._run_prefill(scheduler, adder)
+
+        adder.add_one_req.assert_called_once_with(short_req)
+        adder.add_chunked_req.assert_called_once_with(long_req)
+        self.assertEqual(scheduler.preempted_chunked_reqs, [None])
+        self.assertIs(scheduler.chunked_reqs[0], long_req)
+        self.assertEqual(scheduler.waiting_queue, [short_req])
+
+    def test_chunk_preempt_needs_min_run_and_a_long_remainder(self):
+        for long_req in (
+            self._long_chunk(rounds=2),  # resumed too recently
+            self._long_chunk(total=8000, done=1024),  # remainder below the long threshold
+        ):
+            with self.subTest(rounds=long_req._chunk_rounds_since_resume):
+                short_req = self._short_req()
+                scheduler = self._preempt_setup(chunked=long_req, waiting=[short_req])
+                adder = self._adder(chunk_ret=long_req)
+
+                self._run_prefill(scheduler, adder)
+
+                adder.add_chunked_req.assert_called_once_with(long_req)
+                adder.add_one_req.assert_not_called()
+                self.assertEqual(scheduler.preempted_chunked_reqs, [None])
+
+    def test_chunk_preempt_forces_resume_after_max_rounds(self):
+        long_req, short_req = self._long_chunk(rounds=0), self._short_req()
+        scheduler = self._preempt_setup(waiting=[short_req], step=39)
+        scheduler.preempted_chunked_reqs = [long_req]
+        long_req._chunk_preempted_at = 7  # 33 rounds ago once the round counter advances
+        adder = self._adder(chunk_ret=long_req)
+
+        self._run_prefill(scheduler, adder)
+
+        adder.add_chunked_req.assert_called_once_with(long_req)
+        adder.add_one_req.assert_not_called()
+        self.assertIs(scheduler.chunked_reqs[0], long_req)
+
+    def test_abort_preempted_chunk_releases_after_its_inflight_chunk(self):
+        for inflight in (0, 1):
+            with self.subTest(inflight=inflight):
+                long_req = self._long_chunk()
+                long_req.is_chunked = inflight
+                scheduler = self._preempt_setup()
+                scheduler.preempted_chunked_reqs = [long_req]
+                with patch("sgl_jax.srt.managers.scheduler.release_kv_cache") as release:
+                    scheduler.abort_request(AbortReq(rid=long_req.rid))
+                    if inflight:
+                        release.assert_not_called()
+                        self.assertIs(scheduler.preempted_chunked_reqs[0], long_req)
+                        long_req.is_chunked = 0  # its last chunk's result was processed
+                        scheduler._process_pending_chunked_aborts()
+                release.assert_called_once_with(
+                    long_req, scheduler.tree_cache, is_insert=False, allow_overallocated=False
+                )
+                self.assertTrue(long_req.finished())
+                self.assertEqual(scheduler.preempted_chunked_reqs, [None])
+                sent = scheduler.send_to_tokenizer.send_pyobj.call_args.args[0]
+                self.assertEqual(sent.rid, long_req.rid)
+
+    def test_retract_requeues_preempted_chunk(self):
+        long_req = self._long_chunk()
+        scheduler = self._preempt_setup()
+        scheduler.preempted_chunked_reqs = [long_req]
+
+        with patch("sgl_jax.srt.managers.scheduler.release_kv_cache") as release:
+            scheduler._retract_parked_chunked_reqs([])
+
+        release.assert_called_once_with(
+            long_req, scheduler.tree_cache, is_insert=False, allow_overallocated=False
+        )
+        self.assertEqual(scheduler.waiting_queue, [long_req])
+        self.assertTrue(long_req.is_retracted)
+        self.assertEqual(scheduler.preempted_chunked_reqs, [None])
+
     def test_retract_preserves_active_pd_chunk_sender_and_wire_id(self):
         req = self._make_req("pd-retract", [1, 2], [10, 11])
         req.disagg_transfer_id = "wire-pd-retract"

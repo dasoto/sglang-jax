@@ -124,6 +124,18 @@ _PREFILL_SUF_SCHEDULE = os.environ.get("SGLANG_JAX_PREFILL_SUF_SCHEDULE", "1").s
     "yes",
     "on",
 )
+# Chunk preemption (off unless SGLANG_JAX_CHUNK_PREEMPT=1). A DP rank prefills one chunked request
+# at a time, so a long prompt holds the rank's whole chunk budget for its entire prefill and the
+# rank's short turns wait behind it while its decode batch drains (the busiest rank then sets every
+# decode step). A waiting request with at most _CHUNK_PREEMPT_SHORT uncached tokens preempts the
+# rank's chunked request when more than _CHUNK_PREEMPT_LONG of its prompt remain and it has run
+# _CHUNK_PREEMPT_MIN_RUN chunks since it last resumed. The preempted request keeps its KV and
+# resumes when no short request waits on its rank, or after _CHUNK_PREEMPT_MAX_ROUNDS prefill rounds.
+_CHUNK_PREEMPT = os.environ.get("SGLANG_JAX_CHUNK_PREEMPT", "0") == "1"
+_CHUNK_PREEMPT_SHORT = int(os.environ.get("SGLANG_JAX_CHUNK_PREEMPT_SHORT", "8192"))
+_CHUNK_PREEMPT_LONG = int(os.environ.get("SGLANG_JAX_CHUNK_PREEMPT_LONG", "8192"))
+_CHUNK_PREEMPT_MIN_RUN = int(os.environ.get("SGLANG_JAX_CHUNK_PREEMPT_MIN_RUN", "4"))
+_CHUNK_PREEMPT_MAX_ROUNDS = int(os.environ.get("SGLANG_JAX_CHUNK_PREEMPT_MAX_ROUNDS", "32"))
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
@@ -557,6 +569,7 @@ class Scheduler(
         if self.chunked_prefill_size <= 0:  # -1 means disable
             self.chunked_prefill_size = None
         self.chunked_reqs = [None] * self.dp_size  # Per-DP chunked requests
+        self.preempted_chunked_reqs = [None] * self.dp_size  # see _CHUNK_PREEMPT
         self._pending_chunked_abort_reqs = [None] * self.dp_size
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and server_args.enable_mixed_chunk
@@ -927,6 +940,9 @@ class Scheduler(
                 ):
                     yield rank, info.chunked_req
         for rank, req in enumerate(self.chunked_reqs):
+            if req is not None:
+                yield rank, req
+        for rank, req in enumerate(self._preempted_chunked()):
             if req is not None:
                 yield rank, req
         for queue in (self.waiting_queue, self.grammar_queue):
@@ -1503,6 +1519,9 @@ class Scheduler(
         ret["last_batch_is_none"] = self.last_batch is None
         ret["chunked_req_is_none"] = all(r is None for r in self.chunked_reqs)
         ret["chunked_req_rids"] = [r.rid if r is not None else None for r in self.chunked_reqs]
+        ret["preempted_chunked_req_rids"] = [
+            r.rid if r is not None else None for r in self._preempted_chunked()
+        ]
 
         # request cache stat
         if isinstance(self.tree_cache, ChunkCache):
@@ -1628,7 +1647,9 @@ class Scheduler(
         running_reqs = _batch_size(self.running_batch)
         current_batch_reqs = _batch_size(self.cur_batch)
         last_batch_reqs = _batch_size(self.last_batch)
-        chunked_pending = any(req is not None for req in self.chunked_reqs)
+        chunked_pending = any(req is not None for req in self.chunked_reqs) or any(
+            req is not None for req in self._preempted_chunked()
+        )
         pending_results = len(getattr(self, "result_queue", ())) if self.enable_overlap else 0
 
         has_pending = (
@@ -1698,6 +1719,7 @@ class Scheduler(
         )
         self.pending_dp_reqs = []
         self.chunked_reqs = [None] * self.dp_size
+        self.preempted_chunked_reqs = [None] * self.dp_size
         self._pending_chunked_abort_reqs = [None] * self.dp_size
         if self.enable_overlap:
             self.result_queue = deque()
@@ -1977,6 +1999,9 @@ class Scheduler(
         consumed: dict[int, Req] = {}
         if self.pd == "pathways":
             return consumed
+        for dp_rank, req in enumerate(self._preempted_chunked()):
+            if req is not None and req.to_finish is not None and req.is_chunked <= 0:
+                self._finalize_preempted_chunk_abort(dp_rank)
         for dp_rank, req in enumerate(self._pending_chunked_abort_reqs):
             if req is None:
                 continue
@@ -2049,6 +2074,106 @@ class Scheduler(
             self.chunked_reqs[dp_rank] = None
             req.reset_for_retract()
             self._add_request_to_queue(req)
+        preempted = self._preempted_chunked()
+        for dp_rank, req in enumerate(preempted):
+            if req is None:
+                continue
+            preempted[dp_rank] = None
+            if id(req) in retracted_request_ids:
+                continue
+            self._release_prefill_host_buffer(req)
+            release_kv_cache(
+                req,
+                self.tree_cache,
+                is_insert=False,
+                allow_overallocated=(
+                    self.spec_algorithm is not None and not self.spec_algorithm.is_none()
+                ),
+            )
+            req.reset_for_retract()
+            self._add_request_to_queue(req)
+
+    def _preempted_chunked(self) -> list:
+        """Per-DP chunked requests preempted by short ones (see _CHUNK_PREEMPT)."""
+        reqs = getattr(self, "preempted_chunked_reqs", None)
+        if reqs is None:
+            reqs = self.preempted_chunked_reqs = [None] * len(self.chunked_reqs)
+        return reqs
+
+    def _finalize_preempted_chunk_abort(self, dp_rank: int) -> None:
+        """Release an aborted preempted chunk; its last chunk's result is processed."""
+        preempted = self._preempted_chunked()
+        req = preempted[dp_rank]
+        preempted[dp_rank] = None
+        req.check_finished()
+        self._release_prefill_host_buffer(req)
+        release_kv_cache(
+            req,
+            self.tree_cache,
+            is_insert=False,
+            allow_overallocated=(
+                self.spec_algorithm is not None and not self.spec_algorithm.is_none()
+            ),
+        )
+        abort_out = AbortReq(rid=req.rid)
+        if self._comm_backend is not None:
+            self._comm_backend.send_pyobj(abort_out)
+        else:
+            self.send_to_tokenizer.send_pyobj(abort_out)
+
+    def _preempt_or_resume_chunked_reqs(self, running_bs_per_dp: list[int]) -> list[int]:
+        """Apply _CHUNK_PREEMPT for this prefill round; return the ranks preempted now.
+
+        Decisions read only the waiting queue, chunk progress and the prefill round
+        counter, which every node shares, so multi-host scheduling stays in lockstep.
+        """
+        preempted = self._preempted_chunked()
+        if not _CHUNK_PREEMPT or self.pd or self.is_mixed_chunk:
+            return []
+        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
+            return []
+        step = getattr(self, "_prefill_sched_step", 0)
+        max_running = getattr(self, "per_dp_max_running_requests", None)
+        short = [False] * self.dp_size
+        for req in self.waiting_queue:
+            rank = req.dp_rank
+            if rank is None or short[rank]:
+                continue
+            uncached = getattr(req, "_uncached_prefill_tokens", len(req.origin_input_ids))
+            if uncached <= _CHUNK_PREEMPT_SHORT:
+                short[rank] = True
+        now = []
+        for rank in range(self.dp_size):
+            if self.running_batch.reqs_info[rank].batch_is_full or (
+                max_running is not None and running_bs_per_dp[rank] >= max_running
+            ):
+                short[rank] = False
+            parked = preempted[rank]
+            if parked is not None:
+                if parked.to_finish is not None:
+                    continue  # aborted; finalized once its last chunk is back
+                waited = step - getattr(parked, "_chunk_preempted_at", step)
+                if self.chunked_reqs[rank] is None and (
+                    not short[rank] or waited >= _CHUNK_PREEMPT_MAX_ROUNDS
+                ):
+                    preempted[rank] = None
+                    parked._chunk_rounds_since_resume = 0
+                    self.chunked_reqs[rank] = parked
+                continue
+            req = self.chunked_reqs[rank]
+            if req is None or not short[rank] or self._pending_chunked_abort_reqs[rank] is not None:
+                continue
+            remaining = len(req.origin_input_ids) - len(req.prefix_indices)
+            if (
+                remaining <= _CHUNK_PREEMPT_LONG
+                or getattr(req, "_chunk_rounds_since_resume", 0) < _CHUNK_PREEMPT_MIN_RUN
+            ):
+                continue
+            preempted[rank] = req
+            self.chunked_reqs[rank] = None
+            req._chunk_preempted_at = step
+            now.append(rank)
+        return now
 
     def get_next_batch_to_run(self) -> ScheduleBatch | None:
         if self.pd == "pathways":
@@ -2218,7 +2343,9 @@ class Scheduler(
             self.tree_cache.check_hicache_events()
 
         # Handle the cases where prefill is not allowed
-        has_chunked_reqs = any(req is not None for req in self.chunked_reqs)
+        has_chunked_reqs = any(req is not None for req in self.chunked_reqs) or any(
+            req is not None and req.to_finish is None for req in self._preempted_chunked()
+        )
         if self.is_hybrid:
             for info in self.running_batch.reqs_info:
                 info.batch_is_full = False
@@ -2246,6 +2373,8 @@ class Scheduler(
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue)
         self._refresh_and_order_waiting_queue()
+        preempted_now = self._preempt_or_resume_chunked_reqs(running_bs_per_dp)
+        preempted = self._preempted_chunked()
 
         adder = PrefillAdder(
             self.page_size,
@@ -2264,6 +2393,7 @@ class Scheduler(
             req = self.chunked_reqs[dp_rank]
             if req is not None and self._pending_chunked_abort_reqs[dp_rank] is None:
                 req.init_next_round_input()
+                req._chunk_rounds_since_resume = getattr(req, "_chunk_rounds_since_resume", 0) + 1
                 self.chunked_reqs[dp_rank] = adder.add_chunked_req(req)
 
         # Collect existing LoRA IDs in the running batch if LoRA is enabled
@@ -2312,6 +2442,13 @@ class Scheduler(
             if (
                 self.chunked_reqs[dp_rank] is not None
                 or adder.new_chunked_reqs[dp_rank] is not None
+            ):
+                continue
+            # A rank with a preempted chunk admits only short requests.
+            if (
+                preempted[dp_rank] is not None
+                and getattr(req, "_uncached_prefill_tokens", len(req.origin_input_ids))
+                > _CHUNK_PREEMPT_SHORT
             ):
                 continue
 
@@ -2385,6 +2522,16 @@ class Scheduler(
                     break
             if _reserved_bid is not None:
                 req.disagg_host_buffer_id = _reserved_bid
+
+        # A rank that preempted its chunk but admitted nothing resumes the chunk this round.
+        for dp_rank in preempted_now:
+            if adder.can_run_list[dp_rank] or adder.new_chunked_reqs[dp_rank] is not None:
+                continue
+            req = preempted[dp_rank]
+            preempted[dp_rank] = None
+            req.init_next_round_input()
+            req._chunk_rounds_since_resume = getattr(req, "_chunk_rounds_since_resume", 0) + 1
+            self.chunked_reqs[dp_rank] = adder.add_chunked_req(req)
 
         # Update waiting queue
         # Collect H2D flush plans from admitted reqs; drained donation-safe later.
@@ -2896,6 +3043,12 @@ class Scheduler(
     def abort_request(self, recv_req: AbortReq):
         self._sync_chunked_req_owners()
         self._mark_pending_chunked_aborts(recv_req)
+        for dp_rank, req in enumerate(self._preempted_chunked()):
+            if req is None or not (recv_req.abort_all or req.rid.startswith(recv_req.rid)):
+                continue
+            req.to_finish = FINISH_ABORT()
+            if req.is_chunked <= 0:
+                self._finalize_preempted_chunk_abort(dp_rank)
 
         # Delete requests in the waiting queue
         to_del = []
