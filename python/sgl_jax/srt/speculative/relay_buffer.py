@@ -12,6 +12,12 @@ RELAY_STATE_SPEC = P("data", None, None)
 RELAY_ID_SPEC = P("data", None)
 
 
+def _sharded_zeros(shape, dtype, sharding):
+    """Zeros created directly in ``sharding``: device_put of a host-built array would
+    first materialize the whole (dp_size, capacity, ...) buffer on one device."""
+    return jax.jit(lambda: jnp.zeros(shape, dtype=dtype), out_shardings=sharding)()
+
+
 class SpecRelayBuffers(NamedTuple):
     topk_index: jax.Array
     hidden_states: jax.Array
@@ -39,22 +45,12 @@ def create_spec_relay_buffers(
     hidden_sharding = NamedSharding(mesh, RELAY_STATE_SPEC)
     id_sharding = NamedSharding(mesh, RELAY_ID_SPEC)
     return SpecRelayBuffers(
-        topk_index=jax.device_put(
-            jnp.zeros((dp_size, capacity, num_steps), dtype=jnp.int32),
-            token_sharding,
+        topk_index=_sharded_zeros((dp_size, capacity, num_steps), jnp.int32, token_sharding),
+        hidden_states=_sharded_zeros(
+            (dp_size, capacity, hidden_size), hidden_dtype, hidden_sharding
         ),
-        hidden_states=jax.device_put(
-            jnp.zeros((dp_size, capacity, hidden_size), dtype=hidden_dtype),
-            hidden_sharding,
-        ),
-        verified_id=jax.device_put(
-            jnp.zeros((dp_size, capacity), dtype=jnp.int32),
-            id_sharding,
-        ),
-        new_seq_lens=jax.device_put(
-            jnp.zeros((dp_size, capacity), dtype=jnp.int32),
-            id_sharding,
-        ),
+        verified_id=_sharded_zeros((dp_size, capacity), jnp.int32, id_sharding),
+        new_seq_lens=_sharded_zeros((dp_size, capacity), jnp.int32, id_sharding),
     )
 
 
@@ -69,8 +65,8 @@ def create_dflash_relay_buffers(
     sharding = NamedSharding(mesh, RELAY_ID_SPEC)
     shape = (dp_size, capacity)
     return DFlashRelayBuffers(
-        verified_id=jax.device_put(jnp.zeros(shape, dtype=jnp.int32), sharding),
-        new_seq_lens=jax.device_put(jnp.zeros(shape, dtype=jnp.int32), sharding),
+        verified_id=_sharded_zeros(shape, jnp.int32, sharding),
+        new_seq_lens=_sharded_zeros(shape, jnp.int32, sharding),
     )
 
 

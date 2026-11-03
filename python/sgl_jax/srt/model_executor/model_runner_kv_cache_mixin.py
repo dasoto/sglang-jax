@@ -351,6 +351,12 @@ class ModelRunnerKVCacheMixin:
         )
         if num_full == 0:
             return 0, 0
+        if getattr(self, "is_draft_worker", False) and is_single_layer_draft_arch(
+            self.model_config.hf_config
+        ):
+            # The NextN / MTP draft has one decoder layer, hence one indexer-key buffer
+            # (its pool otherwise reserved one per full layer of the target).
+            return cfg.index_head_dim, 1
         return cfg.index_head_dim, num_full
 
     def _compute_cell_size(self: ModelRunner) -> int:

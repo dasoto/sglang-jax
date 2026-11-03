@@ -645,3 +645,14 @@ def test_int8_latent_rows_need_dsa_with_dcp(monkeypatch, backend, dcp):
     runner.server_args.dcp_size = dcp
     with pytest.raises(ValueError, match="SGLANG_JAX_DSA_KV_INT8"):
         runner._compute_cell_size()
+
+
+def test_single_layer_draft_reserves_one_indexer_buffer():
+    """A NextN / MTP draft worker has one decoder layer, so one DSA indexer-key buffer."""
+    runner = _CellSizeRunner("dsa_sparse", num_layers=8)
+    assert runner._dsa_indexer_cache_params()[1] > 1
+    runner.is_draft_worker = True
+    runner.model_config.hf_config = types.SimpleNamespace(
+        architectures=["GlmMoeDsaForCausalLMNextN"]
+    )
+    assert runner._dsa_indexer_cache_params() == (128, 1)
