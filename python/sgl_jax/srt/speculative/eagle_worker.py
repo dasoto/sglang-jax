@@ -1,5 +1,7 @@
+import dataclasses
 import itertools
 import logging
+import os
 import time
 
 import jax
@@ -15,11 +17,29 @@ from sgl_jax.srt.managers.schedule_batch import (
 )
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardMode
+from sgl_jax.srt.sampling.sampling_params import TOP_K_ALL
 from sgl_jax.srt.speculative.base_worker import BaseSpecWorker
 from sgl_jax.srt.speculative.eagle_draft_worker import EagleDraftWorker
 from sgl_jax.srt.speculative.eagle_info import EagleDraftInput
 
 logger = logging.getLogger(__name__)
+
+# Also precompile the decode program of requests that sample (temperature > 0): its
+# rejection-sampling verify is a separate program, otherwise compiled on the first
+# such request of every batch bucket (minutes each on a large slice).
+_SPEC_PRECOMPILE_SAMPLED = os.environ.get("SGLANG_JAX_SPEC_PRECOMPILE_SAMPLED", "1") == "1"
+
+
+def sampled_precompile_info(sampling_info):
+    """Sampling info of requests at temperature > 0 without top-k or top-p (the OpenAI
+    chat defaults), which select the rejection-sampling verify program."""
+    return dataclasses.replace(
+        sampling_info,
+        temperatures=np.ones_like(sampling_info.temperatures),
+        top_ps=np.ones_like(sampling_info.top_ps),
+        top_ks=np.full_like(sampling_info.top_ks, TOP_K_ALL),
+        is_all_greedy=False,
+    )
 
 
 class EAGLEWorker(BaseSpecWorker):
@@ -254,6 +274,29 @@ class EAGLEWorker(BaseSpecWorker):
                 if self.spec_relay_buffers is not None:
                     self.forward_batch_speculative_decode_overlap(model_worker_batch)
                     jax.block_until_ready(self.spec_relay_buffers)
+                    if _SPEC_PRECOMPILE_SAMPLED:
+                        model_worker_batch = _make_decode_batch()
+                        model_worker_batch.sampling_info = sampled_precompile_info(
+                            model_worker_batch.sampling_info
+                        )
+                        model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
+                        model_worker_batch.spec_info_padded = EagleDraftInput(
+                            future_indices=np.asarray(
+                                model_worker_batch.req_pool_indices, dtype=np.int32
+                            ),
+                            capture_hidden_mode=CaptureHiddenMode.FULL,
+                            num_tokens_per_batch=np.asarray(1, dtype=np.int32),
+                            num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
+                            allocate_lens=model_worker_batch.seq_lens
+                            + EagleDraftInput.ALLOC_LEN_PER_DECODE,
+                        )
+                        model_worker_batch.speculative_eagle_topk = self.topk
+                        model_worker_batch.speculative_num_draft_tokens = (
+                            self.speculative_num_draft_tokens
+                        )
+                        model_worker_batch.speculative_num_steps = self.speculative_num_steps
+                        self.forward_batch_speculative_decode_overlap(model_worker_batch)
+                        jax.block_until_ready(self.spec_relay_buffers)
                 else:
                     self.forward_batch_speculative_generation(model_worker_batch)
 

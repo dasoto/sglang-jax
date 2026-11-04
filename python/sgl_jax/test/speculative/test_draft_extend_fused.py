@@ -255,3 +255,25 @@ def test_verify_publishes_device_lengths_for_recurrent_draft(monkeypatch, dp_siz
         )
     assert ready is lengths
     assert runner._sampler_step == 1
+
+
+def test_sampled_precompile_info_selects_the_chat_default_verify_program():
+    """Precompile's sampled decode batch takes the rejection-sampling verify program that
+    requests with the OpenAI chat defaults (temperature > 0, no top-k or top-p) select."""
+    import dataclasses
+    from types import SimpleNamespace
+
+    from sgl_jax.srt.managers.schedule_batch import ModelWorkerSamplingInfo
+    from sgl_jax.srt.speculative.draft_extend_fused import _prepare_rejection_sampling
+    from sgl_jax.srt.speculative.eagle_worker import sampled_precompile_info
+
+    bs, vocab = 8, 1000
+    greedy = ModelWorkerSamplingInfo.generate_for_precompile_all_greedy(bs, vocab)
+    sampled = sampled_precompile_info(greedy)
+    assert greedy.is_all_greedy and not sampled.is_all_greedy
+    batch = SimpleNamespace(per_dp_bs_size=4, real_bs_per_dp=[4, 4])
+    temps, _, _, enable_top_k, enable_top_p = _prepare_rejection_sampling(sampled, batch, bs, vocab)
+    assert (enable_top_k, enable_top_p) == (False, False)
+    np.testing.assert_array_equal(temps, np.ones((bs, 1), np.float32))
+    chat = dataclasses.replace(sampled, temperatures=np.full((bs, 1), 0.7, np.float32))
+    assert _prepare_rejection_sampling(chat, batch, bs, vocab)[3:] == (False, False)
