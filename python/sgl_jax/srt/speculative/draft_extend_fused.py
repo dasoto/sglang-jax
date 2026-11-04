@@ -2840,7 +2840,9 @@ def spec_prefill(spec_worker, model_worker_batch, launch_done=None, *, update_re
 
     hidden_size = target_worker.model_config.hidden_size
     model_worker_batch.spec_info_padded = EagleDraftInput(
-        hidden_states=np.zeros((len(model_worker_batch.input_ids), hidden_size), dtype=np.float32),
+        # Shape placeholder only: fused_prefill replaces it with the target hidden states.
+        # np.empty skips zeroing ~800 MB of host memory per 32K-token step.
+        hidden_states=np.empty((len(model_worker_batch.input_ids), hidden_size), dtype=np.float32),
         verified_id=np.zeros((len(model_worker_batch.seq_lens),), dtype=np.int32),
         num_tokens_per_batch=np.asarray(1, dtype=np.int32),
         num_tokens_for_logprob_per_batch=np.asarray(1, dtype=np.int32),
