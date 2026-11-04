@@ -45,6 +45,10 @@ _INDEXER_ROPE_CONCAT = envs.SGLANG_JAX_INDEXER_ROPE_CONCAT.get()
 # SGLANG_JAX_MOE_MASK_PAD=1 they get an out-of-range expert id, which EPMoE's permute sorts
 # after every real expert, so no expert shard computes them.
 _MOE_MASK_PAD = os.environ.get("SGLANG_JAX_MOE_MASK_PAD", "0") == "1"
+# Prefill steps on the gather / reduce-scatter MoE exchange: add the shared expert to
+# the routed output in the combine's token-split layout (reduce-scattered over tensor
+# instead of all-reduced) and gather the sum over tensor once.
+_MOE_SHARED_SPLIT = os.environ.get("SGLANG_JAX_MOE_SHARED_SPLIT", "1") == "1"
 
 
 @partial(jax.jit, static_argnames=("quantized_dtype",))
@@ -688,7 +692,12 @@ class Glm5MLP(nnx.Module):
             )
         return tuple(result)
 
-    def __call__(self, hidden_states: jax.Array):
+    @property
+    def accepts_out_sharding(self) -> bool:
+        """The unfused path can return its output in a caller-chosen layout."""
+        return not (self.use_fused and hasattr(self, "w_gu"))
+
+    def __call__(self, hidden_states: jax.Array, out_sharding: NamedSharding | None = None):
         if self.use_fused and hasattr(self, "w_gu"):
             seq_len, _ = hidden_states.shape
             b_seq = 64 if seq_len <= 8 else 256
@@ -721,7 +730,7 @@ class Glm5MLP(nnx.Module):
                 intermediate_parallel = jax.sharding.reshard(
                     intermediate_parallel, NamedSharding(sh.mesh, P(sh.spec[0], None))
                 )
-        output, _ = self.down_proj(intermediate_parallel)
+        output, _ = self.down_proj(intermediate_parallel, out_sharding=out_sharding)
         return output
 
 
@@ -983,8 +992,18 @@ class Glm5DecoderLayer(nnx.Module):
         hidden_states = self.post_attention_layernorm(hidden_states)
 
         if self.is_moe_layer:
+            token_sharding = jax.typeof(hidden_states).sharding
+            split_sharding = None
+            if (
+                _MOE_SHARED_SPLIT
+                and self.shared_experts is not None
+                and self.shared_experts.accepts_out_sharding
+                and isinstance(self.mlp, EPMoE)
+                and self.mlp.gather_rs_applies(hidden_states.shape[0])
+            ):
+                split_sharding = NamedSharding(token_sharding.mesh, P(("data", "tensor"), None))
             if self.shared_experts is not None:
-                shared_output = self.shared_experts(hidden_states)
+                shared_output = self.shared_experts(hidden_states, out_sharding=split_sharding)
             else:
                 shared_output = None
             router_logits = self.moe_gate(hidden_states)
@@ -1008,11 +1027,13 @@ class Glm5DecoderLayer(nnx.Module):
                 # Keep the MoE output in the attention's token layout (DP-sharded):
                 # the default fully replicated output turns the reduce-scatter
                 # combine back into an all-reduce over every expert shard.
-                moe_kwargs["out_sharding"] = jax.typeof(hidden_states).sharding
+                moe_kwargs["out_sharding"] = split_sharding or token_sharding
             hidden_states = self.mlp(hidden_states, moe_weights, moe_ids, **moe_kwargs)
 
             if shared_output is not None:
                 hidden_states = hidden_states + shared_output
+            if split_sharding is not None:
+                hidden_states = jax.sharding.reshard(hidden_states, token_sharding)
         else:
             hidden_states = self.mlp(hidden_states)
             topk_ids = None

@@ -667,12 +667,7 @@ class EPMoE(nnx.Module):
         )
         scatter_on_tensor = "tensor" in out_specs
         replicas = self.moe_replicas
-        gather_rs = (
-            MOE_GATHER_RS
-            and self.tp_size == 1
-            and self.ep_size > 1
-            and hidden_states.shape[0] % (self.ep_size * replicas) == 0
-        )
+        gather_rs = self.gather_rs_applies(hidden_states.shape[0])
         gather_int8 = gather_rs and MOE_GATHER_INT8
         # With replicas each one gathers only its own block of tokens.
         token_spec = P("replica") if gather_rs and replicas > 1 else P(None)
@@ -757,6 +752,19 @@ class EPMoE(nnx.Module):
         # the original mesh so downstream ops (residual add, layernorm) see a
         # consistent context.
         return jax.sharding.reshard(result, out_sharding)
+
+    def gather_rs_applies(self, num_tokens: int) -> bool:
+        """Whether ``num_tokens`` take the gather / reduce-scatter exchange (MOE_GATHER_RS),
+        whose combine leaves every (replica, expert) shard its own block of tokens: the
+        layout P(("data", "tensor")) of the model mesh."""
+        return (
+            MOE_GATHER_RS
+            and not self.replicate_experts
+            and not self._use_a2a(num_tokens)
+            and self.tp_size == 1
+            and self.ep_size > 1
+            and num_tokens % (self.ep_size * self.moe_replicas) == 0
+        )
 
     def _use_a2a(self, num_tokens: int) -> bool:
         return (
@@ -1121,15 +1129,18 @@ class EPMoE(nnx.Module):
         i = jnp.arange(cap, dtype=jnp.int32)
         flat = sorted_selected_experts[jnp.minimum(start + i, num_tokens * top_k - 1)]
         valid = i < n_local
-        # Rows of other shards add zero into a spare row, so every index is in
-        # bounds: the v5e scatter emitter crashed on the out-of-bounds drop form.
-        tokens = jnp.where(valid, flat // top_k, num_tokens)
+        # Rows of other shards add an exact zero into row 0, so every index is in
+        # bounds (the v5e scatter emitter crashed on the out-of-bounds drop form)
+        # without a spare row, whose removal copied the [tokens, hidden] buffer.
+        tokens = jnp.where(valid, flat // top_k, 0)
         w = jnp.where(valid, jnp.ravel(weights)[flat].astype(jnp.float32), 0.0)
         acc_dtype = self.dtype if MOE_COMBINE_BF16 else jnp.float32
-        contrib = (intermediate.astype(jnp.float32) * w[:, None]).astype(acc_dtype)
-        out = jnp.zeros((num_tokens + 1, intermediate.shape[1]), acc_dtype)
+        contrib = jnp.where(
+            valid[:, None], intermediate.astype(jnp.float32) * w[:, None], 0.0
+        ).astype(acc_dtype)
+        out = jnp.zeros((num_tokens, intermediate.shape[1]), acc_dtype)
         out = out.at[tokens].add(contrib, mode="promise_in_bounds")
-        return out[:num_tokens].astype(self.dtype)
+        return out.astype(self.dtype)
 
     def _combine_replicas(self, output, *, tokens_split: bool):
         """Combine with replicas.

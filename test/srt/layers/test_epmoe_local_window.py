@@ -164,6 +164,45 @@ def test_gather_rs_with_dp_sharded_output(monkeypatch):
     np.testing.assert_allclose(outs[1], outs[0], rtol=0, atol=1e-5)
 
 
+@pytest.mark.parametrize("replicas", [1, 2])
+def test_gather_rs_token_split_output(monkeypatch, replicas):
+    """gather_rs_applies says when the combine leaves tokens split over (data, tensor);
+    asking for that layout returns the same values without the gather over tensor, and
+    batches off the gather/RS exchange report False."""
+    monkeypatch.setattr(moe, "MOE_GATHER_RS", True)
+    monkeypatch.setattr(moe, "MOE_LOCAL_WINDOW", True)
+    monkeypatch.setattr(moe, "MOE_REPLICAS", replicas)
+    mesh = create_device_mesh(
+        ici_parallelism=[2, 4], dcn_parallelism=[1, 1], devices=jax.devices()[:8]
+    )
+    with jax.set_mesh(mesh):
+        layer = moe.EPMoE(
+            hidden_size=32,
+            num_experts=8,
+            num_experts_per_tok=4,
+            ep_size=8 // replicas,
+            mesh=mesh,
+            intermediate_dim=16,
+            weight_dtype=jnp.float32,
+            dtype=jnp.float32,
+        )
+    assert layer.gather_rs_applies(64) and not layer.gather_rs_applies(60)
+    rng = np.random.default_rng(13 + replicas)
+    ids, w = _route(rng, 64, 8, 4, 1.5)
+    P = jax.sharding.PartitionSpec
+    dp = jax.sharding.NamedSharding(mesh, P("data", None))
+    split = jax.sharding.NamedSharding(mesh, P(("data", "tensor"), None))
+    with jax.set_mesh(mesh):
+        x = jax.device_put(jnp.asarray(rng.standard_normal((64, 32)) * 0.1, jnp.float32), dp)
+        wd, idd = jax.device_put(jnp.asarray(w), dp), jax.device_put(jnp.asarray(ids), dp)
+        y_dp = layer(x, wd, idd, out_sharding=dp)
+        y_split = layer(x, wd, idd, out_sharding=split)
+    assert y_split.sharding.spec[0] == ("data", "tensor")
+    np.testing.assert_allclose(np.asarray(y_split), np.asarray(y_dp), rtol=0, atol=1e-6)
+    monkeypatch.setattr(moe, "MOE_GATHER_RS", False)
+    assert not layer.gather_rs_applies(64)
+
+
 @pytest.mark.parametrize("m", [64, 60])
 @pytest.mark.parametrize("window", [False, True])
 @pytest.mark.parametrize("int8", [False, True])
