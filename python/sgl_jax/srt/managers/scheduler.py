@@ -2130,8 +2130,6 @@ class Scheduler(
         preempted = self._preempted_chunked()
         if not _CHUNK_PREEMPT or self.pd or self.is_mixed_chunk:
             return []
-        if self.spec_algorithm is not None and not self.spec_algorithm.is_none():
-            return []
         step = getattr(self, "_prefill_sched_step", 0)
         max_running = getattr(self, "per_dp_max_running_requests", None)
         short = [False] * self.dp_size
