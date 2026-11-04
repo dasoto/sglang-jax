@@ -148,14 +148,25 @@ def get_child_key(key: RadixKey, page_size: int = 1):
         return ((key.extra_key, key.dp_rank), plain_key)
 
 
-def _convert_to_bigram_key(tokens: list[int]) -> list[tuple[int, int]]:
+# A bigram (a, b) is stored as the single int ((a + 1) << 32) | b, so tree walks compare
+# ints rather than tuples. Every packed id is >= 2**32, which no token id reaches; that is
+# how an already converted key is recognized.
+_BIGRAM_MIN = 1 << 32
+
+
+def _pack_bigram(a: int, b: int) -> int:
+    return ((int(a) + 1) << 32) | int(b)
+
+
+def _convert_to_bigram_key(tokens: list[int]) -> list[int]:
     # EAGLE uses bigram keys in the radix tree since draft sequence is the one-token-shifted version of target
-    # [1, 2, 3, 4] -> [(1,2), (2,3), (3,4)]
+    # [1, 2, 3, 4] -> [(1,2), (2,3), (3,4)], each pair packed into one int (see _BIGRAM_MIN)
+    if len(tokens) and tokens[0] >= _BIGRAM_MIN:
+        return tokens
     if len(tokens) < 2:
         return []
-    if isinstance(tokens[0], tuple):
-        return tokens
-    return [(tokens[i], tokens[i + 1]) for i in range(len(tokens) - 1)]
+    ids = np.asarray(tokens, dtype=np.int64)
+    return (((ids[:-1] + 1) << 32) | ids[1:]).tolist()
 
 
 class RadixCache(BasePrefixCache):
@@ -204,11 +215,35 @@ class RadixCache(BasePrefixCache):
             self.get_child_key_fn = partial(get_child_key, page_size=page_size)
         self.reset()
 
-    def _create_tokens_data(self, tokens: list[int]) -> np.ndarray:
-        if self.disable:
-            return np.array(tokens, dtype=np.int32)
+    def bigram_key_for_req(self, req, key: RadixKey) -> RadixKey:
+        """``key``, a prefix of ``req``'s radix token sequence, in EAGLE bigram form.
 
-        return np.array(tokens, dtype=np.int32)
+        The request keeps the bigrams of the longest prefix converted so far, so the
+        scheduler's repeated lookups of one request (queue probes, chunk caching, prefix
+        matches) convert each token once rather than the whole prompt on every call.
+        Returns ``key`` unchanged outside EAGLE mode.
+        """
+        ids = key.token_ids
+        n = len(ids) - 1
+        if not self.is_eagle or req is None or n < 1 or ids[0] >= _BIGRAM_MIN:
+            return key
+        memo = getattr(req, "_radix_bigrams", None) or []
+        m = min(len(memo), n)
+        # The sequence only grows; a mismatch at either end of the overlap means the
+        # memo belongs to another sequence (it is rebuilt).
+        if m and (
+            memo[0] != _pack_bigram(ids[0], ids[1])
+            or memo[m - 1] != _pack_bigram(ids[m - 1], ids[m])
+        ):
+            memo, m = [], 0
+        if m < n:
+            memo.extend(_convert_to_bigram_key(ids[m : n + 1]))
+        req._radix_bigrams = memo
+        return RadixKey(memo[:n], key.extra_key, key.dp_rank)
+
+    def _create_tokens_data(self, tokens: list[int]) -> np.ndarray:
+        # Packed EAGLE bigram ids do not fit in int32.
+        return np.array(tokens, dtype=np.int64 if self.is_eagle else np.int32)
 
     def reset(self):
         self.root_node = TreeNode()
@@ -234,6 +269,7 @@ class RadixCache(BasePrefixCache):
             )
 
         # Convert and align key
+        key = self.bigram_key_for_req(params.req, key)
         converted_key = RadixKey(self.key_convert_fn(key.token_ids), key.extra_key, key.dp_rank)
 
         if self.page_size != 1:
@@ -242,21 +278,12 @@ class RadixCache(BasePrefixCache):
 
         token_sequences, last_node = self._match_prefix_helper(self.root_node, converted_key)
 
-        if token_sequences:
-            valid_tokens = []
-            for tokens in token_sequences:
-                if tokens is not None and len(tokens) > 0:
-                    if isinstance(tokens, (list, tuple)):
-                        valid_tokens.extend(tokens)
-                    elif isinstance(tokens, np.ndarray):
-                        valid_tokens.extend(tokens.tolist())
-
-            if valid_tokens:
-                matched_tokens = np.array(valid_tokens, dtype=np.int32)
-            else:
-                matched_tokens = np.empty((0,), dtype=np.int32)
-        else:
-            matched_tokens = np.empty((0,), dtype=np.int32)
+        parts = [
+            np.asarray(tokens, dtype=np.int32)
+            for tokens in token_sequences
+            if tokens is not None and len(tokens) > 0
+        ]
+        matched_tokens = np.concatenate(parts) if parts else np.empty((0,), dtype=np.int32)
 
         return MatchResult(
             device_indices=matched_tokens,
@@ -292,9 +319,12 @@ class RadixCache(BasePrefixCache):
             child.last_access_time = now
             child_ids = child.key.token_ids
             limit = min(len(child_ids), n - off)
-            i = 0
-            while i < limit and child_ids[i : i + step] == ids[off + i : off + i + step]:
-                i += step
+            if limit == len(child_ids) and child_ids == ids[off : off + limit]:
+                i = limit  # the whole node matches: one comparison instead of one per page
+            else:
+                i = 0
+                while i < limit and child_ids[i : i + step] == ids[off + i : off + i + step]:
+                    i += step
             off += i
             if i < len(child_ids):
                 break
@@ -378,7 +408,7 @@ class RadixCache(BasePrefixCache):
             # Radix Cache takes over one reference from memory pool
             new_prefix_len = self.insert(
                 InsertParams(
-                    key=radix_key[:page_aligned_token_len],
+                    key=self.bigram_key_for_req(req, radix_key[:page_aligned_token_len]),
                     value=page_aligned_kv_indices,
                 )
             )
@@ -414,7 +444,8 @@ class RadixCache(BasePrefixCache):
         # For EAGLE, the page_aligned_len is for the bigram key, the normal key len should +1
         page_aligned_token_len = page_aligned_len + 1 if self.is_eagle else page_aligned_len
         # Real fill_ids drive kv slicing above; the KEY uses the hash-substituted ids.
-        radix_key = build_radix_key(req, page_aligned_token_len)
+        # Converted once here: insert and match_prefix below take the bigram key as is.
+        radix_key = self.bigram_key_for_req(req, build_radix_key(req, page_aligned_token_len))
 
         # cache_protected_len, not len(prefix_indices): see cache_finished_req above.
         old_prefix_len = req.cache_protected_len

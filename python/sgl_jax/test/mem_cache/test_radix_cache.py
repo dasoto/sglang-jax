@@ -26,8 +26,10 @@ from sgl_jax.srt.mem_cache.radix_cache import (
     RadixCache,
     RadixKey,
     TreeNode,
+    _convert_to_bigram_key,
     _key_match_page_size1,
     _key_match_paged,
+    _pack_bigram,
 )
 from sgl_jax.srt.utils.mesh_utils import create_device_mesh
 from sgl_jax.test.test_utils import CustomTestCase
@@ -86,6 +88,7 @@ class TestRadixCache(CustomTestCase):
             layer_num=self.layer_num,
             max_seq_len=self.max_seq_len,
             dtype=self.dtype,
+            is_eagle=kwargs.get("is_eagle", False),
         )
         return cache
 
@@ -602,6 +605,76 @@ class TestRadixCache(CustomTestCase):
         cache = self._create_radix_cache(req_pool, allocator, disable=True)
         self.assertEqual(cache.probe_and_touch_prefix(RadixKey([1, 2, 3], None, 0)), 0)
 
+    def test_eagle_bigram_keys_pack_token_pairs(self):
+        """EAGLE keys pack each token pair into one int; converting a key twice is a no-op."""
+        packed = _convert_to_bigram_key([1, 2, 3, 4])
+        self.assertEqual(packed, [_pack_bigram(1, 2), _pack_bigram(2, 3), _pack_bigram(3, 4)])
+        self.assertEqual(_convert_to_bigram_key(packed), packed)
+        self.assertEqual(_convert_to_bigram_key(packed[:1]), packed[:1])
+        self.assertEqual(_convert_to_bigram_key([7]), [])
+        self.assertEqual(_convert_to_bigram_key([]), [])
+        self.assertNotEqual(_pack_bigram(0, 5), _pack_bigram(5, 0))
+        self.assertGreaterEqual(_pack_bigram(0, 0), 1 << 32)
+
+    def test_eagle_match_and_probe_count_bigrams(self):
+        """An EAGLE tree matches bigrams: n shared tokens are n - 1 cached entries."""
+        req_pool, allocator = self._create_auto_device_setup()
+        for page_size in (1, 2):
+            cache = self._create_radix_cache(
+                req_pool, allocator, is_eagle=True, page_size=page_size
+            )
+            cache.insert(InsertParams(key=RadixKey([1, 2, 3, 4, 5], None, 0)))
+            cache.insert(InsertParams(key=RadixKey([1, 2, 3, 9], None, 0)))
+            cases = (([1, 2, 3, 4, 5, 6], 4), ([1, 2, 3, 4, 7], 3), ([1, 2, 8], 1), ([2, 3], 0))
+            for tokens, expected in cases:
+                expected = expected // page_size * page_size
+                key = RadixKey(tokens, None, 0)
+                self.assertEqual(cache.probe_and_touch_prefix(key), expected, (page_size, tokens))
+                match = cache.match_prefix(MatchPrefixParams(key=key))
+                self.assertEqual(len(match.device_indices), expected, (page_size, tokens))
+            self.assertEqual(cache.probe_and_touch_prefix(RadixKey([1, 2, 3], None, 1)), 0)
+
+    def test_eagle_bigram_key_for_req_converts_each_token_once(self):
+        """The request memo extends with the sequence and rebuilds for another sequence."""
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator, is_eagle=True)
+        seq = list(range(100, 180))
+        req = type("Req", (), {})()
+        key = cache.bigram_key_for_req(req, RadixKey(seq[:50], "ns", 3))
+        self.assertEqual(key.token_ids, _convert_to_bigram_key(seq[:50]))
+        self.assertEqual((key.extra_key, key.dp_rank), ("ns", 3))
+        memo = req._radix_bigrams
+        self.assertEqual(len(memo), 49)
+
+        key = cache.bigram_key_for_req(req, RadixKey(seq, "ns", 3))
+        self.assertIs(req._radix_bigrams, memo)
+        self.assertEqual(key.token_ids, _convert_to_bigram_key(seq))
+        key = cache.bigram_key_for_req(req, RadixKey(seq[:20], "ns", 3))
+        self.assertEqual(key.token_ids, _convert_to_bigram_key(seq[:20]))
+        self.assertEqual(len(req._radix_bigrams), 79)
+
+        other = seq[:30] + [7] * 50
+        key = cache.bigram_key_for_req(req, RadixKey(other, "ns", 3))
+        self.assertEqual(key.token_ids, _convert_to_bigram_key(other))
+        self.assertIs(cache.bigram_key_for_req(req, key), key)
+
+        plain = self._create_radix_cache(req_pool, allocator)
+        plain_key = RadixKey(seq, None, 0)
+        self.assertIs(plain.bigram_key_for_req(req, plain_key), plain_key)
+
+    def test_eagle_match_prefix_with_req_matches_without(self):
+        req_pool, allocator = self._create_auto_device_setup()
+        cache = self._create_radix_cache(req_pool, allocator, is_eagle=True)
+        seq = list(range(10, 40))
+        cache.insert(InsertParams(key=RadixKey(seq, None, 0), value=np.arange(29, dtype=np.int32)))
+        req = type("Req", (), {})()
+        for tokens in (seq[:12], seq + [5, 6], seq[:20] + [1]):
+            key = RadixKey(tokens, None, 0)
+            plain = cache.match_prefix(MatchPrefixParams(key=key))
+            memo = cache.match_prefix(MatchPrefixParams(key=key, req=req))
+            np.testing.assert_array_equal(plain.device_indices, memo.device_indices)
+            self.assertIs(plain.last_device_node, memo.last_device_node)
+
 
 class MockRequest:
     """mock request object for testing cache request functionality"""
@@ -756,6 +829,49 @@ class TestRadixCacheWithRequests(CustomTestCase):
             disabled_cache.cache_unfinished_req(mock_req)
         except Exception as e:
             self.fail(f"cache_unfinished_req raised an exception: {e}")
+
+    def test_eagle_cache_unfinished_then_finished_req(self):
+        """Chunk caching and completion insert the request's bigram key, extending its memo."""
+        cache = RadixCache(
+            req_to_token_pool=self.req_pool,
+            token_to_kv_pool_allocator=self.allocator,
+            page_size=1,
+            kv_head_num=self.kv_head_num,
+            head_dim=self.head_dim,
+            layer_num=self.layer_num,
+            max_seq_len=self.max_seq_len,
+            dtype=self.dtype,
+            is_eagle=True,
+        )
+        seq = list(range(200, 216))
+        kv = self.allocator.alloc(len(seq))
+        self.req_pool.write((0, slice(0, len(seq))), kv)
+        req = MockRequest(
+            req_pool_idx=0,
+            origin_input_ids=seq,
+            output_ids=[],
+            fill_ids=seq[:10],
+            prefix_indices=np.empty((0,), dtype=np.int32),
+            last_node=cache.root_node,
+        )
+        req.last_matched_prefix_len = 0
+
+        # First chunk: 10 tokens are 9 bigrams; the 10th token's KV stays attached.
+        cache.cache_unfinished_req(req)
+        self.assertEqual(len(req._radix_bigrams), 9)
+        np.testing.assert_array_equal(req.prefix_indices, kv[:10])
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(seq, None, None)))
+        np.testing.assert_array_equal(match.device_indices, kv[:9])
+
+        req.fill_ids = seq
+        cache.cache_unfinished_req(req)
+        self.assertEqual(len(req._radix_bigrams), 15)
+        np.testing.assert_array_equal(req.prefix_indices, kv)
+
+        cache.cache_finished_req(req)
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(seq + [1], None, None)))
+        np.testing.assert_array_equal(match.device_indices, kv[:15])
+        self.assertEqual(cache.probe_and_touch_prefix(RadixKey(seq, None, None)), 15)
 
 
 if __name__ == "__main__":

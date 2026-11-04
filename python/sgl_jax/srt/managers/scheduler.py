@@ -902,16 +902,26 @@ class Scheduler(
     ) -> int:
         """Length of the longest cached prefix for ``token_ids`` on ``dp_rank``.
 
-        Probes the dp-keyed tree (no alloc, no CoW), but incurs the normal
-        ``match_prefix`` side effects (LRU refresh, possible node split). Returns
-        0 for non-radix caches (ChunkCache returns an empty match).
+        Probes the dp-keyed tree read-only with ``probe_and_touch_prefix`` (no alloc,
+        no CoW, no node split; it refreshes the LRU time of the matched path). Caches
+        without it fall back to ``match_prefix`` and its side effects. Returns 0 for
+        non-radix caches (ChunkCache returns an empty match).
         """
         if self.tree_cache is None:
             return 0
-        result = self.tree_cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(token_ids, extra_key, dp_rank))
-        )
-        return len(result.device_indices)
+        probe_fn = getattr(self.tree_cache, "probe_and_touch_prefix", None)
+        if probe_fn is None:
+            result = self.tree_cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(token_ids, extra_key, dp_rank))
+            )
+            return len(result.device_indices)
+        if getattr(self.tree_cache, "is_eagle", False) and token_ids:
+            # The router probes every rank with the same list: convert it to bigrams once.
+            if getattr(self, "_lookup_prefix_ids", None) is not token_ids:
+                self._lookup_prefix_ids = token_ids
+                self._lookup_prefix_bigrams = self.tree_cache.key_convert_fn(token_ids)
+            token_ids = self._lookup_prefix_bigrams
+        return probe_fn(RadixKey(token_ids, extra_key, dp_rank))
 
     def _iter_dp_requests(self):
         """Enumerate request owners; DpLoadSnapshot deduplicates shared references.
@@ -1770,6 +1780,8 @@ class Scheduler(
         probe_fn = getattr(self.tree_cache, "probe_and_touch_prefix", None)
         if probe_fn is None:
             return
+        # EAGLE trees key on token bigrams; the request memoizes its converted key.
+        bigram_key = getattr(self.tree_cache, "bigram_key_for_req", None)
         for req in self.waiting_queue:
             if req.dp_rank is None:
                 continue
@@ -1777,7 +1789,10 @@ class Scheduler(
             if not isinstance(ids, list) or not ids or not isinstance(ids[0], int):
                 ids = list(req.origin_input_ids)
             if len(ids) > 1:
-                cached_len = probe_fn(RadixKey(ids[: len(ids) - 1], req.extra_key, req.dp_rank))
+                key = RadixKey(ids[: len(ids) - 1], req.extra_key, req.dp_rank)
+                if bigram_key is not None:
+                    key = bigram_key(req, key)
+                cached_len = probe_fn(key)
             else:
                 cached_len = 0
             req._uncached_prefill_tokens = max(0, len(ids) - cached_len)
