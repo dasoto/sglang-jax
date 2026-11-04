@@ -7,10 +7,13 @@ from jax.sharding import AxisType, Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
 from sgl_jax.srt.layers.attention.flashattention_backend import FlashAttentionMetadata
+from sgl_jax.srt.speculative import draft_extend_fused
 from sgl_jax.srt.speculative.draft_extend_fused import (
     _make_draft_extend_metadata,
     _make_target_verify_metadata,
+    _pad_draft_tokens,
     _per_dp_cumsum_device,
+    _prefill_draft_steps,
 )
 
 
@@ -277,3 +280,23 @@ def test_sampled_precompile_info_selects_the_chat_default_verify_program():
     np.testing.assert_array_equal(temps, np.ones((bs, 1), np.float32))
     chat = dataclasses.replace(sampled, temperatures=np.full((bs, 1), 0.7, np.float32))
     assert _prepare_rejection_sampling(chat, batch, bs, vocab)[3:] == (False, False)
+
+
+def test_prefill_draft_steps_runs_one_pass_for_single_block_chains(monkeypatch):
+    """Only a single-block chain (whose later steps' pool versions are discarded) skips steps."""
+    monkeypatch.setattr(draft_extend_fused, "_PREFILL_STEPS", 1)
+    assert _prefill_draft_steps(3, num_blocks=1, num_pools=1) == 1
+    assert _prefill_draft_steps(3, num_blocks=3, num_pools=3) == 3
+    assert _prefill_draft_steps(3, num_blocks=1, num_pools=2) == 3
+    monkeypatch.setattr(draft_extend_fused, "_PREFILL_STEPS", 0)
+    assert _prefill_draft_steps(3, num_blocks=1, num_pools=1) == 3
+    monkeypatch.setattr(draft_extend_fused, "_PREFILL_STEPS", 5)
+    assert _prefill_draft_steps(3, num_blocks=1, num_pools=1) == 3
+
+
+def test_pad_draft_tokens_repeats_the_last_computed_draft():
+    one = jax.numpy.asarray([[7], [9]], dtype=jax.numpy.int32)
+    np.testing.assert_array_equal(np.asarray(_pad_draft_tokens(one, 3)), [[7, 7, 7], [9, 9, 9]])
+    two = jax.numpy.asarray([[1, 2], [3, 4]], dtype=jax.numpy.int32)
+    np.testing.assert_array_equal(np.asarray(_pad_draft_tokens(two, 3)), [[1, 2, 2], [3, 4, 4]])
+    assert _pad_draft_tokens(two, 2) is two

@@ -79,6 +79,35 @@ _CHAIN_ALL = _CHAIN_POOL_MODE == "all"
 # 0 everywhere (the caller keeps exactly step 0's version).
 _CHAIN_POOL_CHECK = os.environ.get("SGLANG_JAX_MTP_CHAIN_POOL_CHECK", "0") == "1"
 
+# Draft steps the fused prefill runs over the whole prompt for a single-block chain
+# (see _prefill_draft_steps); 0 runs all of them.
+_PREFILL_STEPS = int(os.environ.get("SGLANG_JAX_MTP_PREFILL_STEPS", "1"))
+
+
+def _prefill_draft_steps(num_steps: int, num_blocks: int, num_pools: int) -> int:
+    """Draft steps the fused prefill runs over every prompt token.
+
+    A single-block chain (one MTP layer applied ``num_steps`` times, one draft pool)
+    keeps only step 0's pool version, so the later steps over the prompt yield nothing
+    but one draft token per request for its first decode step, at the cost of a full
+    draft-layer pass over the batch each. SGLANG_JAX_MTP_PREFILL_STEPS (default 1)
+    runs that many steps; the first decode step's remaining drafts repeat the last
+    computed one (_pad_draft_tokens) and verify rejects them when wrong. Multi-block
+    chains keep every step's pool, so they run all steps.
+    """
+    if num_blocks > 1 or num_pools > 1 or _PREFILL_STEPS <= 0:
+        return num_steps
+    return min(num_steps, _PREFILL_STEPS)
+
+
+def _pad_draft_tokens(draft_tokens, num_steps: int):
+    """Extend ``draft_tokens`` [bs, k, ...] to ``num_steps`` columns by repeating column k - 1."""
+    k = draft_tokens.shape[1]
+    if k >= num_steps:
+        return draft_tokens
+    pad = jnp.repeat(draft_tokens[:, -1:], num_steps - k, axis=1)
+    return jnp.concatenate([draft_tokens, pad], axis=1)
+
 
 def _chain_pool_leaf_names(tree):
     """Host-side names for the leaves compared by _chain_pool_diff_arrays."""
@@ -2007,7 +2036,8 @@ def _build_prefill(num_layers: int, topk: int, hidden_relay=None):
         draft_forward_batch.spec_info.hidden_states = step_hidden
         draft_positions0 = draft_forward_batch.positions
         relay_on = _chained_relay(hidden_relay, num_layers, len(draft_all_leaves))
-        for i in range(num_layers):
+        run_steps = _prefill_draft_steps(num_layers, len(draft_all_leaves), len(all_memory_pools))
+        for i in range(run_steps):
             leaf_idx = i if i < len(draft_all_leaves) else -1
             pool_idx = i if i < len(all_memory_pools) else -1
             state = jax.tree_util.tree_unflatten(draft_model_state_def, draft_all_leaves[leaf_idx])
@@ -2029,7 +2059,7 @@ def _build_prefill(num_layers: int, topk: int, hidden_relay=None):
             all_topk_index.append(topk_idx)
             if i == 0:
                 layer0_hidden = output.hidden_states
-            if i < num_layers - 1:
+            if i < run_steps - 1:
                 input_ids = _rotate_prefill_input_ids(
                     input_ids,
                     draft_forward_batch.extend_seq_lens,
@@ -2058,6 +2088,7 @@ def _build_prefill(num_layers: int, topk: int, hidden_relay=None):
             stacked_idx = jnp.stack([idx[:, 0] for idx in all_topk_index], axis=1)
         else:
             stacked_idx = jnp.stack(all_topk_index, axis=1)
+        stacked_idx = _pad_draft_tokens(stacked_idx, num_layers)
         relay_hidden = selected_layer0_hidden
         relay_topk_index = stacked_idx
         relay_verified_id = next_token_ids
