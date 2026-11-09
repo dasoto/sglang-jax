@@ -29,6 +29,7 @@ from sgl_jax.srt.constrained.base_grammar_backend import (
     INVALID_GRAMMAR_OBJ,
     create_grammar_backend,
 )
+from sgl_jax.srt.disaggregation.common.memlog import maybe_log_device_memory
 from sgl_jax.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sgl_jax.srt.disaggregation.pathways_scheduler import PathwaysPDSchedulerMixin
 from sgl_jax.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
@@ -1018,6 +1019,7 @@ class Scheduler(
             if self._engine_paused:
                 continue
 
+            maybe_log_device_memory("agg")
             _it1 = time.perf_counter() if self.pd == "pathways" else 0.0
             batch = self.get_next_batch_to_run()
             self.cur_batch = batch
@@ -1139,6 +1141,7 @@ class Scheduler(
                 self.on_idle()
 
             self.last_batch = batch
+            maybe_log_device_memory("agg")
             if _pd_iter_trace:
                 _it3 = time.perf_counter()
                 if _it3 - _it0 > 0.5:

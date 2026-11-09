@@ -28,6 +28,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# HBM per device the target holds back from its KV pool for a speculative draft (its pool
+# and spec buffers are allocated after the target's). The default keeps the original 1 GB;
+# a NextN draft's pool is small (e.g. ~61 MB per chip for GLM-5.3 at 17M tokens).
+_SPEC_DRAFT_RESERVE_BYTES = int(os.environ.get("SGLANG_JAX_SPEC_DRAFT_RESERVE_MB", "1024")) << 20
+
 
 # ---------------------------------------------------------------------------
 # Module-level pure functions (from epic hybrid_recurrent_utils.py)
@@ -515,8 +520,8 @@ class ModelRunnerKVCacheMixin:
             and self.spec_algorithm is not None
             and not self.spec_algorithm.is_none()
         ):
-            # Reserve 2 GB entirely for the Draft Worker's KV buffer and XLA fragmentation.
-            overhead_bytes = 1 * 1024 * 1024 * 1024
+            # Reserve HBM for the draft worker's KV pool and spec buffers.
+            overhead_bytes = _SPEC_DRAFT_RESERVE_BYTES
             logger.info(
                 "Deducting %d bytes from available KV cache for draft memory overhead",
                 overhead_bytes,
