@@ -111,6 +111,19 @@ class TestSchedulerDpRebalance(unittest.TestCase):
         np.testing.assert_array_equal(got[: 2 * PS], have)
         self.assertEqual(len(got), 6 * PS)
 
+    def test_copy_keeps_the_destination_reserve(self):
+        self._cache(self.prompt, 0)
+        req = self._req(self.prompt + [7, 8], 0)
+        # Fill rank 1 so that copying 6 pages would leave less than the reserve.
+        free = self.alloc.available_size(1)
+        self.alloc.alloc(free - 8 * PS, dp_rank=1)
+        with patch.object(sched_mod, "_DP_REBALANCE_RESERVE", 0.1):
+            self.assertFalse(self.s._dp_migrate_waiting_req(req, 0, 1))
+        self.assertEqual(req.dp_rank, 0)
+        self.assertEqual(self.s.dp_page_migrator.copies, [])
+        with patch.object(sched_mod, "_DP_REBALANCE_RESERVE", 0.0):
+            self.assertTrue(self.s._dp_migrate_waiting_req(req, 0, 1))
+
     def test_uncached_request_moves_without_a_copy(self):
         req = self._req(self.prompt, 0)
         self.assertTrue(self.s._dp_migrate_waiting_req(req, 0, 1))

@@ -156,6 +156,9 @@ _DP_REBALANCE_FORCE = os.environ.get("SGLANG_JAX_DP_REBALANCE_FORCE", "0") == "1
 # chunked prefill in progress (a short moved request can preempt it; otherwise it queues there).
 _DP_REBALANCE_PER_RANK = int(os.environ.get("SGLANG_JAX_DP_REBALANCE_PER_RANK", "1"))
 _DP_REBALANCE_BUSY_DEST = os.environ.get("SGLANG_JAX_DP_REBALANCE_BUSY_DEST", "0") == "1"
+# A copy must leave this fraction of the destination's KV pool free or evictable: admission reserves room for a
+# rank's chunked prefill and decode growth, and a copy bypasses those reservations.
+_DP_REBALANCE_RESERVE = float(os.environ.get("SGLANG_JAX_DP_REBALANCE_RESERVE", "0.15"))
 # A moved request not admitted within this many prefill rounds gives up its lock on the copied prefix.
 _DP_REBALANCE_LOCK_ROUNDS = 64
 
@@ -1922,9 +1925,12 @@ class Scheduler(
             stats[2] += 1
             return True
 
+        j0, j1 = lb // ps, m // ps
+        reserve = int(_DP_REBALANCE_RESERVE * alloc.size_per_rank)
+        if alloc.available_size(b) + tree.evictable_size(b) - (j1 - j0) * ps < reserve:
+            return False
         tree.inc_lock_ref(res_b.last_device_node)  # keep b's shared prefix while making room
         dcp = self.dp_page_migrator.dcp
-        j0, j1 = lb // ps, m // ps
         target = (np.arange(j0, j1) % dcp).astype(np.int32)
 
         def pop_pages():
