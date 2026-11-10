@@ -124,6 +124,14 @@ class TestSchedulerDpRebalance(unittest.TestCase):
         with patch.object(sched_mod, "_DP_REBALANCE_RESERVE", 0.0):
             self.assertTrue(self.s._dp_migrate_waiting_req(req, 0, 1))
 
+    def test_copy_limit_keeps_long_prefixes_home(self):
+        self._cache(self.prompt, 0)
+        req = self._req(self.prompt + [7, 8], 0)
+        with patch.object(sched_mod, "_DP_REBALANCE_MAX_COPY", 5 * PS):
+            self.assertFalse(self.s._dp_migrate_waiting_req(req, 0, 1))  # needs 6 pages
+        with patch.object(sched_mod, "_DP_REBALANCE_MAX_COPY", 6 * PS):
+            self.assertTrue(self.s._dp_migrate_waiting_req(req, 0, 1))
+
     def test_uncached_request_moves_without_a_copy(self):
         req = self._req(self.prompt, 0)
         self.assertTrue(self.s._dp_migrate_waiting_req(req, 0, 1))

@@ -159,6 +159,10 @@ _DP_REBALANCE_BUSY_DEST = os.environ.get("SGLANG_JAX_DP_REBALANCE_BUSY_DEST", "0
 # A copy must leave this fraction of the destination's KV pool free or evictable: admission reserves room for a
 # rank's chunked prefill and decode growth, and a copy bypasses those reservations.
 _DP_REBALANCE_RESERVE = float(os.environ.get("SGLANG_JAX_DP_REBALANCE_RESERVE", "0.15"))
+# Requests whose move would copy more than this many tokens stay (-1 = no limit). Each copy also evicts the
+# destination's cache and leaves a stale copy on the source: moving every ~100K-token session (run 66) dropped
+# the hit rate from ~93.5% to ~89.9% and throughput by 22%.
+_DP_REBALANCE_MAX_COPY = int(os.environ.get("SGLANG_JAX_DP_REBALANCE_MAX_COPY", "-1"))
 # A moved request not admitted within this many prefill rounds gives up its lock on the copied prefix.
 _DP_REBALANCE_LOCK_ROUNDS = 64
 
@@ -1926,6 +1930,8 @@ class Scheduler(
             return True
 
         j0, j1 = lb // ps, m // ps
+        if 0 <= _DP_REBALANCE_MAX_COPY < (j1 - j0) * ps:
+            return False
         reserve = int(_DP_REBALANCE_RESERVE * alloc.size_per_rank)
         if alloc.available_size(b) + tree.evictable_size(b) - (j1 - j0) * ps < reserve:
             return False
