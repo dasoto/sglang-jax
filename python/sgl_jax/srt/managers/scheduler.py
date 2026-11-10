@@ -79,7 +79,11 @@ from sgl_jax.srt.managers.scheduler_profiler_mixing import SchedulerProfilerMixi
 from sgl_jax.srt.managers.tp_worker import ModelWorker
 from sgl_jax.srt.managers.tp_worker_overlap_thread import ModelWorkerClient
 from sgl_jax.srt.managers.utils import validate_input_length
-from sgl_jax.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+from sgl_jax.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
+    InsertParams,
+    MatchPrefixParams,
+)
 from sgl_jax.srt.mem_cache.chunk_cache import ChunkCache
 from sgl_jax.srt.mem_cache.common import release_kv_cache
 from sgl_jax.srt.mem_cache.kv_cache_builder import build_kv_cache
@@ -137,6 +141,19 @@ _CHUNK_PREEMPT_SHORT = int(os.environ.get("SGLANG_JAX_CHUNK_PREEMPT_SHORT", "819
 _CHUNK_PREEMPT_LONG = int(os.environ.get("SGLANG_JAX_CHUNK_PREEMPT_LONG", "8192"))
 _CHUNK_PREEMPT_MIN_RUN = int(os.environ.get("SGLANG_JAX_CHUNK_PREEMPT_MIN_RUN", "4"))
 _CHUNK_PREEMPT_MAX_ROUNDS = int(os.environ.get("SGLANG_JAX_CHUNK_PREEMPT_MAX_ROUNDS", "32"))
+# DP rebalancing (off unless SGLANG_JAX_DP_REBALANCE > 0). A decode step costs about the busiest DP group's
+# rows, and with sticky prefix-cache routing the groups' decode rows drift apart (on AgentX the busiest group
+# holds ~1.7x the mean, about what independent sessions give). Before each prefill admission, the next request
+# of a group with at least SGLANG_JAX_DP_REBALANCE more decode rows than the least-loaded admitting group moves
+# there: the part of its cached prefix the destination lacks is copied between the groups' KV pages
+# (DpPageMigrator) and inserted into the destination's radix tree, locked until the request is admitted. At
+# most SGLANG_JAX_DP_REBALANCE_MAX requests move per round. SGLANG_JAX_DP_REBALANCE_FORCE=1 moves every
+# eligible head-of-queue request to the next group regardless of load (correctness tests).
+_DP_REBALANCE_GAP = int(os.environ.get("SGLANG_JAX_DP_REBALANCE", "0"))
+_DP_REBALANCE_MAX = int(os.environ.get("SGLANG_JAX_DP_REBALANCE_MAX", "2"))
+_DP_REBALANCE_FORCE = os.environ.get("SGLANG_JAX_DP_REBALANCE_FORCE", "0") == "1"
+# A moved request not admitted within this many prefill rounds gives up its lock on the copied prefix.
+_DP_REBALANCE_LOCK_ROUNDS = 64
 
 # Test retract decode for debugging purposes
 TEST_RETRACT = get_bool_env_var("SGLANG_TEST_RETRACT")
@@ -640,6 +657,12 @@ class Scheduler(
                 logger.info("[Scheduler] Begins to precompile HiCache transfers.")
                 self.tree_cache.precompile_hicache_transfers()
                 logger.info("[Scheduler] Completes HiCache transfer precompile.")
+
+        self.dp_page_migrator = None
+        # moves with a page copy, pages copied, moves without a copy, window start
+        self._dp_rebalance_stats = [0, 0, 0, time.monotonic()]
+        if (_DP_REBALANCE_GAP > 0 or _DP_REBALANCE_FORCE) and self.dp_size > 1 and not self.pd:
+            self._init_dp_page_migrator(server_args)
 
     def _setup_jit_cache(self, server_args: ServerArgs) -> None:
         jit_cache_dir = os.getenv("JAX_COMPILATION_CACHE_DIR", None)
@@ -1325,6 +1348,8 @@ class Scheduler(
             return_routed_experts=recv_req.return_routed_experts,
             return_hidden_states=recv_req.return_hidden_states,
         )
+        # Set by the DP router before it writes its choice into dp_rank.
+        req._dp_pinned = getattr(recv_req, "_dp_pinned", recv_req.dp_rank is not None)
         req.tokenizer = self.tokenizer
         if (
             req.return_hidden_states
@@ -1775,6 +1800,164 @@ class Scheduler(
             mark = getattr(self, "_pd_mark_time", None)
             if mark is not None:
                 mark(req, "queue_entry")
+
+    def _init_dp_page_migrator(self, server_args: ServerArgs) -> None:
+        from sgl_jax.srt.mem_cache.dp_migrate import DpPageMigrator
+
+        tree = self.tree_cache
+        if (
+            tree is None
+            or getattr(tree, "disable", False)
+            or not hasattr(tree, "bigram_key_for_req")
+            or tree.supports_recurrent()
+        ):
+            logger.warning("DP rebalancing needs a plain radix cache; disabled")
+            return
+        pools = [self.tp_worker.model_runner.token_to_kv_pool]
+        draft = getattr(getattr(self, "draft_worker", None), "draft_worker", None)
+        runner = getattr(draft, "draft_model_runner", None) if draft is not None else None
+        if runner is not None:
+            pools.append(runner.token_to_kv_pool)
+        if not all(hasattr(p, "kv_buffer") and hasattr(p, "indexer_key_buffer") for p in pools):
+            logger.warning("DP rebalancing supports paged MLA pools only; disabled")
+            return
+        self.dp_page_migrator = DpPageMigrator(
+            self.mesh, pools, dcp=getattr(self.token_to_kv_pool_allocator, "dcp_size", 1)
+        )
+        if not server_args.disable_precompile:
+            self.dp_page_migrator.precompile()
+        logger.info(
+            "DP rebalancing on: gap %d decode rows, at most %d moves per round%s",
+            _DP_REBALANCE_GAP,
+            _DP_REBALANCE_MAX,
+            " (FORCE: every eligible request moves)" if _DP_REBALANCE_FORCE else "",
+        )
+
+    def _dp_release_migrate_lock(self, req: Req) -> None:
+        node = getattr(req, "_dp_migrate_lock", None)
+        if node is not None:
+            req._dp_migrate_lock = None
+            self.tree_cache.dec_lock_ref(node)
+
+    def _dp_rebalance_waiting(self, running_bs_per_dp: list[int]) -> None:
+        """Move the next request of an overloaded DP group to the group with the fewest decode rows
+        (see _DP_REBALANCE_GAP)."""
+        rows = list(running_bs_per_dp)
+        for g, req in enumerate(self.chunked_reqs):
+            if req is not None:
+                rows[g] += 1  # decodes on its rank once its last chunk is done
+        step = getattr(self, "_prefill_sched_step", 0)
+        preempted = self._preempted_chunked()
+        seen, moved = set(), 0
+        for req in self.waiting_queue:
+            a = req.dp_rank
+            if getattr(req, "_dp_migrate_lock", None) is not None:
+                if step - getattr(req, "_dp_migrate_round", step) > _DP_REBALANCE_LOCK_ROUNDS:
+                    self._dp_release_migrate_lock(req)
+                continue
+            if a is None or a in seen or moved >= _DP_REBALANCE_MAX:
+                continue
+            seen.add(a)  # only each rank's next request: it decodes there soonest
+            if getattr(req, "_dp_pinned", False):
+                continue
+            uncached = getattr(req, "_uncached_prefill_tokens", len(req.origin_input_ids))
+            open_ranks = [
+                g
+                for g in range(self.dp_size)
+                if g != a
+                and self.chunked_reqs[g] is None
+                and not self.running_batch.reqs_info[g].batch_is_full
+                and len(self.running_batch.reqs_info[g].reqs or ())
+                < self.per_dp_max_running_requests
+                and (preempted[g] is None or uncached <= _CHUNK_PREEMPT_SHORT)
+            ]
+            if _DP_REBALANCE_FORCE:
+                b = (a + 1) % self.dp_size
+                if b not in open_ranks:
+                    continue
+            else:
+                if not open_ranks:
+                    continue
+                b = min(open_ranks, key=lambda g: (rows[g], g))
+                if rows[a] - rows[b] < _DP_REBALANCE_GAP:
+                    continue
+            if self._dp_migrate_waiting_req(req, a, b):
+                rows[b] += 1
+                moved += 1
+        stats = self._dp_rebalance_stats
+        now = time.monotonic()
+        if now - stats[3] >= 60.0:
+            if stats[0] or stats[2]:
+                logger.info(
+                    "[dp-rebalance] %.0f s: %d requests moved with %d copied pages, %d without a copy",
+                    now - stats[3],
+                    stats[0],
+                    stats[1],
+                    stats[2],
+                )
+            self._dp_rebalance_stats = [0, 0, 0, now]
+
+    def _dp_migrate_waiting_req(self, req: Req, a: int, b: int) -> bool:
+        """Re-home waiting ``req`` from DP rank ``a`` to ``b``, copying the part of its cached prefix ``b``
+        lacks. Returns False (``req`` stays on ``a``) if ``b`` cannot make room."""
+        tree, alloc, ps = self.tree_cache, self.token_to_kv_pool_allocator, self.page_size
+        stats = self._dp_rebalance_stats
+        key_a = req.match_key()
+        src = (
+            np.asarray(tree.match_prefix(MatchPrefixParams(key=key_a, req=req)).device_indices)
+            if len(key_a)
+            else np.empty(0, np.int64)
+        )
+        m = len(src)
+        key_b = RadixKey(key_a.token_ids, key_a.extra_key, b)
+        res_b = tree.match_prefix(MatchPrefixParams(key=key_b, req=req)) if m else None
+        have = np.asarray(res_b.device_indices, np.int64) if m else np.empty(0, np.int64)
+        lb = len(have)
+        if lb >= m:
+            req.dp_rank = b
+            stats[2] += 1
+            return True
+
+        tree.inc_lock_ref(res_b.last_device_node)  # keep b's shared prefix while making room
+        dcp = self.dp_page_migrator.dcp
+        j0, j1 = lb // ps, m // ps
+        target = (np.arange(j0, j1) % dcp).astype(np.int32)
+
+        def pop_pages():
+            if dcp > 1:
+                return alloc._pop_dcp_pages(b, target)
+            slots = alloc.alloc(len(target) * ps, dp_rank=b)
+            return None if slots is None else slots[::ps] // ps
+
+        dst = pop_pages()
+        if dst is None:
+            tree.evict(EvictParams(num_tokens=2 * len(target) * ps, dp_rank=b))
+            dst = pop_pages()
+        if dst is None:
+            tree.dec_lock_ref(res_b.last_device_node)
+            return False
+        src_pages = np.asarray(src[j0 * ps : j1 * ps : ps], np.int64) // ps
+        self.dp_page_migrator.copy(a, b, src_pages, dst)
+
+        new_slots = (np.asarray(dst, np.int64)[:, None] * ps + np.arange(ps)).reshape(-1)
+        value = np.concatenate([have, new_slots]).astype(np.int32)
+        # The tree keys EAGLE prefixes on token bigrams: m slots need m + 1 tokens.
+        tok_len = m + 1 if getattr(tree, "is_eagle", False) else m
+        ins_key = tree.bigram_key_for_req(
+            req, RadixKey(key_a.token_ids[:tok_len], key_a.extra_key, b)
+        )
+        new_prefix = tree.insert(InsertParams(key=ins_key, value=value))
+        if new_prefix > lb:
+            alloc.free(value[lb:new_prefix], dp_rank=b)
+        tree.dec_lock_ref(res_b.last_device_node)
+        node = tree.match_prefix(MatchPrefixParams(key=key_b, req=req)).last_device_node
+        tree.inc_lock_ref(node)
+        req._dp_migrate_lock = node
+        req._dp_migrate_round = getattr(self, "_prefill_sched_step", 0)
+        req.dp_rank = b
+        stats[0] += 1
+        stats[1] += j1 - j0
+        return True
 
     def _refresh_and_order_waiting_queue(self) -> None:
         self._prefill_sched_step = getattr(self, "_prefill_sched_step", 0) + 1
@@ -2400,6 +2583,8 @@ class Scheduler(
         # Get priority queue
         self.policy.calc_priority(self.waiting_queue)
         self._refresh_and_order_waiting_queue()
+        if getattr(self, "dp_page_migrator", None) is not None:
+            self._dp_rebalance_waiting(running_bs_per_dp)
         preempted_now = self._preempt_or_resume_chunked_reqs(running_bs_per_dp)
         preempted = self._preempted_chunked()
 
@@ -2582,6 +2767,9 @@ class Scheduler(
 
         can_run_set = set(all_can_run_reqs)
         self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        if getattr(self, "dp_page_migrator", None) is not None:
+            for req in all_can_run_reqs:
+                self._dp_release_migrate_lock(req)
 
         # Update chunked requests for each DP rank
         for dp_rank in range(self.dp_size):
@@ -3099,6 +3287,7 @@ class Scheduler(
             # This only works for requests that have not started anything.
             # We still need to send something back to TokenizerManager to clean up the state.
             req = self.waiting_queue.pop(i)
+            self._dp_release_migrate_lock(req)
             abort_out = AbortReq(rid=req.rid)
             if self._comm_backend is not None:
                 self._comm_backend.send_pyobj(abort_out)

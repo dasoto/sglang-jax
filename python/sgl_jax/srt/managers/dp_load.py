@@ -116,6 +116,9 @@ class DpRouter:
         Single-DP and round-robin routing do not need load estimates. A failed
         selection leaves counters untouched so the caller can defer the request.
         """
+        if not hasattr(req, "_dp_pinned"):
+            # Whether the client named the rank; routing writes its choice to the same field.
+            req._dp_pinned = req.dp_rank is not None
         if self.dp_size == 1:
             req.dp_rank = 0
             return 0

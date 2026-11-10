@@ -47,6 +47,17 @@ def test_sticky_request_contributes_to_next_choice(policy):
     assert router.assign(_req("next")) == 1
 
 
+def test_assign_records_whether_the_client_named_the_rank():
+    """DP rebalancing never moves client-pinned requests; routing writes its own choice to dp_rank."""
+    router = _router("cache_aware")
+    routed, pinned = _req("routed"), _req("pinned", rank=1)
+    assert router.assign(routed) == 0 and router.assign(pinned) == 1
+    assert routed._dp_pinned is False
+    assert pinned._dp_pinned is True
+    router.assign(routed)  # a later assignment keeps the original answer
+    assert routed._dp_pinned is False
+
+
 def test_invalid_rank_is_reassigned(caplog):
     router = _router()
     req = _req(rank=99)
