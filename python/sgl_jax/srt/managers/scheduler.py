@@ -152,6 +152,10 @@ _CHUNK_PREEMPT_MAX_ROUNDS = int(os.environ.get("SGLANG_JAX_CHUNK_PREEMPT_MAX_ROU
 _DP_REBALANCE_GAP = int(os.environ.get("SGLANG_JAX_DP_REBALANCE", "0"))
 _DP_REBALANCE_MAX = int(os.environ.get("SGLANG_JAX_DP_REBALANCE_MAX", "2"))
 _DP_REBALANCE_FORCE = os.environ.get("SGLANG_JAX_DP_REBALANCE_FORCE", "0") == "1"
+# How many of an overloaded rank's next requests may move per round, and whether a destination may have a
+# chunked prefill in progress (a short moved request can preempt it; otherwise it queues there).
+_DP_REBALANCE_PER_RANK = int(os.environ.get("SGLANG_JAX_DP_REBALANCE_PER_RANK", "1"))
+_DP_REBALANCE_BUSY_DEST = os.environ.get("SGLANG_JAX_DP_REBALANCE_BUSY_DEST", "0") == "1"
 # A moved request not admitted within this many prefill rounds gives up its lock on the copied prefix.
 _DP_REBALANCE_LOCK_ROUNDS = 64
 
@@ -1848,16 +1852,16 @@ class Scheduler(
                 rows[g] += 1  # decodes on its rank once its last chunk is done
         step = getattr(self, "_prefill_sched_step", 0)
         preempted = self._preempted_chunked()
-        seen, moved = set(), 0
+        considered, moved = [0] * self.dp_size, 0
         for req in self.waiting_queue:
             a = req.dp_rank
             if getattr(req, "_dp_migrate_lock", None) is not None:
                 if step - getattr(req, "_dp_migrate_round", step) > _DP_REBALANCE_LOCK_ROUNDS:
                     self._dp_release_migrate_lock(req)
                 continue
-            if a is None or a in seen or moved >= _DP_REBALANCE_MAX:
+            if a is None or moved >= _DP_REBALANCE_MAX or considered[a] >= _DP_REBALANCE_PER_RANK:
                 continue
-            seen.add(a)  # only each rank's next request: it decodes there soonest
+            considered[a] += 1  # only each rank's next requests: they decode there soonest
             if getattr(req, "_dp_pinned", False):
                 continue
             uncached = getattr(req, "_uncached_prefill_tokens", len(req.origin_input_ids))
@@ -1865,7 +1869,7 @@ class Scheduler(
                 g
                 for g in range(self.dp_size)
                 if g != a
-                and self.chunked_reqs[g] is None
+                and (_DP_REBALANCE_BUSY_DEST or self.chunked_reqs[g] is None)
                 and not self.running_batch.reqs_info[g].batch_is_full
                 and len(self.running_batch.reqs_info[g].reqs or ())
                 < self.per_dp_max_running_requests

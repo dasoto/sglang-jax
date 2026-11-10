@@ -133,6 +133,37 @@ class TestSchedulerDpRebalance(unittest.TestCase):
             self.s._dp_rebalance_waiting([5, 1])
         self.assertEqual([r.dp_rank for r in self.s.waiting_queue], [1, 0, 1])
 
+    def test_rebalance_moves_several_requests_per_rank_when_allowed(self):
+        self._cache(self.prompt, 0)
+        reqs = [self._req(self.prompt + [7, k], 0, f"r{k}") for k in range(3)]
+        self.s.waiting_queue = list(reqs)
+        with (
+            patch.object(sched_mod, "_DP_REBALANCE_GAP", 2),
+            patch.object(sched_mod, "_DP_REBALANCE_MAX", 6),
+            patch.object(sched_mod, "_DP_REBALANCE_PER_RANK", 2),
+            patch.object(sched_mod, "_DP_REBALANCE_FORCE", False),
+        ):
+            self.s._dp_rebalance_waiting([6, 0])
+        self.assertEqual([r.dp_rank for r in reqs], [1, 1, 0])
+        # The second move found the prefix already copied: no second page copy.
+        self.assertEqual(len(self.s.dp_page_migrator.copies), 1)
+
+    def test_busy_destination_only_when_allowed(self):
+        self._cache(self.prompt, 0)
+        head = self._req(self.prompt + [7, 8], 0, "head")
+        self.s.waiting_queue = [head]
+        self.s.chunked_reqs = [None, self._req(self.prompt, 1, "chunk")]
+        with (
+            patch.object(sched_mod, "_DP_REBALANCE_GAP", 2),
+            patch.object(sched_mod, "_DP_REBALANCE_FORCE", False),
+        ):
+            with patch.object(sched_mod, "_DP_REBALANCE_BUSY_DEST", False):
+                self.s._dp_rebalance_waiting([6, 0])
+                self.assertEqual(head.dp_rank, 0)
+            with patch.object(sched_mod, "_DP_REBALANCE_BUSY_DEST", True):
+                self.s._dp_rebalance_waiting([6, 0])
+                self.assertEqual(head.dp_rank, 1)
+
     def test_rebalance_respects_gap_and_pins(self):
         self._cache(self.prompt, 0)
         head = self._req(self.prompt + [7, 8], 0, "head")
