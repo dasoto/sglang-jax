@@ -966,7 +966,14 @@ class ModelRunnerKVCacheMixin:
                 )
                 self.max_total_num_tokens += spec_headroom
                 self.server_args.max_num_reqs = max_num_reqs
-                self.server_args.draft_runner_cache_size = self.max_total_num_tokens
+                # The draft pool skips the user cap below, so hand it the capped size: a
+                # --max-total-tokens target with an uncapped draft pool compiles the fused
+                # spec programs over two different KV page counts.
+                self.server_args.draft_runner_cache_size = (
+                    self.max_total_num_tokens
+                    if max_total_tokens is None
+                    else min(self.max_total_num_tokens, max_total_tokens)
+                )
 
         # 6. Apply constraints (CI, user cap, page align, dp).
         self.max_total_num_tokens = self._apply_token_constraints(

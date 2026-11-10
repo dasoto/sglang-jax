@@ -656,3 +656,52 @@ def test_single_layer_draft_reserves_one_indexer_buffer():
         architectures=["GlmMoeDsaForCausalLMNextN"]
     )
     assert runner._dsa_indexer_cache_params() == (128, 1)
+
+
+class _PoolSizeRunner(ModelRunnerKVCacheMixin):
+    """init_memory_pool with profiling and pool creation stubbed out."""
+
+    is_hybrid = False
+    linear_recurrent_config = None
+
+    def __init__(self, server_args, is_draft_worker, profiled_tokens):
+        self.server_args = server_args
+        self.is_draft_worker = is_draft_worker
+        self.spec_algorithm = types.SimpleNamespace(is_none=lambda: False)
+        self.use_mla_backend = True
+        self.mesh = types.SimpleNamespace(shape={"data": 4, "tensor": 2})
+        self._profiled_tokens = profiled_tokens
+
+    def _init_kv_cache_dtype(self):
+        pass
+
+    def profile_max_num_token(self, total_device_memory):
+        return self._profiled_tokens
+
+    def _resolve_max_num_reqs(self, max_num_reqs):
+        return max_num_reqs
+
+    def _init_pools(self, max_num_reqs, dp_size):
+        pass
+
+
+@pytest.mark.parametrize("cap", [None, 64 * 100])
+def test_draft_pool_follows_the_target_token_cap(cap, monkeypatch):
+    """The draft pool matches the target's, also under --max-total-tokens (which the draft
+    worker does not apply itself), so the fused spec programs see one KV page count."""
+    monkeypatch.delenv("SGLANG_CI_SMALL_KV_SIZE", raising=False)
+    sa = types.SimpleNamespace(
+        page_size=64,
+        dcp_size=1,
+        speculative_num_steps=3,
+        speculative_eagle_topk=1,
+        speculative_num_draft_tokens=4,
+    )
+    target = _PoolSizeRunner(sa, is_draft_worker=False, profiled_tokens=64 * 400)
+    target.init_memory_pool(max_num_reqs=8, max_total_tokens=cap, dp_size=4)
+    draft = _PoolSizeRunner(sa, is_draft_worker=True, profiled_tokens=64 * 4000)
+    draft.init_memory_pool(max_num_reqs=8, max_total_tokens=cap, dp_size=4)
+
+    assert draft.max_total_num_tokens == target.max_total_num_tokens
+    if cap is not None:
+        assert target.max_total_num_tokens == cap * 4
