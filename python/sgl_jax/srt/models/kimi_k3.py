@@ -32,6 +32,7 @@ Semantics follow Moonshot's ``modeling_kimi_linear.py`` (Kimi-K3 release):
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 
@@ -420,11 +421,14 @@ class KimiK3MLAAttention(DeepseekV3Attention):
 _DSA_INDEX_K_NORM_EPS = 1e-6
 
 
-def _hadamard(n: int) -> np.ndarray:
-    """Sylvester Hadamard matrix of order ``n`` (a power of two), unnormalized."""
+@functools.lru_cache(maxsize=None)
+def _normalized_hadamard(n: int) -> np.ndarray:
+    """Sylvester Hadamard matrix of order ``n`` (a power of two), scaled to be orthonormal."""
     h = np.ones((1, 1), dtype=np.float32)
     while h.shape[0] < n:
         h = np.block([[h, h], [h, -h]])
+    h = h * np.float32(n**-0.5)
+    h.setflags(write=False)
     return h
 
 
@@ -496,25 +500,23 @@ class KimiK31DsaIndexer(nnx.Module):
             kernel_axes=(None, None),
             scope_name="weights_proj",
         )
-        self.hadamard = nnx.Variable(
-            jnp.asarray(_hadamard(index_head_dim) * index_head_dim**-0.5, dtype=jnp.float32)
-        )
 
     def __call__(
         self, hidden_states: jax.Array, q_latent: jax.Array
     ) -> tuple[jax.Array, jax.Array, jax.Array]:
         """Returns query ``[T, n_heads, head_dim]``, key ``[T, head_dim]`` and head
         weights ``[T, n_heads]`` for the DSA backend's top-k."""
-        h = self.hadamard.value
+        # A trace-time constant: as a module variable it would go through weight loading.
+        h = _normalized_hadamard(self.head_dim)
         query, _ = self.wq_b(q_latent)
         query = query.reshape(-1, self.n_heads, self.head_dim)
         query = jnp.einsum(
-            "thd,de->the", query, h.astype(query.dtype), preferred_element_type=jnp.float32
+            "thd,de->the", query, jnp.asarray(h, query.dtype), preferred_element_type=jnp.float32
         ).astype(query.dtype)
         key, _ = self.wk(hidden_states)
         key = self.k_norm(key)
         key = jnp.einsum(
-            "td,de->te", key, h.astype(key.dtype), preferred_element_type=jnp.float32
+            "td,de->te", key, jnp.asarray(h, key.dtype), preferred_element_type=jnp.float32
         ).astype(key.dtype)
         weights, _ = self.weights_proj(hidden_states)
         return query, key, weights

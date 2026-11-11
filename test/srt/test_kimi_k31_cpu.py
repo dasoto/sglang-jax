@@ -271,6 +271,29 @@ class TestKimiK31WeightMappings(unittest.TestCase):
                 self.assertFalse(any(k in mappings for k in keys))
 
 
+class TestKimiK31IndexerInServerModel(unittest.TestCase):
+    """The indexer must work after the server's abstract construction, not only when built eagerly."""
+
+    def test_indexer_runs_after_abstract_build(self):
+        from flax import nnx
+
+        from sgl_jax.srt.configs.kimi_k3 import KimiK3Config
+        from sgl_jax.srt.models.kimi_k3 import KimiK31ForConditionalGeneration
+
+        text = _k31_text_config()
+        config = KimiK3Config(text_config=text.to_dict(), architectures=["KimiK31ForConditionalGeneration"])
+        config.use_dsa_sparse = True
+        mesh = _make_mesh(1)
+        with jax.set_mesh(mesh):
+            abstract = nnx_abstract(KimiK31ForConditionalGeneration, config, mesh)
+            graphdef, state = nnx.split(abstract)
+            state = jax.tree.map(lambda x: jnp.ones(x.shape, x.dtype) * 0.01, state)
+            model = nnx.merge(graphdef, state)
+            indexer = model.model.layers[3].self_attn.indexer
+            q, k, w = indexer(jnp.ones((5, 256), jnp.float32), jnp.ones((5, 64), jnp.float32))
+        self.assertEqual((q.shape, k.shape, w.shape), ((5, 4, 32), (5, 32), (5, 4)))
+
+
 def nnx_abstract(cls, config, mesh):
     """Builds the model without allocating parameter values."""
     from flax import nnx
