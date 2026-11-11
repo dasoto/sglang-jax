@@ -183,7 +183,21 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.free_group = [[] for _ in range(dp_size)]
         self.is_not_in_free_group = True
 
+    def available_size(self, dp_rank: int = 0) -> int:
+        if self.dcp_size <= 1:
+            return super().available_size(dp_rank)
+        # Page j of a sequence must live on DCP rank j % dcp_size (the DSA
+        # backend derives each rank's pages from that rule), so the rank with
+        # the fewest free pages bounds what can still be allocated.
+        pages = np.concatenate([self.free_pages[dp_rank], self.release_pages[dp_rank]])
+        per_rank = np.bincount((pages - 1) % self.dcp_size, minlength=self.dcp_size)
+        return int(per_rank.min()) * self.dcp_size * self.page_size
+
     def _pop_dcp_pages(self, dp_rank: int, target_ranks: np.ndarray) -> np.ndarray | None:
+        """Pop one free page per entry of ``target_ranks`` whose DCP owner,
+        ``(page - 1) % dcp_size``, equals that entry. Returns None, leaving the
+        free list untouched, if any DCP rank is short of pages (strict ownership:
+        page j of a sequence is always on rank j % dcp_size)."""
         total_need = len(target_ranks)
         if total_need == 0:
             return np.empty(0, dtype=np.int32)
@@ -205,24 +219,16 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         out_pages = np.empty(total_need, dtype=np.int32)
         used_mask = np.zeros(len(free), dtype=bool)
-        unmatched_slots = []
         for r in range(self.dcp_size):
             req_pos = np.flatnonzero(target_ranks == r)
             if len(req_pos) == 0:
                 continue
-            cand_idx = np.flatnonzero((page_ranks == r) & (~used_mask))
-            take = min(len(req_pos), len(cand_idx))
-            if take > 0:
-                chosen = cand_idx[:take]
-                out_pages[req_pos[:take]] = free[chosen]
-                used_mask[chosen] = True
-            if take < len(req_pos):
-                unmatched_slots.extend(req_pos[take:].tolist())
-
-        if unmatched_slots:
-            rem_idx = np.flatnonzero(~used_mask)[: len(unmatched_slots)]
-            out_pages[unmatched_slots] = free[rem_idx]
-            used_mask[rem_idx] = True
+            cand_idx = np.flatnonzero(page_ranks == r)
+            if len(cand_idx) < len(req_pos):
+                return None
+            chosen = cand_idx[: len(req_pos)]
+            out_pages[req_pos] = free[chosen]
+            used_mask[chosen] = True
 
         self.free_pages[dp_rank] = free[~used_mask]
         return out_pages
