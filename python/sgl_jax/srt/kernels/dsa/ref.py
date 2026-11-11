@@ -45,6 +45,9 @@ def build_index_share_map(
         elif itype == "shared":
             assert last_slot >= 0, f"layer {layer_id} is shared but no preceding full"
             src_slot[layer_id] = last_slot
+        elif itype == "none":
+            # No indexer and no DSA attention on this layer (Kimi-K3.1's KDA layers).
+            continue
         else:
             raise ValueError(f"unknown indexer_type {itype!r} at layer {layer_id}")
     return full_slot, src_slot, len(full_slot)

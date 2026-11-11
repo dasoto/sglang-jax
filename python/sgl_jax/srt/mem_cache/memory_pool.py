@@ -2057,8 +2057,12 @@ class HybridLinearKVPool(KVCache):
             )
         self.full_kv_pool.replace_buffer(kv_buffer)
 
-    # QSA's compressed indexer cache and open-group ring. Both are indexed by
-    # indexer slot, not layer id, so they pass through untranslated.
+    # DSA's indexer-key cache (Kimi-K3.1), QSA's compressed indexer cache and its
+    # open-group ring. All are indexed by indexer slot, not layer id, so they pass
+    # through untranslated.
+
+    def get_indexer_key_buffer(self, slot_id: int) -> jax.Array:
+        return self.full_kv_pool.get_indexer_key_buffer(slot_id)
 
     def get_compressed_key_buffer(self, slot_id: int) -> jax.Array:
         return self.full_kv_pool.get_compressed_key_buffer(slot_id)

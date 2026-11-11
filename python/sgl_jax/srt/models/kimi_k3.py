@@ -42,7 +42,7 @@ from flax import nnx
 from jax.sharding import NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from sgl_jax.srt.configs.kimi_k3 import get_kimi_k3_text_config
+from sgl_jax.srt.configs.kimi_k3 import apply_kimi_k31_dsa_fields, get_kimi_k3_text_config
 from sgl_jax.srt.configs.kimi_linear import KimiLinearConfig
 from sgl_jax.srt.configs.model_config import AttentionArch, ModelConfig
 from sgl_jax.srt.eplb.expert_location import (
@@ -50,6 +50,7 @@ from sgl_jax.srt.eplb.expert_location import (
     get_global_expert_location_metadata,
 )
 from sgl_jax.srt.layers.activation import situ_and_mul
+from sgl_jax.srt.layers.attention.dsa_sparse_backend import DSAFusedCache
 from sgl_jax.srt.layers.attention.fla.gated_rmsnorm import GatedRMSNorm
 from sgl_jax.srt.layers.embeddings import Embed, ParallelLMHead
 from sgl_jax.srt.layers.gate import GateLogit, TopK
@@ -414,6 +415,236 @@ class KimiK3MLAAttention(DeepseekV3Attention):
         return attn_output * gate
 
 
+# The DSA indexer key's LayerNorm epsilon: the reference implementation's default
+# (Kimi-K3.1's dsa_config sets no index_k_norm_eps).
+_DSA_INDEX_K_NORM_EPS = 1e-6
+
+
+def _hadamard(n: int) -> np.ndarray:
+    """Sylvester Hadamard matrix of order ``n`` (a power of two), unnormalized."""
+    h = np.ones((1, 1), dtype=np.float32)
+    while h.shape[0] < n:
+        h = np.block([[h, h], [h, -h]])
+    return h
+
+
+class KimiK31IndexKeyNorm(nnx.Module):
+    """LayerNorm with bias over the indexer key, computed in float32."""
+
+    def __init__(self, dim: int, dtype: jnp.dtype):
+        self.weight = nnx.Param(jnp.ones((dim,), dtype=dtype))
+        self.bias = nnx.Param(jnp.zeros((dim,), dtype=dtype))
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        x32 = x.astype(jnp.float32)
+        mean = jnp.mean(x32, axis=-1, keepdims=True)
+        var = jnp.var(x32, axis=-1, keepdims=True)
+        y = (x32 - mean) * jax.lax.rsqrt(var + _DSA_INDEX_K_NORM_EPS)
+        y = y * self.weight.value.astype(jnp.float32) + self.bias.value.astype(jnp.float32)
+        return y.astype(x.dtype)
+
+
+class KimiK31DsaIndexer(nnx.Module):
+    """Kimi-K3.1's DSA lightning indexer: DeepSeek-V3.2's, without RoPE.
+
+    Per token: the query is ``wq_b`` of the MLA query latent (after
+    ``q_a_layernorm``), ``index_n_heads`` vectors of ``index_head_dim``; the key is
+    one ``index_head_dim`` vector, ``LayerNorm(wk(hidden))``; the head weights are
+    ``weights_proj(hidden)``. Query and key are rotated by the normalized Hadamard
+    matrix, an orthogonal change of basis that leaves their dot products unchanged
+    and makes the backend's quantized scoring more accurate. The DSA backend scores
+    ``sum_h relu(q_h . k) * w_h`` (scaled) and keeps the top ``index_topk`` tokens.
+    ``index_rope_dim`` is 0, so nothing is rotated by position.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        q_lora_rank: int,
+        index_head_dim: int,
+        index_n_heads: int,
+        mesh: jax.sharding.Mesh,
+        dtype: jnp.dtype = jnp.bfloat16,
+    ):
+        self.head_dim = index_head_dim
+        self.n_heads = index_n_heads
+        self.wq_b = LinearBase(
+            q_lora_rank,
+            index_head_dim * index_n_heads,
+            mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=(None, None),
+            scope_name="wq_b",
+        )
+        self.wk = LinearBase(
+            hidden_size,
+            index_head_dim,
+            mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=(None, None),
+            scope_name="wk",
+        )
+        self.k_norm = KimiK31IndexKeyNorm(index_head_dim, dtype)
+        self.weights_proj = LinearBase(
+            hidden_size,
+            index_n_heads,
+            mesh,
+            use_bias=False,
+            params_dtype=dtype,
+            kernel_axes=(None, None),
+            scope_name="weights_proj",
+        )
+        self.hadamard = nnx.Variable(
+            jnp.asarray(_hadamard(index_head_dim) * index_head_dim**-0.5, dtype=jnp.float32)
+        )
+
+    def __call__(
+        self, hidden_states: jax.Array, q_latent: jax.Array
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """Returns query ``[T, n_heads, head_dim]``, key ``[T, head_dim]`` and head
+        weights ``[T, n_heads]`` for the DSA backend's top-k."""
+        h = self.hadamard.value
+        query, _ = self.wq_b(q_latent)
+        query = query.reshape(-1, self.n_heads, self.head_dim)
+        query = jnp.einsum(
+            "thd,de->the", query, h.astype(query.dtype), preferred_element_type=jnp.float32
+        ).astype(query.dtype)
+        key, _ = self.wk(hidden_states)
+        key = self.k_norm(key)
+        key = jnp.einsum(
+            "td,de->te", key, h.astype(key.dtype), preferred_element_type=jnp.float32
+        ).astype(key.dtype)
+        weights, _ = self.weights_proj(hidden_states)
+        return query, key, weights
+
+
+class KimiK31MLAAttention(KimiK3MLAAttention):
+    """Kimi-K3 MLA plus Kimi-K3.1's DSA indexer.
+
+    With ``--attention-backend dsa_sparse`` each layer computes its own top-k
+    (``indexer_type="full"``) and attends only the selected tokens; with the dense
+    MLA backend the indexer is unused and the layer runs as Kimi-K3's.
+    """
+
+    def __init__(
+        self,
+        config: KimiLinearConfig,
+        layer_idx: int,
+        mesh: jax.sharding.Mesh,
+        dtype: jnp.dtype = jnp.bfloat16,
+        use_absorbed: bool = True,
+    ):
+        super().__init__(config, layer_idx, mesh, dtype, use_absorbed=use_absorbed)
+        if config.q_lora_rank is None:
+            raise ValueError("Kimi-K3.1's DSA indexer reads the MLA query latent (q_lora_rank)")
+        self.indexer = KimiK31DsaIndexer(
+            config.hidden_size,
+            config.q_lora_rank,
+            config.index_head_dim,
+            config.index_n_heads,
+            mesh,
+            dtype,
+        )
+        self.use_dsa_sparse = bool(getattr(config, "use_dsa_sparse", False))
+
+    def __call__(
+        self,
+        positions: jax.Array,
+        hidden_states: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool,
+    ):
+        if not self.use_dsa_sparse:
+            return super().__call__(positions, hidden_states, forward_batch, token_to_kv_pool)
+        q_latent, _ = self.q_a_proj(hidden_states)
+        q_latent = self.q_a_layernorm(q_latent)
+        q, _ = self.q_b_proj(q_latent)
+        q = q.reshape(-1, self.num_heads, self.qk_head_dim)
+        q_nope = q[:, :, : self.qk_nope_head_dim]
+        q_rope = q[:, :, self.qk_nope_head_dim :]
+
+        kv_a_out, _ = self.kv_a_proj(hidden_states)
+        compressed = self.kv_a_layernorm(kv_a_out[:, : self.kv_lora_rank])
+        # Kimi's MLA has no RoPE: the qk_rope dims are used as they come.
+        k_rope = kv_a_out[:, self.kv_lora_rank :].reshape(-1, 1, self.qk_rope_head_dim)
+
+        q_idx, k_idx, idx_weights = self.indexer(hidden_states, q_latent)
+        dsa_kwargs = dict(
+            indexer_type="full",
+            dsa_topk_in=None,
+            dsa_topk_pages_in=None,
+            dsa_topk_reuse=False,
+            q_idx=q_idx,
+            k_idx=k_idx,
+            idx_weights=idx_weights,
+        )
+        attn_output, kv_fused = self._forward_mqa_dsa(
+            q_nope, q_rope, compressed, k_rope, forward_batch, token_to_kv_pool, dsa_kwargs
+        )
+        attn_output = self._pre_o_proj(attn_output, hidden_states)
+        output, _ = self.o_proj(attn_output)
+        return output, kv_fused
+
+    def _forward_mqa_dsa(
+        self,
+        q_nope: jax.Array,
+        q_rope: jax.Array,
+        compressed: jax.Array,
+        k_rope: jax.Array,
+        forward_batch: ForwardBatch,
+        token_to_kv_pool,
+        dsa_kwargs: dict,
+    ):
+        """Absorbed MLA through the DSA backend (as in the GLM-5 model)."""
+        c_kv_3d = compressed[:, None, :]
+        w_uk, w_uv = self.w_uk.value, self.w_uv.value
+        backend = forward_batch.attn_backend
+        backend = getattr(backend, "full_attn_backend", backend)  # the hybrid KDA wrapper
+        absorbs = getattr(backend, "absorbs_mla_in_prefill", None)
+        if absorbs is not None and absorbs(forward_batch):
+            # The backend absorbs W_UK into the query and applies W_UV itself
+            # (DSA_DCP_PREFILL_ABSORB), returning [T, H, v_head_dim].
+            attn_output, kv_fused = self.attn_mqa(
+                q_nope,
+                c_kv_3d,
+                c_kv_3d,
+                forward_batch=forward_batch,
+                token_to_kv_pool=token_to_kv_pool,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                mla_absorb=(w_uk, w_uv),
+                **dsa_kwargs,
+            )
+            return attn_output.reshape(-1, self.num_heads * self.v_head_dim), kv_fused
+        if self.replicated_absorb:
+            w_uk = jax.sharding.reshard(w_uk, P(None, "tensor", None))
+            w_uv = jax.sharding.reshard(w_uv, P(None, "tensor", None))
+        # "thd,rhd->thr" with an fp32 accumulator (bf16 accumulation of this small
+        # batched dot drifts decode over many layers; see the GLM-5 model).
+        ql_nope = jax.lax.dot_general(
+            q_nope, w_uk, (((2,), (2,)), ((1,), (1,))), preferred_element_type=jnp.float32
+        ).astype(q_nope.dtype)
+        ql_nope = ql_nope.transpose(1, 0, 2)
+        o_latent, kv_fused = self.attn_mqa(
+            ql_nope,
+            c_kv_3d,
+            c_kv_3d,
+            forward_batch=forward_batch,
+            token_to_kv_pool=token_to_kv_pool,
+            q_rope=q_rope,
+            k_rope=k_rope,
+            **dsa_kwargs,
+        )
+        # "thr,rhd->thd", fp32 accumulator.
+        o_v = jax.lax.dot_general(
+            o_latent, w_uv, (((2,), (0,)), ((1,), (1,))), preferred_element_type=jnp.float32
+        ).astype(o_latent.dtype)
+        o_v = o_v.transpose(1, 0, 2)
+        return o_v.reshape(-1, self.num_heads * self.v_head_dim), kv_fused
+
+
 class KimiK3LatentMoE(nnx.Module):
     """Router on the full hidden state, experts in the latent, plus shared experts."""
 
@@ -661,9 +892,13 @@ class KimiK3DecoderLayer(nnx.Module):
         if self.is_kda:
             self.self_attn = KimiK3DeltaAttention(config, layer_idx, mesh, dtype)
         else:
-            self.self_attn = KimiK3MLAAttention(
-                config, layer_idx, mesh, dtype, use_absorbed=use_absorbed_mla
+            indexer_types = getattr(config, "indexer_types", None)
+            mla_cls = (
+                KimiK31MLAAttention
+                if indexer_types is not None and indexer_types[layer_idx] == "full"
+                else KimiK3MLAAttention
             )
+            self.self_attn = mla_cls(config, layer_idx, mesh, dtype, use_absorbed=use_absorbed_mla)
 
         self.is_moe_layer = (
             config.num_experts is not None
@@ -801,6 +1036,7 @@ class KimiK3Model(nnx.Module):
         partial_sum = self.embed_tokens(forward_batch.input_ids)
         blocks: list[jax.Array] = []
         layers_kv_fused, layers_recurrent, layers_conv, layers_topk_ids = [], [], [], []
+        layers_idx_fused = []  # Kimi-K3.1's DSA indexer-key pages, in indexer-slot order
         compact_pos = self._compact_positions(forward_batch)
         for layer in self.layers:
             partial_sum, blocks, attn_state, topk_ids = layer(
@@ -816,6 +1052,10 @@ class KimiK3Model(nnx.Module):
                 recurrent_buffer, conv_buffers = attn_state
                 layers_recurrent.append(recurrent_buffer)
                 layers_conv.append(conv_buffers)
+            elif isinstance(attn_state, DSAFusedCache):
+                layers_kv_fused.append(attn_state.kv)
+                if attn_state.idx is not None:
+                    layers_idx_fused.append(attn_state.idx)
             else:
                 layers_kv_fused.append(attn_state)
             if self.eplb_record and topk_ids is not None:
@@ -824,7 +1064,10 @@ class KimiK3Model(nnx.Module):
 
         hidden_states = self.output_attn_res(blocks, partial_sum)
         hidden_states = self.norm(hidden_states)
-        return hidden_states, layers_kv_fused, (layers_recurrent, layers_conv), layers_topk_ids
+        # MLATokenToKVPool.replace_buffer takes (latent pages, indexer-key pages) when DSA
+        # wrote indexer keys, else the latent list alone.
+        kv_update = (layers_kv_fused, layers_idx_fused) if layers_idx_fused else layers_kv_fused
+        return hidden_states, kv_update, (layers_recurrent, layers_conv), layers_topk_ids
 
     def _recorded_topk_ids(self, topk_ids: jax.Array, loc: jax.Array | None) -> jax.Array:
         """[T, k] top-k ids for the expert-distribution recorder: replicated, -1 on padding."""
@@ -871,6 +1114,10 @@ class KimiK3ForConditionalGeneration(nnx.Module):
         if text_config is None:
             raise ValueError("KimiK3ForConditionalGeneration requires a Kimi-K3 config")
         self.text_config = text_config
+        # ModelConfig sets these on the top-level config; the layers read the text config.
+        text_config.use_dsa_sparse = bool(getattr(config, "use_dsa_sparse", False))
+        if text_config.use_dsa_sparse and getattr(text_config, "indexer_types", None) is None:
+            raise ValueError("--attention-backend dsa_sparse needs Kimi-K3.1 (text_config.dsa_config)")
         quantization_config = getattr(config, "quantization_config", None)
         self.ep_size = getattr(config, "ep_size", 1) or 1
         moe_backend = getattr(config, "moe_backend", "epmoe")
@@ -1067,6 +1314,16 @@ class KimiK3ForConditionalGeneration(nnx.Module):
             mappings.update(linear("self_attn.o_proj", "self_attn.o_proj", row))
             if attn.g_proj is not None:
                 mappings.update(linear("self_attn.g_proj", "self_attn.g_proj", col))
+            if getattr(attn, "indexer", None) is not None:
+                # Kimi-K3.1's DSA indexer (bf16; self_attn is outside the MXFP4 groups).
+                for name in ("wq_b", "wk", "weights_proj"):
+                    mappings.update(
+                        linear(f"self_attn.indexer.{name}", f"self_attn.indexer.{name}", rep)
+                    )
+                for name in ("weight", "bias"):
+                    mappings[f"{prefix}.self_attn.indexer.k_norm.{name}"] = WeightSpec(
+                        target_path=f"{target}.self_attn.indexer.k_norm.{name}", sharding=(None,)
+                    )
 
         if not layer.is_moe_layer:
             mappings.update(linear("mlp.gate_proj", "mlp.gate_proj", col))
@@ -1209,4 +1466,18 @@ class KimiK3ForConditionalGeneration(nnx.Module):
         return jax.device_put(values, NamedSharding(self.mesh, P(None, None, "tensor", None)))
 
 
-EntryClass = KimiK3ForConditionalGeneration
+class KimiK31ForConditionalGeneration(KimiK3ForConditionalGeneration):
+    """Kimi-K3.1: Kimi-K3 plus a DSA lightning indexer on its 24 MLA layers.
+
+    Serve it with ``--attention-backend dsa_sparse`` (sparse MLA over each layer's
+    top-k tokens); ``fa`` runs it as dense MLA with the indexer unused.
+    """
+
+    @classmethod
+    def patch_model_config(cls, config: ModelConfig) -> None:
+        super().patch_model_config(config)
+        if not apply_kimi_k31_dsa_fields(config.hf_text_config):
+            raise ValueError("KimiK31ForConditionalGeneration requires text_config.dsa_config")
+
+
+EntryClass = [KimiK3ForConditionalGeneration, KimiK31ForConditionalGeneration]

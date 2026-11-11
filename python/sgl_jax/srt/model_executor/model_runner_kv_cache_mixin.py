@@ -700,7 +700,8 @@ class ModelRunnerKVCacheMixin:
             assert not (
                 kvcache_kwargs.get("num_indexer_layers")
                 and token_to_kv_pool_class is MLATokenToKVPool
-            ), "hybrid-recurrent models do not support --attention-backend dsa_sparse"
+                and not self._hybrid_dsa_supported()
+            ), "this hybrid-recurrent model does not support --attention-backend dsa_sparse"
 
             return HybridLinearKVPool(
                 size=self.max_total_num_tokens,
@@ -726,11 +727,26 @@ class ModelRunnerKVCacheMixin:
         if (
             self.linear_recurrent_config is not None
             and self.server_args.attention_backend == "dsa_sparse"
+            and not self._hybrid_dsa_supported()
         ):
             raise ValueError(
-                "hybrid-recurrent models do not support --attention-backend dsa_sparse: "
-                "HybridLinearKVPool has no DSA indexer cache interface"
+                "this hybrid-recurrent model does not support --attention-backend dsa_sparse: "
+                "its indexer layers must all be full-attention layers (Kimi-K3.1)"
             )
+
+    def _hybrid_dsa_supported(self: ModelRunner) -> bool:
+        """True when every DSA indexer layer is a full-attention (MLA) layer.
+
+        Kimi-K3.1 declares ``indexer_types`` with "none" on its KDA layers, so the
+        hybrid pool's MLA sub-pool holds every indexer-key slot and the KDA layers
+        never reach the DSA backend.
+        """
+        cfg = self.model_config.hf_text_config
+        types = getattr(cfg, "indexer_types", None)
+        if types is None or "none" not in types:
+            return False
+        full_ids = set(self.linear_recurrent_config.full_attention_layer_ids)
+        return all(t == "none" or i in full_ids for i, t in enumerate(types))
 
     def _create_token_to_kv_pool(
         self: ModelRunner,
