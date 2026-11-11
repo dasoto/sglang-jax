@@ -1903,7 +1903,7 @@ class Scheduler(
             size_per_rank = self.token_to_kv_pool_allocator.size_per_rank
             leak_msgs = []
             for dp in range(self.dp_size):
-                avail = self.token_to_kv_pool_allocator.available_size(dp)
+                avail = self.token_to_kv_pool_allocator.free_size(dp)
                 evict = self.tree_cache.evictable_size(dp_rank=dp)
                 protected = self.tree_cache.protected_size(dp_rank=dp)
                 if avail + evict + protected != size_per_rank:
@@ -1931,7 +1931,7 @@ class Scheduler(
 
     def _get_token_info(self):
         available_size = sum(
-            [self.token_to_kv_pool_allocator.available_size(dp) for dp in range(self.dp_size)]
+            [self.token_to_kv_pool_allocator.free_size(dp) for dp in range(self.dp_size)]
         )
         # Sum evictable size across all DP ranks
         evictable_size = sum(

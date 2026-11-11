@@ -35,6 +35,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def available_size(self, dp_rank: int = 0) -> int:
         return (len(self.free_pages[dp_rank]) + len(self.release_pages[dp_rank])) * self.page_size
 
+    def free_size(self, dp_rank: int = 0) -> int:
+        """Free tokens for accounting (leak checks, usage); allocators whose
+        available_size is a conservative allocation bound override this."""
+        return self.available_size(dp_rank)
+
     def get_kvcache(self) -> KVCache:
         return self._kvcache
 
@@ -182,6 +187,9 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.release_pages = [np.empty(0, dtype=np.int32) for _ in range(dp_size)]
         self.free_group = [[] for _ in range(dp_size)]
         self.is_not_in_free_group = True
+
+    def free_size(self, dp_rank: int = 0) -> int:
+        return super().available_size(dp_rank)
 
     def available_size(self, dp_rank: int = 0) -> int:
         if self.dcp_size <= 1:

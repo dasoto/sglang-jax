@@ -38,6 +38,43 @@ def alloc_token_slots(
         return out_cache_loc
 
 
+# An allocation retries at most this many times (evicting twice as much each time);
+# the loop stops earlier once nothing evictable is left.
+_DCP_ALLOC_RETRIES = 24
+
+
+def retry_dcp_alloc(tree_cache, num_tokens: int, dp_rank: int, alloc, backup_state: bool):
+    """Retry a failed paged allocation under DCP, evicting more cache each time.
+
+    With DCP, page j of a sequence must live on owner rank j % dcp_size, so an
+    allocation can fail on one short owner rank while most of the pool is evictable
+    cache (LRU eviction frees pages on every rank). ``alloc`` returns the slots or
+    None. Returns ``(slots or None, state)``; ``state`` is a fresh allocator backup
+    taken right before the successful attempt when ``backup_state`` is set.
+    """
+    allocator = tree_cache.token_to_kv_pool_allocator if tree_cache is not None else None
+    state = None
+    out = None
+    need = num_tokens
+    for _ in range(_DCP_ALLOC_RETRIES):
+        if (
+            allocator is None
+            or getattr(allocator, "dcp_size", 1) <= 1
+            or isinstance(tree_cache, ChunkCache)
+            or isinstance(allocator, SWATokenToKVPoolAllocator)
+            or tree_cache.evictable_size(dp_rank=dp_rank) <= 0
+        ):
+            break
+        need *= 2
+        tree_cache.evict(EvictParams(num_tokens=need, dp_rank=dp_rank))
+        if backup_state:
+            state = allocator.backup_state()
+        out = alloc()
+        if out is not None:
+            break
+    return out, state
+
+
 def alloc_paged_token_slots_extend(
     tree_cache: BasePrefixCache,
     prefix_lens: list[int],
@@ -55,6 +92,18 @@ def alloc_paged_token_slots_extend(
     out_cache_loc = allocator.alloc_extend(
         prefix_lens, seq_lens, last_loc, extend_num_tokens, dp_rank=dp_rank
     )
+    if out_cache_loc is None:
+        out_cache_loc, retry_state = retry_dcp_alloc(
+            tree_cache,
+            num_tokens,
+            dp_rank,
+            lambda: allocator.alloc_extend(
+                prefix_lens, seq_lens, last_loc, extend_num_tokens, dp_rank=dp_rank
+            ),
+            backup_state,
+        )
+        if out_cache_loc is not None and backup_state:
+            state = retry_state
     if out_cache_loc is None:
         error_msg = (
             f"Prefill out of memory. Try to lower your batch size.\n"

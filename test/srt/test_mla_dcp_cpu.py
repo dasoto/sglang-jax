@@ -527,5 +527,51 @@ class TestMLADCPCPU(unittest.TestCase):
             seq_lens = step(seq_lens, [10, 1, 1, 7], check_order=True)  # rows between chunks
             step(seq_lens, [5, 3, 1, 1], check_order=True)  # rows after the chunks
 
+class TestDCPPageOwnership(unittest.TestCase):
+    """Page j of every sequence must live on DCP rank j % dcp_size; the DSA
+    backend derives each rank's local pages from that rule."""
+
+    def _allocator(self, dcp_size: int, num_pages: int, page_size: int = 4):
+        pool = SimpleNamespace(dcp_size=dcp_size)
+        return PagedTokenToKVPoolAllocator(
+            size=num_pages * page_size, page_size=page_size, kvcache=pool, dp_size=1
+        )
+
+    def test_extend_and_decode_pages_follow_round_robin_owner(self):
+        page_size, dcp = 4, 2
+        alloc = self._allocator(dcp, num_pages=32, page_size=page_size)
+        seq_lens = [9, 4, 13]
+        out = alloc.alloc_extend([0, 0, 0], seq_lens, [-1, -1, -1], sum(seq_lens))
+        self.assertIsNotNone(out)
+        starts = np.cumsum([0] + seq_lens)
+        for i, n in enumerate(seq_lens):
+            pages = out[starts[i] : starts[i + 1] : page_size] // page_size
+            np.testing.assert_array_equal((pages - 1) % dcp, np.arange(len(pages)) % dcp)
+        # Decode: seq 1 (4 tokens, page 0 full) grows into page 1 -> rank 1.
+        last_loc = [out[starts[i + 1] - 1] for i in range(3)]
+        dec = alloc.alloc_decode([10, 5, 14], last_loc)
+        self.assertEqual((dec[1] // page_size - 1) % dcp, 1)
+        self.assertEqual(dec[0], last_loc[0] + 1)  # still inside its page 2
+
+    def test_available_size_tracks_scarcest_rank(self):
+        page_size, dcp = 4, 2
+        alloc = self._allocator(dcp, num_pages=8, page_size=page_size)
+        self.assertEqual(alloc.available_size(), 8 * page_size)
+        self.assertEqual(alloc.free_size(), 8 * page_size)
+        # Single-page sequences all take rank-0 pages (pages 1, 3, 5, 7).
+        for _ in range(3):
+            self.assertIsNotNone(alloc.alloc_extend([0], [page_size], [-1], page_size))
+        self.assertEqual(alloc.available_size(), 1 * dcp * page_size)
+        # accounting (leak check, usage) still sees every free page
+        self.assertEqual(alloc.free_size(), 5 * page_size)
+        self.assertIsNotNone(alloc.alloc_extend([0], [page_size], [-1], page_size))
+        self.assertEqual(alloc.available_size(), 0)
+        self.assertEqual(alloc.free_size(), 4 * page_size)
+        # Rank 1 still has 4 pages, but a new sequence's page 0 must be on rank 0.
+        free_before = alloc.free_pages[0].copy()
+        self.assertIsNone(alloc.alloc_extend([0], [page_size], [-1], page_size))
+        np.testing.assert_array_equal(alloc.free_pages[0], free_before)
+
+
 if __name__ == "__main__":
     unittest.main()
