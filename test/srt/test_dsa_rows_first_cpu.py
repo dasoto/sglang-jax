@@ -246,6 +246,64 @@ class TestDSARowsFirstCPU(unittest.TestCase):
         s = step(s, [6, 1, 1, 5])
         step(s, [1, 1, 1, 1])  # one-token rows only (d == n)
 
+    def test_real_kernels_trace(self):
+        """The rows-first step through the real kernel wrappers (abstract evaluation, no TPU):
+        catches trace-time errors that the reference kernels above would hide, e.g. a
+        new keyword that is not a static jit argument."""
+        patches = [
+            mock.patch.object(dsa_mod, "_INDEXER_KERNEL", True),
+            mock.patch.object(dsa_mod, "_INDEXER_KERNEL_PREFILL", True),
+            mock.patch.object(dsa_mod, "_PREFILL_SPARSE", 1),
+        ]
+        for p in patches:
+            p.start()
+        self.addCleanup(lambda: [p.stop() for p in patches])
+        pool, alloc, backend, layer = self._make_setup()
+        ps = self.page_size
+        prefix, ext = [0, 0, 0], [40, 1, 23]
+        seq_lens = [p + e for p, e in zip(prefix, ext)]
+        n = sum(ext)
+        loc = alloc.alloc_extend(prefix, seq_lens, [-1, -1, -1], n)
+        toks, cur = [], 0
+        for e, sl in zip(ext, seq_lens):
+            toks.extend(list(loc[cur : cur + e]) + [0] * (-(-sl // ps) * ps - e))
+            cur += e
+        worker_batch = SimpleNamespace(
+            dp_size=1, per_dp_bs_size=3, seq_lens=np.array(seq_lens, np.int32),
+            extend_seq_lens=np.array(ext, np.int32), cache_loc=np.array(toks, np.int32),
+            out_cache_loc=np.array(loc, np.int32), forward_mode=ForwardMode.EXTEND,
+        )
+        with mock.patch.dict(os.environ, {ROWS_FIRST_ENV: "1"}):
+            backend.forward_metadata = backend.get_forward_metadata(worker_batch)
+        self.assertIsNotNone(backend.forward_metadata.tok_perm)
+        tok = NamedSharding(self.mesh, P("data"))
+        fb = SimpleNamespace(
+            out_cache_loc=jax.device_put(np.array(loc, np.int32), tok),
+            positions=jax.device_put(np.arange(n, dtype=np.int32), tok),
+            forward_mode=ForwardMode.EXTEND,
+        )
+        sds = lambda shape, spec: jax.ShapeDtypeStruct(
+            shape, jnp.float32, sharding=NamedSharding(self.mesh, spec))
+        args = (
+            sds((n, self.num_heads, self.kv_lora_rank), P("data", "tensor", None)),
+            sds((n, self.kv_lora_rank), P("data", None)),
+            sds((n, self.num_heads, self.rope), P("data", "tensor", None)),
+            sds((n, self.rope), P("data", None)),
+            sds((n, self.idx_heads, self.idx_dim), P("data", None, None)),
+            sds((n, self.idx_dim), P("data", None)),
+            sds((n, self.idx_heads), P("data", None)),
+        )
+
+        def step(q, k, q_pe, k_pe, q_idx, k_idx, w):
+            o, fused = backend(q, k, k, layer, fb, pool, q_rope=q_pe, k_rope=k_pe,
+                               indexer_type="full", q_idx=q_idx, k_idx=k_idx, idx_weights=w)
+            return o, fused.topk_pages
+
+        with jax.set_mesh(self.mesh):
+            o, pages = jax.eval_shape(step, *args)
+        self.assertEqual(o.shape[0], n)
+        self.assertEqual(pages.shape, (n, self.index_topk // ps))
+
 
 if __name__ == "__main__":
     unittest.main()

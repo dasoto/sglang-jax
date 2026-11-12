@@ -794,6 +794,7 @@ def select_topk_indices(scores: jax.Array, k: int, *, backend: str = "auto") -> 
         "topk_backend",
         "dcp_size",
         "return_values",
+        "return_scores",
     ),
 )
 def streamindex_topk(
