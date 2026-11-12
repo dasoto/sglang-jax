@@ -57,6 +57,13 @@ MOE_HIER_COMBINE_ENV = "SGLANG_JAX_MOE_HIER_COMBINE"
 # quantized per 1 x H/tp block, as in DeepSeek-V3's FP8 dispatch); 128 instead of 2 x H/tp bytes
 # per row for Kimi-K3's H/tp = 112.
 MOE_FP8_DISPATCH_ENV = "SGLANG_JAX_MOE_FP8_DISPATCH"
+# All-to-all prefill MoE (SGLANG_JAX_MOE_A2A=1, see MXFP4EPMoE._a2a_forward): each chip sends
+# only its tokens' rows to the chips of the experts they route to, with ragged all-to-alls,
+# instead of all-gathering every token to every chip and reducing a full [T, H] partial.
+# SGLANG_JAX_MOE_A2A_CF: receive-buffer rows as a multiple of the mean rows per expert rank; a
+# layer whose busiest rank would get more takes the dense path instead.
+MOE_A2A_ENV = "SGLANG_JAX_MOE_A2A"
+MOE_A2A_CF_ENV = "SGLANG_JAX_MOE_A2A_CF"
 # Local-window row sort: (local expert, row) packed into one int32 key needs rows < 2^16.
 _PACKED_SORT_MAX_ROWS = 1 << 16
 
@@ -142,6 +149,41 @@ def _reduce_scatter_minor(x, tp: int):
     t, h = x.shape
     y = x.reshape(t, tp, h // tp).transpose(1, 0, 2)  # [tp, T, H/tp]
     return jax.lax.psum_scatter(y, "tensor", scatter_dimension=0, tiled=True)[0]
+
+
+def _ragged_all_to_all(
+    operand, output, input_offsets, send_sizes, output_offsets, recv_sizes, *, axis_name, emulate
+):
+    """``jax.lax.ragged_all_to_all`` (inside a shard_map), or an all-gather emulation of it.
+
+    This chip sends ``operand[input_offsets[j] : input_offsets[j] + send_sizes[j]]`` to chip
+    j, which writes it at ``output_offsets[j]`` of its ``output``; ``recv_sizes[j]`` is what
+    this chip gets from chip j. XLA:CPU has no ragged-all-to-all, so tests (``emulate``)
+    all-gather every chip's operand and offsets and pick the rows addressed to this chip.
+    """
+    if not emulate:
+        return jax.lax.ragged_all_to_all(
+            operand, output, input_offsets, send_sizes, output_offsets, recv_sizes,
+            axis_name=axis_name,
+        )
+    del recv_sizes
+    names = (axis_name,) if isinstance(axis_name, str) else tuple(axis_name)
+    me = jnp.int32(0)
+    for name in names:
+        me = me * jax.lax.axis_size(name) + jax.lax.axis_index(name)
+    ops = jax.lax.all_gather(operand, names)  # [n, S, H]
+    meta = jax.lax.all_gather(jnp.stack([input_offsets, send_sizes, output_offsets]), names)
+    col = jax.lax.dynamic_index_in_dim(meta, me, axis=2, keepdims=False)  # [n, 3] towards me
+    src_off, size, dst_off = col[:, 0], col[:, 1], col[:, 2]
+    i = jnp.arange(output.shape[0], dtype=jnp.int32)[:, None]
+    hit = (i >= dst_off[None, :]) & (i < (dst_off + size)[None, :])  # [R, n]
+    s = jnp.argmax(hit, axis=1)
+    src = jnp.clip(src_off[s] + i[:, 0] - dst_off[s], 0, operand.shape[0] - 1)
+    return jnp.where(jnp.any(hit, axis=1)[:, None], ops[s, src], output)
+
+
+def _round_up(x: int, m: int) -> int:
+    return -(-x // m) * m
 
 
 def _parse_compact_divisors(value: str) -> tuple[int, ...]:
@@ -260,6 +302,10 @@ class MXFP4EPMoE(EPMoE):
             MOE_LOCAL_COMBINE_LARGE_ENV, ("scatter", "sorted", "gather")
         )
         self.onehot_max_tokens = int(os.environ.get(MOE_ONEHOT_MAX_TOKENS_ENV, "2048"))
+        self.a2a = os.environ.get(MOE_A2A_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
+        self.a2a_capacity_factor = float(os.environ.get(MOE_A2A_CF_ENV, "4.0"))
+        self.a2a_emulate = None  # None: emulate the ragged all-to-all off TPU (tests)
+        self.a2a_capacity = None  # fixed receive-buffer rows (tests); None = derive from CF
         if self.replicate_experts:
             raise NotImplementedError("MXFP4EPMoE does not support moe_dp_size > 1")
         if self.quantized_dtype is not None or self.activation_quantized_dtype is not None:
@@ -333,6 +379,30 @@ class MXFP4EPMoE(EPMoE):
 
     @named_scope
     def __call__(
+        self,
+        hidden_states,
+        topk_weights,
+        topk_ids,
+        *,
+        out_sharding: jax.sharding.NamedSharding | None = None,
+        token_mask: jax.Array | None = None,
+        compact_pos: jax.Array | None = None,
+    ) -> jax.Array:
+        """``token_mask`` [tokens] marks real tokens (DP-padding slots are False).
+
+        Prefill-sized steps take the all-to-all path when it is enabled and applies (see
+        ``_a2a_forward``); everything else, and an a2a step whose routing would overflow the
+        receive buffers, takes ``_call_dense``.
+        """
+        dense = partial(
+            self._call_dense, out_sharding=out_sharding, token_mask=token_mask, compact_pos=compact_pos
+        )
+        blocks = self._a2a_blocks(hidden_states, topk_ids)
+        if blocks is None:
+            return dense(hidden_states, topk_weights, topk_ids)
+        return self._a2a_call(hidden_states, topk_weights, topk_ids, token_mask, blocks, dense)
+
+    def _call_dense(
         self,
         hidden_states,
         topk_weights,
@@ -484,6 +554,278 @@ class MXFP4EPMoE(EPMoE):
             r32 = result.astype(jnp.float32)
             return result, jnp.sum(r32 * r32, axis=-1)
         return result
+
+    def _a2a_blocks(self, hidden_states, topk_ids) -> tuple[int, int] | None:
+        """(dp, tp) of the model mesh when the all-to-all path applies to this call, else None.
+
+        Static (shapes and shardings only): SGLANG_JAX_MOE_A2A, mesh-mode RS combine, the GMM
+        kernel, a prefill-sized [T, H] input with P("data", "tensor"), T divisible by the chip
+        count and expert ranks of moe_tp chips each.
+        """
+        if not (self.a2a and self.rs_combine_mesh and self.gmm_kernel_weights_ready):
+            return None
+        blocks = self._rs_combine_blocks(hidden_states)
+        if blocks is None or topk_ids.ndim != 2 or topk_ids.shape[0] != hidden_states.shape[0]:
+            return None
+        if topk_ids.shape[0] * topk_ids.shape[1] < self.local_window_min_rows:
+            return None
+        if _spec_axes(jax.typeof(hidden_states).sharding.spec, 2) != (("data",), ("tensor",)):
+            return None
+        dp, tp = blocks
+        if hidden_states.shape[0] % (dp * tp):
+            return None
+        return blocks
+
+    def _a2a_capacity(self, rows: int) -> int:
+        """Static receive-buffer rows per chip: CF x the mean rows per expert rank, 128-aligned."""
+        if self.a2a_capacity:
+            return int(self.a2a_capacity)
+        mean = rows / self.ep_size
+        cap = _round_up(int(math.ceil(mean * self.a2a_capacity_factor)), 128)
+        return max(128, min(cap, _round_up(rows, 128)))
+
+    def _a2a_routing(self, topk_ids, token_mask, blocks):
+        """(ids P("data", None), ids replicated, cnt [n, ep]) for ``_a2a_forward``.
+
+        Masked tokens get the sentinel id ``num_experts``; ``cnt[s, r]`` counts chip s's
+        (token, slot) pairs routed to expert rank r (the sentinel's rank ep is never counted).
+        """
+        dp, tp = blocks
+        n = dp * tp
+        t, k = topk_ids.shape
+        model = lambda spec: NamedSharding(self.mesh, spec)  # noqa: E731
+        ids = jax.sharding.reshard(topk_ids.astype(jnp.int32), model(P("data", None)))
+        if token_mask is not None and token_mask.shape[0] == t:
+            mask = jax.sharding.reshard(token_mask, model(P("data")))
+            ids = jnp.where(mask[:, None], ids, jnp.asarray(self.num_experts, jnp.int32))
+        ids_all = jax.sharding.reshard(ids, model(P(None, None)))  # replicated [T, k]
+        rank = ids_all.reshape(n, (t // n) * k) // self.experts_per_device
+        cnt = jnp.sum(
+            rank[:, :, None] == jnp.arange(self.ep_size, dtype=jnp.int32), axis=1, dtype=jnp.int32
+        )
+        return ids, ids_all, cnt
+
+    def _a2a_call(self, hidden_states, topk_weights, topk_ids, token_mask, blocks, dense):
+        """Routing and the overflow check, then the a2a path or (overflow) the dense one."""
+        t, k = topk_ids.shape
+        ids, ids_all, cnt = self._a2a_routing(topk_ids, token_mask, blocks)
+        r_cap = self._a2a_capacity(t * k)
+        overflow = jnp.max(jnp.sum(cnt, axis=0)) > r_cap
+        a2a = partial(self._a2a_forward, blocks=blocks, r_cap=r_cap)
+        return jax.lax.cond(
+            overflow,
+            lambda hs, tw, ti, ia, c: dense(hs, tw, topk_ids),  # noqa: ARG005
+            a2a,
+            hidden_states,
+            topk_weights,
+            ids,
+            ids_all,
+            cnt,
+        )
+
+    @named_scope
+    def _a2a_forward(self, hidden_states, topk_weights, ids, ids_all, cnt, *, blocks, r_cap):
+        """Prefill MoE with ragged all-to-all token dispatch and combine.
+
+        ``ids`` [T, k] P("data", None) are the routed expert ids with masked tokens set to the
+        sentinel ``num_experts``; ``ids_all`` is the same, replicated; ``cnt`` [n, ep] counts
+        each chip's (token, slot) pairs per expert rank. Chip i of the model mesh (d * tp + t)
+        is chip i of the (expert, tensor) MoE mesh (e * moe_tp + x); expert rank e owns experts
+        [e * E_l, (e + 1) * E_l), each split over its moe_tp chips along I.
+
+        1. Model mesh: an all-to-all over "tensor" turns each chip's [T/dp, H/tp] block into
+           the full rows of T/n tokens (chip i owns tokens [i * T/n, (i + 1) * T/n)). Each pair
+           goes to the moe_tp chips of its expert's rank, ordered by (destination, local
+           expert, pair), in one ragged all-to-all. Every chip derives all offsets from
+           ``cnt``, so there is no size exchange.
+        2. MoE mesh (same devices, no data movement): received rows sit in sender order, each
+           sender's block sorted by local expert, so every row's expert and slot in the
+           tm-aligned GMM layout follow from per-(sender, local expert) counts. The MXFP4 GMM
+           kernel runs over the local groups; outputs go back in received order, unweighted.
+        3. Model mesh: the reverse ragged all-to-all returns every row to its source chip,
+           which sums its tokens' rows times their router weights in f32, takes the row sums
+           of squares on the full rows (``emit_sumsq``) and all-to-alls back to
+           P("data", "tensor").
+        The caller guarantees no rank receives more than ``r_cap`` rows.
+        """
+        from sgl_jax.srt.kernels.mxfp4_gmm import mxfp4_moe_mlp
+
+        dp, tp = blocks
+        n = dp * tp
+        t, h = hidden_states.shape
+        k = ids.shape[1]
+        tl = t // n  # tokens per chip
+        npairs = tl * k
+        mtp, e_l, ep = self.tp_size, self.experts_per_device, self.ep_size
+        s_cap = mtp * npairs  # every pair to each chip of its rank: an exact bound
+        emulate = (not is_tpu_runtime()) if self.a2a_emulate is None else self.a2a_emulate
+        ragged = partial(_ragged_all_to_all, axis_name=("data", "tensor"), emulate=emulate)
+        hdt = hidden_states.dtype
+        model = lambda spec: NamedSharding(self.mesh, spec)  # noqa: E731
+        big = jnp.iinfo(jnp.int32).max
+
+        def excl_cumsum(x, axis):
+            return jnp.cumsum(x, axis=axis, dtype=jnp.int32) - x
+
+        def chip_rows(c):  # [n, ep] -> [n, n]: entry (s, dd) = c[s, dd // mtp]
+            return jnp.repeat(c, mtp, axis=1)
+
+        def dispatch(x, ids_g, w_g, c):  # [T/dp, H/tp], [T/dp, k] x2, [n, ep] (local)
+            ti = jax.lax.axis_index("tensor")
+            me = jax.lax.axis_index("data") * tp + ti
+            rows = jax.lax.all_to_all(x, "tensor", 0, 1, tiled=True)  # [tl, H]
+            my_ids = jax.lax.dynamic_slice_in_dim(ids_g, ti * tl, tl, 0).reshape(npairs)
+            my_w = jax.lax.dynamic_slice_in_dim(w_g, ti * tl, tl, 0).reshape(npairs)
+            rank = my_ids // e_l
+            loc = my_ids - rank * e_l
+            entry = jnp.arange(s_cap, dtype=jnp.int32)
+            pair = entry % npairs
+            dd = rank[pair] * mtp + entry // npairs
+            key = jnp.where(rank[pair] < ep, (dd * e_l + loc[pair]) * s_cap + entry, big)
+            key = jax.lax.sort(key)
+            valid = key < big
+            pair_s = jnp.where(valid, key % s_cap, 0) % npairs
+            send = rows[pair_s // k]
+            rep = chip_rows(c)
+            send_sizes = rep[me]
+            recv = ragged(
+                send,
+                jnp.zeros((r_cap, h), hdt),
+                excl_cumsum(send_sizes, 0),
+                send_sizes,
+                excl_cumsum(rep, 0)[me],
+                c[:, me // mtp],
+            )
+            tok = jnp.where(valid, pair_s // k, -1)
+            w = jnp.where(valid, my_w[pair_s], 0.0).astype(jnp.float32)
+            return recv[None], tok[None], w[None]
+
+        stacked = P(("data", "tensor"), None)
+        recv, send_tok, send_w = shard_map(
+            dispatch,
+            mesh=self.mesh,
+            in_specs=(P("data", "tensor"), P("data", None), P("data", None), P(None, None)),
+            out_specs=(P(("data", "tensor"), None, None), stacked, stacked),
+            check_vma=False,
+        )(
+            hidden_states,
+            ids,
+            jax.sharding.reshard(topk_weights.astype(jnp.float32), model(P("data", None))),
+            cnt,
+        )
+
+        tm_env = os.environ.get("SGLANG_JAX_MOE_LOCAL_WINDOW_TM", "").strip()
+        tm = int(tm_env) if tm_env.isdigit() else 64
+        cap = _round_up(r_cap + e_l * (tm - 1), math.lcm(tm, 128))  # aligned layout, exact
+
+        def experts(rows, ids_r, w_gate, w_up, w_down, s_gate, s_up, s_down):
+            rows = rows[0]  # [r_cap, H] received, in sender order
+            rank = jax.lax.axis_index("expert")
+            group_offset = (rank * e_l).astype(jnp.int32)
+            loc = ids_r.reshape(n, npairs) - group_offset
+            # cm[s, e]: rows from sender s for local expert e.
+            cm = jnp.sum(loc[:, :, None] == jnp.arange(e_l, dtype=jnp.int32), axis=1, dtype=jnp.int32)
+            from_s = jnp.sum(cm, axis=1)  # [n]
+            recv_off = excl_cumsum(from_s, 0)
+            n_recv = jnp.sum(from_s)
+            size_e = jnp.sum(cm, axis=0)  # [e_l]
+            pad_cum = jnp.concatenate(
+                [jnp.zeros((1,), jnp.int32), jnp.cumsum((size_e + tm - 1) // tm * tm, dtype=jnp.int32)]
+            )
+            sstart = excl_cumsum(cm, 0)  # expert e's rows from senders < s
+            q0 = excl_cumsum(cm, 1)  # sender s's rows for local experts < e
+            # GMM row r -> received row: local expert e, its off-th row, from sender s.
+            r = jnp.arange(cap, dtype=jnp.int32)
+            e = jnp.minimum(jnp.sum((r[:, None] >= pad_cum[None, 1:]).astype(jnp.int32), axis=1), e_l - 1)
+            off = r - pad_cum[e]
+            valid = (r < pad_cum[-1]) & (off < size_e[e])
+            s = jnp.minimum(jnp.sum(((sstart + cm).T[e] <= off[:, None]).astype(jnp.int32), axis=1), n - 1)
+            src = jnp.where(valid, recv_off[s] + q0[s, e] + off - sstart[s, e], 0)
+            group_sizes = jax.lax.dynamic_update_slice_in_dim(
+                jnp.zeros((self.num_experts,), jnp.int32), pad_cum[1:] - pad_cum[:-1], group_offset, 0
+            )
+            y = mxfp4_moe_mlp(
+                rows[jnp.clip(src, 0, r_cap - 1)],
+                group_sizes,
+                group_offset,
+                w_gate,
+                s_gate,
+                w_up,
+                s_up,
+                w_down,
+                s_down,
+                situ_beta=self.situ_beta,
+                situ_linear_beta=self.situ_linear_beta,
+                act_input_dtype=self.dtype,
+                out_dtype=self.dtype,
+                tm=tm,
+                cache=True,
+                zero_unvisited=False,  # rows outside the local spans are never read back
+                interpret=not is_tpu_runtime(),
+            )
+            # Received row i -> its GMM row.
+            i = jnp.arange(r_cap, dtype=jnp.int32)
+            si = jnp.minimum(jnp.sum((recv_off + from_s <= i[:, None]).astype(jnp.int32), axis=1), n - 1)
+            q = i - recv_off[si]
+            ei = jnp.minimum(jnp.sum(((q0 + cm)[si] <= q[:, None]).astype(jnp.int32), axis=1), e_l - 1)
+            g = pad_cum[ei] + sstart[si, ei] + q - q0[si, ei]
+            out = y[jnp.clip(g, 0, cap - 1)]
+            return jnp.where((i < n_recv)[:, None], out, jnp.zeros((), out.dtype))[None]
+
+        moe_stacked = P(("expert", "tensor"), None, None)
+        with jax.sharding.use_abstract_mesh(self.updated_mesh):
+            # Same devices in the same order on both meshes: this reshard moves no data.
+            recv_moe = jax.sharding.reshard(recv, moe_stacked)
+            outs = shard_map(
+                experts,
+                mesh=self.moe_mesh,
+                in_specs=(moe_stacked, P(None), _WI_SPEC, _WI_SPEC, _WO_SPEC, _WI_SPEC, _WI_SPEC, _WO_SPEC),
+                out_specs=moe_stacked,
+                check_vma=False,
+            )(
+                recv_moe,
+                jax.sharding.reshard(ids_all, P(None)),
+                self.w1_weight_packed.value,
+                self.w3_weight_packed.value,
+                self.w2_weight_packed.value,
+                self.w1_weight_scale.value,
+                self.w3_weight_scale.value,
+                self.w2_weight_scale.value,
+            )
+        outs = jax.sharding.reshard(outs, model(P(("data", "tensor"), None, None)))
+        emit = self.emit_sumsq
+
+        def combine(y, tok, w, c):  # [1, r_cap, H], [1, s_cap] x2, [n, ep] (local)
+            me = jax.lax.axis_index("data") * tp + jax.lax.axis_index("tensor")
+            mine = c[:, me // mtp]  # rows this chip received from each sender
+            rep = chip_rows(c)
+            back = ragged(
+                y[0],
+                jnp.zeros((s_cap, h), hdt),
+                excl_cumsum(mine, 0),
+                mine,
+                excl_cumsum(rep, 1)[:, me],
+                rep[me],
+            )  # [s_cap, H] in this chip's send order
+            m = jnp.where(
+                tok[0][None, :] == jnp.arange(tl, dtype=jnp.int32)[:, None], w[0][None, :], 0.0
+            )
+            out = jnp.dot(
+                m, back.astype(jnp.float32), precision=jax.lax.Precision.HIGHEST
+            ).astype(hdt)  # [tl, H]
+            res = jax.lax.all_to_all(out, "tensor", 1, 0, tiled=True)  # [T/dp, H/tp]
+            if not emit:
+                return res
+            o32 = out.astype(jnp.float32)
+            return res, jax.lax.all_gather(jnp.sum(o32 * o32, axis=1), "tensor", tiled=True)
+
+        return shard_map(
+            combine,
+            mesh=self.mesh,
+            in_specs=(P(("data", "tensor"), None, None), stacked, stacked, P(None, None)),
+            out_specs=(P("data", "tensor"), P("data")) if emit else P("data", "tensor"),
+            check_vma=False,
+        )(outs, send_tok, send_w, cnt)
 
     def _rs_combine_blocks(self, hidden_states) -> tuple[int, int] | None:
         """(dp, tp) of the model mesh when the reduce-scatter combine applies, else None.
