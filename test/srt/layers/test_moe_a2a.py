@@ -265,6 +265,30 @@ def test_a2a_overflow_falls_back_to_dense():
 
 
 @needs8
+@pytest.mark.parametrize("n_real", [10, 40, 100])
+def test_a2a_with_compact(n_real):
+    """With compact sizes, steps whose real tokens fit one take the compact path; the rest a2a."""
+    T = 128
+    mesh = _mesh()
+    mask_np = np.zeros((T,), bool)
+    mask_np[np.random.default_rng(n_real).choice(T, size=n_real, replace=False)] = True
+    with jax.set_mesh(mesh):
+        dense, a2a = _layers(mesh, seed=43)
+        for layer in (dense, a2a):
+            layer.compact_divisors = (8, 4, 2)  # compact sizes 16, 32, 64
+            layer.compact_min_tokens = 1
+        hs, tw, ti, mask = _inputs(mesh, T, mask_np, seed=n_real)
+        ref, _ = _run(dense, hs, tw, ti, mask)
+        out, _ = _run(a2a, hs, tw, ti, mask)
+        direct = _direct_a2a(a2a, hs, tw, ti, mask)
+    _assert_close(out, ref, mask_np)
+    if n_real > 64:
+        np.testing.assert_array_equal(out, direct)  # beyond the compact sizes: a2a
+    else:
+        np.testing.assert_array_equal(out, ref)  # the dense compact branch, bit for bit
+
+
+@needs8
 def test_a2a_capacity_tiers():
     """The smallest receive-buffer tier that holds the busiest rank's rows runs; same output."""
     T = 256

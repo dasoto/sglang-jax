@@ -60,7 +60,7 @@ MOE_FP8_DISPATCH_ENV = "SGLANG_JAX_MOE_FP8_DISPATCH"
 # All-to-all prefill MoE (SGLANG_JAX_MOE_A2A=1, see MXFP4EPMoE._a2a_forward): each chip sends
 # only its tokens' rows to the chips of the experts they route to, with ragged all-to-alls,
 # instead of all-gathering every token to every chip and reducing a full [T, H] partial.
-# SGLANG_JAX_MOE_A2A_TIERS: static receive-buffer sizes, as multiples of the mean rows per expert
+# SGLANG_JAX_MOE_A2A_TIERS (default 0.75,1.25,2.5): static receive-buffer sizes, as multiples of the mean rows per expert
 # rank; each layer runs the smallest one that holds its busiest rank's rows (the buffer-sized
 # copies and gathers then follow the real load, e.g. with few busy DP groups), and a layer whose
 # busiest rank exceeds the largest takes the dense path instead.
@@ -308,7 +308,7 @@ class MXFP4EPMoE(EPMoE):
         self.a2a_tiers = tuple(
             sorted(
                 float(x)
-                for x in os.environ.get(MOE_A2A_TIERS_ENV, "0.375,0.75,1.25,2.5").split(",")
+                for x in os.environ.get(MOE_A2A_TIERS_ENV, "0.75,1.25,2.5").split(",")
                 if x.strip()
             )
         )
@@ -398,9 +398,11 @@ class MXFP4EPMoE(EPMoE):
     ) -> jax.Array:
         """``token_mask`` [tokens] marks real tokens (DP-padding slots are False).
 
-        Prefill-sized steps take the all-to-all path when it is enabled and applies (see
-        ``_a2a_forward``); everything else, and an a2a step whose routing would overflow the
-        receive buffers, takes ``_call_dense``.
+        With SGLANG_JAX_MOE_A2A, the all-to-all path (see ``_a2a_forward``) replaces the full
+        branch of prefill-sized steps: a step whose real tokens fit a compact size still takes
+        the compact path, which measured faster on v6e-128 (T = 1,024-4,096, one busy DP group:
+        499-586 us per layer vs 539-702 us for a2a), and an a2a step whose routing would
+        overflow every receive buffer takes the dense full path.
         """
         dense = partial(
             self._call_dense, out_sharding=out_sharding, token_mask=token_mask, compact_pos=compact_pos
@@ -408,7 +410,8 @@ class MXFP4EPMoE(EPMoE):
         blocks = self._a2a_blocks(hidden_states, topk_ids)
         if blocks is None:
             return dense(hidden_states, topk_weights, topk_ids)
-        return self._a2a_call(hidden_states, topk_weights, topk_ids, token_mask, blocks, dense)
+        a2a = partial(self._a2a_call, token_mask=token_mask, blocks=blocks, dense=dense)
+        return dense(hidden_states, topk_weights, topk_ids, full_override=a2a)
 
     def _call_dense(
         self,
@@ -420,6 +423,7 @@ class MXFP4EPMoE(EPMoE):
         token_mask: jax.Array | None = None,
         compact_pos: jax.Array | None = None,
         allow_compact: bool = True,
+        full_override=None,
     ) -> jax.Array:
         """``token_mask`` [tokens] marks real tokens (DP-padding slots are False).
 
@@ -432,6 +436,9 @@ class MXFP4EPMoE(EPMoE):
 
         With ``emit_sumsq`` the result is ``(output, sumsq)``: ``sumsq`` [tokens] f32 holds
         each output row's sum of squares over H (P("data") in mesh mode).
+
+        ``full_override(hidden_states, topk_weights, topk_ids)``, when given, runs instead of
+        the full path (the a2a path).
         """
         if out_sharding is None:
             out_sharding = jax.sharding.NamedSharding(self.mesh, P(*([None] * hidden_states.ndim)))
@@ -470,12 +477,17 @@ class MXFP4EPMoE(EPMoE):
                 use_mask=True,
                 rs_blocks=rs_blocks,
             )
-            branches.append(
-                lambda hs, tw, ti, n, p: full(hs, tw, ti, token_mask)  # noqa: ARG005
-            )
+            if full_override is not None:
+                branches.append(lambda hs, tw, ti, n, p: full_override(hs, tw, ti))  # noqa: ARG005
+            else:
+                branches.append(
+                    lambda hs, tw, ti, n, p: full(hs, tw, ti, token_mask)  # noqa: ARG005
+                )
             return jax.lax.switch(
                 index, branches, hidden_states, topk_weights, topk_ids, n_real, compact_pos
             )
+        if full_override is not None:
+            return full_override(hidden_states, topk_weights, topk_ids)
         return self._call_full(
             hidden_states,
             topk_weights,
@@ -618,7 +630,7 @@ class MXFP4EPMoE(EPMoE):
         )
         return ids, ids_all, cnt
 
-    def _a2a_call(self, hidden_states, topk_weights, topk_ids, token_mask, blocks, dense):
+    def _a2a_call(self, hidden_states, topk_weights, topk_ids, *, token_mask, blocks, dense):
         """Routing, then the a2a path on the smallest receive buffer that holds the busiest
         rank's rows, or the dense path (without its compact branches) when none does."""
         t, k = topk_ids.shape
