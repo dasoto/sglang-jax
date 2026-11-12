@@ -2396,7 +2396,11 @@ class Scheduler(
             req.dp_rank = target
             req.init_next_round_input(self.tree_cache)
             res = adder.add_one_req(req)
-            if res != AddReqResult.CONTINUE:
+            # add_one_req can admit the request and then report the budget it left (OTHER
+            # once the round's prefill-token budget is spent, e.g. by 2,048-token chunks).
+            # An admitted request belongs to the target rank -- its pool slot, KV pages and
+            # chunked ownership are allocated there -- so only a rejected one goes home.
+            if not any(x is req for x in adder.can_run_list[target]):
                 req.dp_rank = home
                 if res == AddReqResult.DP_BUDGET_EXHAUSTED or res == AddReqResult.NO_TOKEN:
                     idle.pop(0)
@@ -2413,6 +2417,8 @@ class Scheduler(
                     cached[1],
                     len(req.prefix_indices),
                 )
+            if res != AddReqResult.CONTINUE:
+                break  # admitted, but the round's budget is spent: no more steals
 
     def get_new_batch_prefill(self) -> ScheduleBatch | None:
         # Pathways-PD sets _pd_admission_paused while its D-pool token gate is
@@ -2658,6 +2664,12 @@ class Scheduler(
                 assert (
                     self.chunked_reqs[dp_rank] is None
                 ), f"Chunked request already exists for DP rank {dp_rank} when adding new chunked req"
+                # The next round re-adds a chunked request on req.dp_rank: it must be the rank
+                # whose batch (pool slot, KV pages) carries this chunk.
+                assert adder.new_chunked_reqs[dp_rank].dp_rank == dp_rank, (
+                    f"chunked request admitted on DP rank {dp_rank} is assigned to DP rank "
+                    f"{adder.new_chunked_reqs[dp_rank].dp_rank}"
+                )
                 self.chunked_reqs[dp_rank] = adder.new_chunked_reqs[dp_rank]
             # Increment for any chunked req (new OR continuing) to keep
             # process_batch_result_prefill from sampling on intermediate chunks -- only when

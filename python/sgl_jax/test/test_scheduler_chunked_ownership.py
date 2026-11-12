@@ -810,6 +810,36 @@ class TestSchedulerChunkedOwnership(unittest.TestCase):
         self.assertEqual(req.dp_rank, 0)
         self.assertEqual(adder.can_run_list, {0: [], 1: []})
 
+    def test_steal_admitted_as_budget_runs_out_stays_on_the_target_rank(self):
+        # add_one_req admits the stolen request as a chunk and then reports the round's
+        # prefill budget spent (OTHER). The request's pool slot and KV pages are on the target
+        # rank, so it must stay assigned there; restoring its home rank put it into the home
+        # rank's next batch next to that rank's own chunked request (two chunked requests on
+        # one rank: "only one chunked request may reuse req_pool_idx in a batch").
+        scheduler, adder, req = self._make_steal_scheduler(home_cached=0)
+        later = self._make_req("cold2", [9, 10], [], dp_rank=0)
+        later.init_next_round_input = Mock()
+        later.match_key = Mock(return_value="key2")
+        scheduler.waiting_queue.append(later)
+        scheduler.dp_size = 3  # a second idle rank that must not get a steal this round
+        scheduler.chunked_reqs = scheduler.chunked_reqs + [None]
+        adder.can_run_list[2] = []
+        adder.new_chunked_reqs.append(None)
+        scheduler.running_batch.reqs_info.append(SimpleNamespace(reqs=[], batch_is_full=False))
+
+        def add_one_req(r):
+            adder.can_run_list[r.dp_rank].append(r)
+            adder.new_chunked_reqs[r.dp_rank] = r
+            return AddReqResult.OTHER
+
+        adder.add_one_req = Mock(side_effect=add_one_req)
+        scheduler._steal_for_idle_dp_ranks(adder, set())
+        self.assertEqual(req.dp_rank, 1)
+        self.assertEqual(adder.can_run_list, {0: [], 1: [req], 2: []})
+        self.assertIs(adder.new_chunked_reqs[1], req)
+        self.assertEqual(adder.add_one_req.call_count, 1)  # budget spent: no second steal
+        self.assertEqual(later.dp_rank, 0)
+
     def test_get_new_batch_prefill_steals_only_when_enabled(self):
         for limit in (None, 4096):
             with self.subTest(limit=limit):
