@@ -815,6 +815,7 @@ def streamindex_topk(
     dcp_size: int = 1,
     dcp_rank: jax.Array | None = None,
     return_values: bool = False,
+    return_scores: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -847,10 +848,15 @@ def streamindex_topk(
         result is this rank's local top-k, mapped to global positions.
       return_values: also return the scores of the selected entries, so callers
         can merge per-rank selections.
+      return_scores: return the raw ``[T, cols]`` scores instead of a top-k (rows
+        outside ``distribution``'s sequences stay -inf). Column c is the entry at
+        position c of the sequence's (with DCP: this rank's local) kv; with DCP,
+        local page ``c // page_size`` is the sequence's global page
+        ``(c // page_size) * dcp_size + dcp_rank``.
 
     Returns:
       Top-K indices (in compressed space); ``(scores, indices)`` when
-      ``return_values``.
+      ``return_values``; the score matrix when ``return_scores``.
     """
     # Scale factors for the FP8 index cache format are packed directly inside
     # `cache_kv` along the width dimension, keeping HBM transactions fused.
@@ -1092,6 +1098,8 @@ def streamindex_topk(
     )
 
     scores = scores.reshape(q.shape[0], -1)
+    if return_scores:
+        return scores
     if dcp_size <= 1 and not return_values:
         topk_idxs = select_topk_indices(scores, k, backend=topk_backend)
         return topk_idxs[: q.shape[0], :k]
@@ -1135,6 +1143,7 @@ def streamindex_page_topk(
     dcp_size: int = 1,
     dcp_rank: jax.Array | None = None,
     return_values: bool = False,
+    start_seq: jax.Array | int = 0,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Page-level lightning-indexer top-k (prefill/extend form).
 
@@ -1145,6 +1154,10 @@ def streamindex_page_topk(
 
     ``dcp_size``/``dcp_rank``/``return_values``: as in ``streamindex_topk``; with
     DCP the returned ids are global seq-local page ids of this rank's pages.
+
+    ``start_seq``: score only sequences ``[start_seq, num_seqs)``; rows of earlier
+    sequences stay -inf (ids -1), e.g. the one-token rows a caller scores with the
+    decode kernel.
 
     Returns:
       i32[T, k_pages] seq-local page ids per query token; -1 for padding.
@@ -1196,7 +1209,8 @@ def streamindex_page_topk(
         pltpu.SemaphoreType.DMA((4, 2, 1)),
     ]
 
-    seq_range = [jnp.int32(0), num_seqs.astype(jnp.int32)]
+    start_seq = jnp.minimum(jnp.asarray(start_seq, jnp.int32), num_seqs.astype(jnp.int32))
+    seq_range = [start_seq, num_seqs.astype(jnp.int32)]
     if dcp_size > 1:
         seq_range.append(jnp.asarray(dcp_rank, jnp.int32))
     scalar_prefetches = (
@@ -1226,7 +1240,7 @@ def streamindex_page_topk(
                 num_scalar_prefetch=len(scalar_prefetches),
                 in_specs=in_specs,
                 out_specs=out_specs,
-                grid=(num_seqs.astype(jnp.int32),),
+                grid=(num_seqs.astype(jnp.int32) - start_seq,),
                 scratch_shapes=scratch_shapes,
             ),
             compiler_params=pltpu.CompilerParams(

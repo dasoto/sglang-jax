@@ -381,6 +381,10 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             )
         if mla_absorb is not None:
             raise ValueError("mla_absorb is only supported on the DCP prefill path")
+        if not is_decode and getattr(md, "tok_perm", None) is not None:
+            raise NotImplementedError(
+                "SGLANG_JAX_MLA_DECODE_ROWS_FIRST with the DSA backend needs --dcp-size > 1"
+            )
         if is_full and q_idx is None:
             o, kv_cache = self._run_dense(
                 q, q_rope, new_kv_c, new_k_pe, kv_cache, sm_scale, layer, dpa, md
@@ -1345,12 +1349,37 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             )
         is_decode = mode.is_decode()
         loc = forward_batch.out_cache_loc.astype(jnp.int32)
+        positions = None
+        # SGLANG_JAX_MLA_DECODE_ROWS_FIRST: the metadata lists each DP rank's one-token
+        # sequences first (distribution (d, d, n)); bring the tokens into that order so
+        # the indexer can score those rows with the decode kernel, and restore the
+        # caller's order on the output.
+        rows_first = (not is_decode) and getattr(md, "tok_perm", None) is not None
+        if rows_first:
+            perm = md.tok_perm
+            tok = P(dpa, None)
+            q, q_rope = (_take_rows(x, perm, P(dpa, "tensor", None)) for x in (q, q_rope))
+            new_kv_c, new_k_pe = (_take_rows(x, perm, tok) for x in (new_kv_c, new_k_pe))
+            if q_idx is not None:
+                q_idx = _take_rows(q_idx, perm, P(dpa, None, None))
+                k_idx = _take_rows(k_idx, perm, tok)
+                idx_weights = _take_rows(idx_weights, perm, tok)
+            loc = _take_rows(loc, perm, P(dpa))
+            positions = _take_rows(forward_batch.positions.astype(jnp.int32), perm, P(dpa))
         reuse = is_full and dsa_topk_reuse and dsa_topk_pages_in is not None
         topk, topk_pages = None, None
         if is_full:
             idx_mode = "write" if reuse else ("decode" if is_decode else "prefill")
             idx_cache, topk, topk_pages = self._dcp_index(
-                q_idx, k_idx, idx_weights, idx_cache, loc, dpa, md, mode=idx_mode
+                q_idx,
+                k_idx,
+                idx_weights,
+                idx_cache,
+                loc,
+                dpa,
+                md,
+                mode=idx_mode,
+                rows_first=rows_first,
             )
         pages_use = topk_pages if (is_full and not reuse) else dsa_topk_pages_in
         if pages_use is None:
@@ -1372,7 +1401,11 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 raise ValueError("mla_absorb is only supported on the DCP prefill path")
             o, kv_cache = self._dcp_run_sparse_decode(*args)
         else:
-            o, kv_cache = self._dcp_run_sparse_prefill(*args, mla_absorb=mla_absorb)
+            o, kv_cache = self._dcp_run_sparse_prefill(
+                *args, mla_absorb=mla_absorb, positions=positions, loc=loc
+            )
+            if rows_first:
+                o = _take_rows(o, md.tok_unperm, P(dpa, "tensor", None))
         fresh = is_full and not reuse
         return o, DSAFusedCache(
             kv=kv_cache,
@@ -1381,10 +1414,18 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             topk_pages=topk_pages if fresh else None,
         )
 
-    def _dcp_index(self, q_idx, k_idx, idx_weights, idx_cache, loc, dpa, md, *, mode):
+    def _dcp_index(
+        self, q_idx, k_idx, idx_weights, idx_cache, loc, dpa, md, *, mode, rows_first=False
+    ):
         """Owned indexer-key writes plus, for ``mode`` "decode" / "prefill", the
         token top-k (and its pages) / per-query page top-k over all ranks' keys.
-        Returns ``(idx_cache, topk, topk_pages)`` (None where not computed)."""
+        Returns ``(idx_cache, topk, topk_pages)`` (None where not computed).
+
+        ``rows_first`` (prefill mode, tokens in rows-first order): the leading
+        one-token sequences ``[0, distribution[0])`` are scored with the batched
+        decode kernel and max-pooled to pages, the others with the page kernel. The
+        page kernel would give each one-token row a whole query block; the selection
+        is the same either way."""
         dcp = self.dcp_size
         ps = self.page_size
         index_topk = self.index_topk
@@ -1443,6 +1484,7 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 if _PREFILL_INDEXER_QB is None
                 else {"num_queries_per_block": _PREFILL_INDEXER_QB}
             )
+            num_one = dist_[0] if rows_first else 0
             vals, idx = streamindex_page_topk(
                 q_,
                 w_,
@@ -1455,8 +1497,33 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
                 dcp_size=dcp,
                 dcp_rank=rank,
                 return_values=True,
+                start_seq=num_one,
                 **qb_kw,
             )
+            if rows_first:
+                # One-token rows are rows [0, num_one) (one token per sequence, first).
+                # Their page scores are the max of their token scores within each page.
+                rows = min(q_.shape[0], sl_.shape[0])
+                scores = streamindex_topk(
+                    q_[:rows],
+                    w_[:rows],
+                    cache_,
+                    sl_,
+                    local_pt,
+                    cuq_,
+                    jnp.stack([num_one, num_one, num_one]),
+                    k=index_topk,
+                    compression_ratio=1,
+                    num_kv_pages_per_block=_INDEXER_KERNEL_KV_PAGES_PER_BLOCK,
+                    num_queries_per_block=1,
+                    dcp_size=dcp,
+                    dcp_rank=rank,
+                    return_scores=True,
+                )
+                d_vals, d_idx = _page_topk_from_scores(scores, ps, k_pages, dcp, rank)
+                one = (jnp.arange(rows) < num_one)[:, None]
+                vals = vals.at[:rows].set(jnp.where(one, d_vals, vals[:rows]))
+                idx = idx.at[:rows].set(jnp.where(one, d_idx, idx[:rows]))
             return cache_, _dcp_merge_topk(vals, idx, k_pages)
 
         out = jax.shard_map(_run, in_specs=in_specs, out_specs=out_specs, check_vma=False)(
@@ -1583,6 +1650,8 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
         md,
         forward_batch,
         mla_absorb=None,
+        positions=None,
+        loc=None,
     ):
         """Prefill/mixed: owned writes up front, then the blocked sparse-prefill
         kernel over each query's owned selected pages with all heads (other pages
@@ -1684,14 +1753,46 @@ class DSASparseAttentionBackend(MLAAttentionBackend):
             kpe,
             cache,
             topk_pages,
-            forward_batch.positions.astype(jnp.int32),
-            forward_batch.out_cache_loc.astype(jnp.int32),
+            forward_batch.positions.astype(jnp.int32) if positions is None else positions,
+            forward_batch.out_cache_loc.astype(jnp.int32) if loc is None else loc,
             md.seq_lens,
             md.cu_q_lens,
             md.cu_kv_lens,
             md.page_indices,
             *(mla_absorb if absorb else ()),
         )
+
+
+def _take_rows(x: jax.Array, idx: jax.Array, spec: P) -> jax.Array:
+    """Gather rows of ``x`` by DP-rank-local indices ``idx`` (``tok_perm`` /
+    ``tok_unperm``: per rank, new position -> old position), keeping ``x``'s
+    sharding ``spec`` (axis 0 sharded over the attention data axis)."""
+    return jax.shard_map(
+        lambda x_, i_: jnp.take(x_, i_, axis=0),
+        in_specs=(spec, P(spec[0])),
+        out_specs=spec,
+        check_vma=False,
+    )(x, idx)
+
+
+def _page_topk_from_scores(
+    scores: jax.Array, page_size: int, k_pages: int, dcp_size: int, dcp_rank
+) -> tuple[jax.Array, jax.Array]:
+    """Per-row page top-k from token scores ``[rows, cols]`` laid out as
+    ``streamindex_topk(return_scores=True)`` returns them: max-pool each page, take
+    the best ``k_pages`` (descending), and map local pages to the sequence's global
+    page ids (``lp * dcp_size + dcp_rank``); empty slots get id -1. This matches
+    ``streamindex_page_topk(return_values=True)`` for the same rows."""
+    rows, cols = scores.shape
+    cols_pad = -(-cols // page_size) * page_size
+    if cols_pad != cols:
+        scores = jnp.pad(scores, ((0, 0), (0, cols_pad - cols)), constant_values=-jnp.inf)
+    pages = scores.reshape(rows, cols_pad // page_size, page_size).max(axis=-1)
+    if pages.shape[1] < k_pages:
+        pages = jnp.pad(pages, ((0, 0), (0, k_pages - pages.shape[1])), constant_values=-jnp.inf)
+    vals, lp = jax.lax.top_k(pages, k_pages)
+    ids = lp * dcp_size + dcp_rank if dcp_size > 1 else lp
+    return vals, jnp.where(vals > -jnp.inf, ids, -1).astype(jnp.int32)
 
 
 def _fused_latent_rows(kvc: jax.Array, kpe: jax.Array, cache: jax.Array) -> jax.Array:
