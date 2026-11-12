@@ -60,10 +60,12 @@ MOE_FP8_DISPATCH_ENV = "SGLANG_JAX_MOE_FP8_DISPATCH"
 # All-to-all prefill MoE (SGLANG_JAX_MOE_A2A=1, see MXFP4EPMoE._a2a_forward): each chip sends
 # only its tokens' rows to the chips of the experts they route to, with ragged all-to-alls,
 # instead of all-gathering every token to every chip and reducing a full [T, H] partial.
-# SGLANG_JAX_MOE_A2A_CF: receive-buffer rows as a multiple of the mean rows per expert rank; a
-# layer whose busiest rank would get more takes the dense path instead.
+# SGLANG_JAX_MOE_A2A_TIERS: static receive-buffer sizes, as multiples of the mean rows per expert
+# rank; each layer runs the smallest one that holds its busiest rank's rows (the buffer-sized
+# copies and gathers then follow the real load, e.g. with few busy DP groups), and a layer whose
+# busiest rank exceeds the largest takes the dense path instead.
 MOE_A2A_ENV = "SGLANG_JAX_MOE_A2A"
-MOE_A2A_CF_ENV = "SGLANG_JAX_MOE_A2A_CF"
+MOE_A2A_TIERS_ENV = "SGLANG_JAX_MOE_A2A_TIERS"
 # Local-window row sort: (local expert, row) packed into one int32 key needs rows < 2^16.
 _PACKED_SORT_MAX_ROWS = 1 << 16
 
@@ -303,9 +305,15 @@ class MXFP4EPMoE(EPMoE):
         )
         self.onehot_max_tokens = int(os.environ.get(MOE_ONEHOT_MAX_TOKENS_ENV, "2048"))
         self.a2a = os.environ.get(MOE_A2A_ENV, "0").strip().lower() in ("1", "true", "yes", "on")
-        self.a2a_capacity_factor = float(os.environ.get(MOE_A2A_CF_ENV, "4.0"))
+        self.a2a_tiers = tuple(
+            sorted(
+                float(x)
+                for x in os.environ.get(MOE_A2A_TIERS_ENV, "0.375,0.75,1.25,2.5").split(",")
+                if x.strip()
+            )
+        )
         self.a2a_emulate = None  # None: emulate the ragged all-to-all off TPU (tests)
-        self.a2a_capacity = None  # fixed receive-buffer rows (tests); None = derive from CF
+        self.a2a_capacity = None  # one fixed receive-buffer size (tests); None = the tiers
         if self.replicate_experts:
             raise NotImplementedError("MXFP4EPMoE does not support moe_dp_size > 1")
         if self.quantized_dtype is not None or self.activation_quantized_dtype is not None:
@@ -411,6 +419,7 @@ class MXFP4EPMoE(EPMoE):
         out_sharding: jax.sharding.NamedSharding | None = None,
         token_mask: jax.Array | None = None,
         compact_pos: jax.Array | None = None,
+        allow_compact: bool = True,
     ) -> jax.Array:
         """``token_mask`` [tokens] marks real tokens (DP-padding slots are False).
 
@@ -441,7 +450,9 @@ class MXFP4EPMoE(EPMoE):
             and rows >= self.local_window_min_rows
         )
         rs_blocks = self._rs_combine_blocks(hidden_states)
-        compact_sizes = self._compact_sizes(hidden_states, topk_ids, rs_blocks) if use_mask else ()
+        compact_sizes = (
+            self._compact_sizes(hidden_states, topk_ids, rs_blocks) if use_mask and allow_compact else ()
+        )
         if compact_sizes and compact_pos is None:
             compact_pos = self.compact_positions(token_mask)
         if compact_sizes and compact_pos is not None:
@@ -576,13 +587,15 @@ class MXFP4EPMoE(EPMoE):
             return None
         return blocks
 
-    def _a2a_capacity(self, rows: int) -> int:
-        """Static receive-buffer rows per chip: CF x the mean rows per expert rank, 128-aligned."""
+    def _a2a_capacities(self, rows: int) -> tuple[int, ...]:
+        """Static receive-buffer sizes (ascending, 128-aligned): the tiers x the mean rank load."""
         if self.a2a_capacity:
-            return int(self.a2a_capacity)
+            return (int(self.a2a_capacity),)
         mean = rows / self.ep_size
-        cap = _round_up(int(math.ceil(mean * self.a2a_capacity_factor)), 128)
-        return max(128, min(cap, _round_up(rows, 128)))
+        top = _round_up(rows, 128)
+        return tuple(
+            sorted({max(128, min(_round_up(int(math.ceil(mean * f)), 128), top)) for f in self.a2a_tiers})
+        )
 
     def _a2a_routing(self, topk_ids, token_mask, blocks):
         """(ids P("data", None), ids replicated, cnt [n, ep]) for ``_a2a_forward``.
@@ -606,22 +619,18 @@ class MXFP4EPMoE(EPMoE):
         return ids, ids_all, cnt
 
     def _a2a_call(self, hidden_states, topk_weights, topk_ids, token_mask, blocks, dense):
-        """Routing and the overflow check, then the a2a path or (overflow) the dense one."""
+        """Routing, then the a2a path on the smallest receive buffer that holds the busiest
+        rank's rows, or the dense path (without its compact branches) when none does."""
         t, k = topk_ids.shape
         ids, ids_all, cnt = self._a2a_routing(topk_ids, token_mask, blocks)
-        r_cap = self._a2a_capacity(t * k)
-        overflow = jnp.max(jnp.sum(cnt, axis=0)) > r_cap
-        a2a = partial(self._a2a_forward, blocks=blocks, r_cap=r_cap)
-        return jax.lax.cond(
-            overflow,
-            lambda hs, tw, ti, ia, c: dense(hs, tw, topk_ids),  # noqa: ARG005
-            a2a,
-            hidden_states,
-            topk_weights,
-            ids,
-            ids_all,
-            cnt,
+        caps = self._a2a_capacities(t * k)
+        max_load = jnp.max(jnp.sum(cnt, axis=0))
+        index = jnp.sum((max_load > jnp.asarray(caps, jnp.int32)).astype(jnp.int32))
+        branches = [partial(self._a2a_forward, blocks=blocks, r_cap=c) for c in caps]
+        branches.append(
+            lambda hs, tw, ti, ia, c: dense(hs, tw, topk_ids, allow_compact=False)  # noqa: ARG005
         )
+        return jax.lax.switch(index, branches, hidden_states, topk_weights, ids, ids_all, cnt)
 
     @named_scope
     def _a2a_forward(self, hidden_states, topk_weights, ids, ids_all, cnt, *, blocks, r_cap):
@@ -727,7 +736,6 @@ class MXFP4EPMoE(EPMoE):
             cm = jnp.sum(loc[:, :, None] == jnp.arange(e_l, dtype=jnp.int32), axis=1, dtype=jnp.int32)
             from_s = jnp.sum(cm, axis=1)  # [n]
             recv_off = excl_cumsum(from_s, 0)
-            n_recv = jnp.sum(from_s)
             size_e = jnp.sum(cm, axis=0)  # [e_l]
             pad_cum = jnp.concatenate(
                 [jnp.zeros((1,), jnp.int32), jnp.cumsum((size_e + tm - 1) // tm * tm, dtype=jnp.int32)]
@@ -769,8 +777,7 @@ class MXFP4EPMoE(EPMoE):
             q = i - recv_off[si]
             ei = jnp.minimum(jnp.sum(((q0 + cm)[si] <= q[:, None]).astype(jnp.int32), axis=1), e_l - 1)
             g = pad_cum[ei] + sstart[si, ei] + q - q0[si, ei]
-            out = y[jnp.clip(g, 0, cap - 1)]
-            return jnp.where((i < n_recv)[:, None], out, jnp.zeros((), out.dtype))[None]
+            return y[jnp.clip(g, 0, cap - 1)][None]  # rows past n_recv are never sent back
 
         moe_stacked = P(("expert", "tensor"), None, None)
         with jax.sharding.use_abstract_mesh(self.updated_mesh):

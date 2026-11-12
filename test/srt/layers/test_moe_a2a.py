@@ -109,7 +109,7 @@ def _direct_a2a(layer, hs, tw, ti, mask):
 
     def f(a, b, c, m):
         ids, ids_all, cnt = layer._a2a_routing(c, m, blocks)
-        r_cap = layer._a2a_capacity(c.shape[0] * c.shape[1])
+        r_cap = layer._a2a_capacities(c.shape[0] * c.shape[1])[-1]
         return layer._a2a_forward(a, b, ids, ids_all, cnt, blocks=blocks, r_cap=r_cap)
 
     out = jax.jit(f)(hs, tw, ti, mask)
@@ -262,3 +262,24 @@ def test_a2a_overflow_falls_back_to_dense():
         direct = _direct_a2a(a2a, hs, tw, ti, mask)  # what an unchecked a2a would give
     np.testing.assert_array_equal(out, ref)  # the dense branch, bit for bit
     assert np.abs(direct - ref).max() > 1e-2 * np.abs(ref).max()  # truncated rows were lost
+
+
+@needs8
+def test_a2a_capacity_tiers():
+    """The smallest receive-buffer tier that holds the busiest rank's rows runs; same output."""
+    T = 256
+    mesh = _mesh()
+    mask_np = np.zeros((T,), bool)
+    mask_np[:20] = True  # few real tokens: a small tier
+    with jax.set_mesh(mesh):
+        dense, a2a = _layers(mesh, seed=41)
+        a2a.a2a_tiers = (0.375, 0.75, 1.25, 2.5)
+        caps = a2a._a2a_capacities(T * TOPK)
+        assert caps == (128, 256, 512)  # mean 192 rows per rank: 0.375 and 0.75 x mean both round to 128
+        hs, tw, ti, mask = _inputs(mesh, T, mask_np, seed=12)
+        ref, _ = _run(dense, hs, tw, ti, mask)
+        out, _ = _run(a2a, hs, tw, ti, mask)
+        a2a.a2a_capacity = caps[-1]
+        big = _direct_a2a(a2a, hs, tw, ti, mask)
+    _assert_close(out, ref, mask_np)
+    np.testing.assert_array_equal(out, big)  # the small tier gives the large tier's result
